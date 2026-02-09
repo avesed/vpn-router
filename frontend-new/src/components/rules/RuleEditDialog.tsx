@@ -1,0 +1,363 @@
+import { useState, useEffect } from "react";
+import { useTranslation } from "react-i18next";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import * as z from "zod";
+import { useAddCustomRule, useUpdateCustomRule } from "../../api/hooks/useRules";
+import { useAllEgress } from "../../api/hooks/useEgress";
+import { useDomainCatalog } from "../../api/hooks/useDomainCatalog";
+import { usePeerNodes } from "../../api/hooks/usePeerNodes";
+import { useNodeChains } from "../../api/hooks/useChains";
+import { useAuth } from "../../providers/AuthProvider";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "../ui/dialog";
+import { Button } from "../ui/button";
+import { Form, FormField, FormItem, FormLabel, FormControl, FormMessage } from "../ui/form";
+import { Input } from "../ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
+import { Textarea } from "../ui/textarea";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui/tabs";
+import { Badge } from "../ui/badge";
+import { Checkbox } from "../ui/checkbox";
+import { toast } from "sonner";
+import type { RouteRule } from "../../types";
+
+const formSchema = z.object({
+  tag: z.string().min(1, "Tag is required"),
+  outbound: z.string().min(1, "Outbound is required"),
+  domains: z.string().optional(),
+  domainKeywords: z.string().optional(),
+  ipCidrs: z.string().optional(),
+});
+
+interface RuleEditDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  rule?: RouteRule; // Optional rule for edit mode
+  availableOutbounds?: string[]; // Optional - if provided, used as base outbound list
+}
+
+export function RuleEditDialog({ open, onOpenChange, rule, availableOutbounds: providedOutbounds }: RuleEditDialogProps) {
+  const { t } = useTranslation();
+  const { isAdmin } = useAuth();
+  const addRule = useAddCustomRule();
+  const updateRule = useUpdateCustomRule();
+  const { data: allEgress } = useAllEgress();
+  const { data: domainCatalog } = useDomainCatalog();
+  // Peer nodes and chains are admin-only features
+  const { data: peerNodes } = usePeerNodes({ enabled: isAdmin });
+  const { data: nodeChains } = useNodeChains({ enabled: isAdmin });
+  const [selectedCatalogLists, setSelectedCatalogLists] = useState<string[]>([]);
+
+  const isEditMode = !!rule;
+
+  const form = useForm<z.infer<typeof formSchema>>({
+    resolver: zodResolver(formSchema),
+    defaultValues: {
+      tag: "",
+      outbound: "",
+      domains: "",
+      domainKeywords: "",
+      ipCidrs: "",
+    },
+  });
+
+  // Reset form when dialog opens/closes or rule changes
+  useEffect(() => {
+    if (open) {
+      if (rule) {
+        // Edit mode: populate form with existing rule data
+        // Filter out geosite: prefixed domains (catalog lists)
+        const regularDomains = rule.domains?.filter(d => !d.startsWith("geosite:")) || [];
+        const catalogLists = rule.domains?.filter(d => d.startsWith("geosite:")).map(d => d.replace("geosite:", "")) || [];
+        
+        form.reset({
+          tag: rule.tag,
+          outbound: rule.outbound,
+          domains: regularDomains.join("\n"),
+          domainKeywords: rule.domain_keywords?.join("\n") || "",
+          ipCidrs: rule.ip_cidrs?.join("\n") || "",
+        });
+        setSelectedCatalogLists(catalogLists);
+      } else {
+        // Add mode: reset to empty
+        form.reset({
+          tag: "",
+          outbound: "",
+          domains: "",
+          domainKeywords: "",
+          ipCidrs: "",
+        });
+        setSelectedCatalogLists([]);
+      }
+    }
+  }, [open, rule, form]);
+
+  const onSubmit = (values: z.infer<typeof formSchema>) => {
+    let domains = values.domains ? values.domains.split("\n").filter(Boolean) : [];
+    const domainKeywords = values.domainKeywords ? values.domainKeywords.split("\n").filter(Boolean) : undefined;
+    const ipCidrs = values.ipCidrs ? values.ipCidrs.split("\n").filter(Boolean) : undefined;
+
+    // Add catalog lists as domains with geosite: prefix
+    if (selectedCatalogLists.length > 0) {
+      const catalogDomains = selectedCatalogLists.map(listId => `geosite:${listId}`);
+      domains = [...domains, ...catalogDomains];
+    }
+
+    if (isEditMode) {
+      // Update existing rule
+      toast.promise(
+        updateRule.mutateAsync({
+          tag: rule!.tag, // Use original tag
+          outbound: values.outbound,
+          domains: domains.length > 0 ? domains : undefined,
+          domainKeywords,
+          ipCidrs,
+        }),
+        {
+          loading: t("rules.updatingRule"),
+          success: () => {
+            onOpenChange(false);
+            return t("rules.updateRuleSuccess");
+          },
+          error: (err) => t("rules.updateRuleFailed", { message: err.message }),
+        }
+      );
+    } else {
+      // Add new rule
+      toast.promise(
+        addRule.mutateAsync({
+          tag: values.tag,
+          outbound: values.outbound,
+          domains: domains.length > 0 ? domains : undefined,
+          domainKeywords,
+          ipCidrs,
+        }),
+        {
+          loading: t("rules.addingRule"),
+          success: () => {
+            onOpenChange(false);
+            return t("rules.addRuleSuccess");
+          },
+          error: (err) => t("rules.addRuleFailed", { message: err.message }),
+        }
+      );
+    }
+  };
+
+  // Combine all egress options: use provided list or construct from API data
+  // providedOutbounds comes from /api/rules which includes all egress types + outbound groups
+  const availableOutbounds = providedOutbounds && providedOutbounds.length > 0
+    ? [
+        ...providedOutbounds,
+        // Admin-only: add peer nodes (only connected peers)
+        ...(isAdmin && peerNodes?.nodes
+          ?.filter((p) => p.tunnel_status === "connected" && p.enabled)
+          .map((p) => p.tag) || []),
+        // Admin-only: add multi-hop chains (only active chains)
+        ...(isAdmin && nodeChains?.chains
+          ?.filter((c) => c.chain_state === "active" && c.enabled)
+          .map((c) => c.tag) || []),
+      ]
+    : [
+        // Fallback: construct from individual API data
+        ...(allEgress?.pia.map((e) => e.tag) || []),
+        ...(allEgress?.custom.map((e) => e.tag) || []),
+        ...(allEgress?.direct.map((e) => e.tag) || []),
+        ...(allEgress?.warp || []).map((e) => e.tag),
+        ...(allEgress?.openvpn.map((e) => e.tag) || []),
+        ...(allEgress?.v2ray.map((e) => e.tag) || []),
+        // Peer nodes (only connected peers, admin-only)
+        ...(isAdmin && peerNodes?.nodes
+          ?.filter((p) => p.tunnel_status === "connected" && p.enabled)
+          .map((p) => p.tag) || []),
+        // Multi-hop chains (only active chains, admin-only)
+        ...(isAdmin && nodeChains?.chains
+          ?.filter((c) => c.chain_state === "active" && c.enabled)
+          .map((c) => c.tag) || []),
+      ];
+
+  // Get domain catalog categories
+  const catalogCategories = domainCatalog?.categories ? Object.entries(domainCatalog.categories) : [];
+
+  const handleCatalogListToggle = (listId: string) => {
+    setSelectedCatalogLists(prev =>
+      prev.includes(listId) ? prev.filter(id => id !== listId) : [...prev, listId]
+    );
+  };
+
+  const isPending = addRule.isPending || updateRule.isPending;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-3xl max-h-[90vh] overflow-hidden flex flex-col">
+        <DialogHeader>
+          <DialogTitle>{isEditMode ? t("rules.editRule") : t("rules.addNewRule")}</DialogTitle>
+          <DialogDescription>
+            {isEditMode ? t("rules.editRuleDescription") : t("rules.addRuleDescription")}
+          </DialogDescription>
+        </DialogHeader>
+
+        <Form {...form}>
+          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4 flex-1 overflow-auto px-1">
+            <div className="grid grid-cols-2 gap-4">
+              <FormField
+                control={form.control}
+                name="tag"
+                render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t("rules.ruleTag")}</FormLabel>
+                      <FormControl>
+                        <Input 
+                          placeholder={t("rules.ruleTagPlaceholder")} 
+                          {...field} 
+                          disabled={isEditMode}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="outbound"
+                render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t("rules.outboundLine")}</FormLabel>
+                      <Select onValueChange={field.onChange} value={field.value}>
+                        <FormControl>
+                          <SelectTrigger>
+                            <SelectValue
+                              placeholder={t("common.selectPlaceholder", { item: t("rules.outbound") })}
+                            />
+                          </SelectTrigger>
+                        </FormControl>
+
+                      <SelectContent>
+                        {availableOutbounds.map((tag) => (
+                          <SelectItem key={tag} value={tag}>
+                            {tag}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+
+            <Tabs defaultValue="manual" className="w-full">
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="manual">{t("rules.manualInput")}</TabsTrigger>
+                <TabsTrigger value="catalog">
+                  {t("rules.domainCatalogTab", { count: selectedCatalogLists.length })}
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="manual" className="space-y-4 mt-4">
+                <FormField
+                  control={form.control}
+                  name="domains"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t("rules.domainSuffix")}</FormLabel>
+                      <FormControl>
+                        <Textarea
+                          placeholder={t("rules.domainSuffixPlaceholder")}
+                          className="h-20"
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="domainKeywords"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t("rules.domainKeyword")}</FormLabel>
+                      <FormControl>
+                        <Textarea
+                          placeholder={t("rules.domainKeywordPlaceholder")}
+                          className="h-20"
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="ipCidrs"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t("rules.ipCidr")}</FormLabel>
+                      <FormControl>
+                        <Textarea
+                          placeholder={t("rules.ipCidrPlaceholder")}
+                          className="h-20"
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </TabsContent>
+
+              <TabsContent value="catalog" className="space-y-4 mt-4">
+                <div>
+                  <FormLabel>{t("rules.catalogSelectTitle")}</FormLabel>
+                  <p className="text-sm text-muted-foreground mb-3">
+                    {t("rules.catalogSelectDescription", { count: selectedCatalogLists.length })}
+                  </p>
+                  <div className="max-h-[400px] overflow-y-auto border rounded-md p-4 space-y-3">
+                    {catalogCategories.length === 0 ? (
+                      <p className="text-center text-muted-foreground py-8">{t("common.loading")}</p>
+                    ) : (
+                      catalogCategories.map(([categoryId, category]: [string, any]) => (
+                        <div key={categoryId} className="space-y-2">
+                          <h4 className="font-medium text-sm">{category.name}</h4>
+                          <div className="grid grid-cols-2 gap-2">
+                            {category.lists.map((list: any) => (
+                              <label
+                                key={list.id}
+                                className="flex items-center space-x-2 cursor-pointer p-2 rounded hover:bg-muted"
+                              >
+                                <Checkbox
+                                  checked={selectedCatalogLists.includes(list.id)}
+                                  onCheckedChange={() => handleCatalogListToggle(list.id)}
+                                />
+                                <span className="text-sm">{list.id}</span>
+                                <Badge variant="secondary" className="ml-auto text-xs">
+                                  {list.domain_count}
+                                </Badge>
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </TabsContent>
+            </Tabs>
+
+              <DialogFooter>
+                <Button type="submit" disabled={isPending}>
+                  {isEditMode ? t("rules.updateRule") : t("rules.addRule")}
+                </Button>
+              </DialogFooter>
+
+          </form>
+        </Form>
+      </DialogContent>
+    </Dialog>
+  );
+}

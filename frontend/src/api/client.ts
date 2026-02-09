@@ -152,10 +152,10 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     clearTimeout(timeoutId);
   }
 
-  // 401 Unauthorized - 清除 token 并跳转到登录页
+  // 401 Unauthorized - 清除 token，让 AuthContext 处理重定向
+  // 不在这里做 window.location.href 跳转，避免与 React Router 冲突导致无限刷新
   if (response.status === 401) {
     localStorage.removeItem(TOKEN_KEY);
-    window.location.href = "/login";
     throw new Error("Session expired");
   }
 
@@ -225,9 +225,9 @@ async function fetchWithAuth(path: string, timeout: number = DEFAULT_TIMEOUT): P
     clearTimeout(timeoutId);
   }
 
+  // 401 Unauthorized - 清除 token，让 AuthContext 处理重定向
   if (response.status === 401) {
     localStorage.removeItem(TOKEN_KEY);
-    window.location.href = "/login";
     throw new Error("Session expired");
   }
 
@@ -797,7 +797,7 @@ export const api = {
       { method: "POST", timeout: 60000 }
     ),
 
-  // Get terminal node's available egress list (with cache support - Phase 11.5)
+  // Get terminal node's available egress list (with cache support)
   getTerminalEgress: (tag: string, refresh?: boolean) =>
     request<{ egress_list: Array<{ tag: string; type: string; description?: string; enabled: boolean }>; node_tag: string; cached?: boolean; cached_at?: string }>(
       `/chains/${encodeURIComponent(tag)}/terminal-egress${refresh ? '?refresh=true' : ''}`,

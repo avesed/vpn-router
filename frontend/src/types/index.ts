@@ -620,8 +620,11 @@ export interface SpeedTestResponse {
 }
 
 // ============ V2Ray Egress Types ============
+// Only VLESS is supported for new configs
+// VMess/Trojan kept in type for backwards compat (reading existing data)
 
 export type V2RayProtocol = "vmess" | "vless" | "trojan";
+export type V2RayProtocolSupported = "vless"; // Only VLESS supported in xray-lite
 export type V2RayTransport = "tcp" | "ws" | "grpc" | "h2" | "quic" | "httpupgrade" | "xhttp";
 
 export interface V2RayTransportConfig {
@@ -877,11 +880,13 @@ export interface RealityKeyPair {
 }
 
 // V2Ray protocol options for UI
+// Only VLESS is supported - VMess/Trojan removed from xray-lite
 export const V2RAY_PROTOCOLS = [
-  { value: "vmess", label: "VMess", description: "VMess protocol" },
-  { value: "vless", label: "VLESS", description: "VLESS protocol (recommended)" },
-  { value: "trojan", label: "Trojan", description: "Trojan protocol" },
+  { value: "vless", label: "VLESS", description: "VLESS protocol with REALITY/XTLS-Vision" },
 ] as const;
+
+// Legacy protocol type for displaying existing configs (read-only)
+export type V2RayProtocolLegacy = "vmess" | "vless" | "trojan";
 
 export const V2RAY_TRANSPORTS = [
   { value: "tcp", label: "TCP", description: "Raw TCP" },
@@ -1098,7 +1103,7 @@ export interface PeerNode {
   name: string;
   description?: string;
   endpoint: string;
-  api_port?: number;  // Phase D: API 端口 (默认 36000)
+  api_port?: number;  // API 端口 (默认 36000)
   tunnel_type: PeerTunnelType;
   tunnel_status: PeerTunnelStatus;
   tunnel_interface?: string;
@@ -1132,7 +1137,7 @@ export interface PeerNode {
   created_at?: string;
   updated_at?: string;
 
-  // 双向连接状态 (Phase 11.2)
+  // Bidirectional connection status
   bidirectional_status?: "pending" | "outbound_only" | "bidirectional";
 }
 
@@ -1290,7 +1295,7 @@ export interface TerminalEgressInfo {
   enabled: boolean;
 }
 
-// Terminal egress list response (with cache support - Phase 11.5)
+// Terminal egress list response (with cache support)
 export interface TerminalEgressListResponse {
   egress_list: TerminalEgressInfo[];
   node_tag: string;

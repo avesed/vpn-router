@@ -59,9 +59,10 @@ def _safe_int_env(name: str, default: int) -> int:
         return default
 
 
-# 默认超时时间（秒）
-DEFAULT_TIMEOUT = 10
-DEFAULT_CONNECT_TIMEOUT = 5
+# 可配置的超时时间（秒）
+# 通过环境变量可调整，适应不同网络环境
+DEFAULT_TIMEOUT = _safe_int_env("TUNNEL_API_TIMEOUT", 15)  # 从 10s 增加到 15s
+DEFAULT_CONNECT_TIMEOUT = _safe_int_env("TUNNEL_API_CONNECT_TIMEOUT", 8)  # 从 5s 增加到 8s
 
 # Default web port from environment (for API endpoint fallback)
 DEFAULT_WEB_PORT = _safe_int_env("WEB_PORT", 36000)
@@ -75,6 +76,7 @@ class EgressInfo:
     type: str  # "pia", "custom", "direct", "warp", "v2ray", "openvpn"
     enabled: bool
     description: Optional[str] = None
+    protocol: Optional[str] = None  # WARP protocol (wireguard/masque)
 
 
 @dataclass
@@ -300,9 +302,13 @@ class TunnelAPIClient:
                     )
 
             # 解析 JSON 响应
+            # 确保 message 字段始终存在，避免调用方出现 None
             if response.text:
-                return response.json()
-            return {}
+                result = response.json()
+                if 'message' not in result:
+                    result['message'] = 'Success' if result.get('success', True) else 'Request failed'
+                return result
+            return {'success': True, 'message': 'Empty response'}
 
         except requests.exceptions.ProxyError as e:
             # SOCKS 代理错误 - 隧道可能未连接
@@ -346,7 +352,7 @@ class TunnelAPIClient:
     ) -> Dict[str, Any]:
         """发送 GET 请求
 
-        Phase 2: 通用 GET 方法，用于隧道优先通信。
+        通用 GET 方法，用于隧道优先通信。
 
         Args:
             path: API 路径 (如 /api/peer-info/egress)
@@ -368,7 +374,7 @@ class TunnelAPIClient:
     ) -> Dict[str, Any]:
         """发送 POST 请求
 
-        Phase 2: 通用 POST 方法，用于隧道优先通信。
+        通用 POST 方法，用于隧道优先通信。
 
         Args:
             path: API 路径 (如 /api/peer-notify/connected)
@@ -391,7 +397,7 @@ class TunnelAPIClient:
     ) -> Dict[str, Any]:
         """发送 DELETE 请求
 
-        Phase 2: 通用 DELETE 方法，用于隧道优先通信。
+        通用 DELETE 方法，用于隧道优先通信。
 
         Args:
             path: API 路径 (如 /api/peer-chain/unregister)
@@ -423,7 +429,7 @@ class TunnelAPIClient:
                     type=item.get("type", "unknown"),
                     enabled=item.get("enabled", True),
                     description=item.get("description"),
-                ))
+                    protocol=item.get("protocol"),                ))
 
             logging.info(f"[tunnel-api] 获取 {self.node_tag} 出口列表: {len(egress_list)} 个")
             return egress_list
@@ -433,7 +439,7 @@ class TunnelAPIClient:
             raise
 
     def get_forwarded_egress_list(self, target_tag: str) -> List[EgressInfo]:
-        """Phase 4: 通过当前节点转发获取目标节点的出口列表
+        """通过当前节点转发获取目标节点的出口列表
 
         用于传递模式：当本节点是中继时，转发查询到终端节点。
 
@@ -464,7 +470,7 @@ class TunnelAPIClient:
                     type=e.get("type", "unknown"),
                     enabled=e.get("enabled", False),
                     description=e.get("description"),
-                )
+                    protocol=e.get("protocol"),                )
                 for e in egress_data
             ]
 
@@ -488,7 +494,7 @@ class TunnelAPIClient:
         egress_tag: str,
         mark_type: str = "dscp",
         source_node: Optional[str] = None,
-        target_node: Optional[str] = None,  # Phase 11-Fix.E: 支持转发注册
+        target_node: Optional[str] = None, 支持转发注册
     ) -> bool:
         """在终端节点注册链路路由
 
@@ -515,7 +521,7 @@ class TunnelAPIClient:
             }
             if source_node:
                 data["source_node"] = source_node
-            # Phase 11-Fix.E: 如果指定了 target_node，接收节点将转发注册
+           如果指定了 target_node，接收节点将转发注册
             if target_node:
                 data["target_node"] = target_node
 
@@ -543,7 +549,8 @@ class TunnelAPIClient:
         chain_tag: str,
         mark_value: int,
         mark_type: str = "dscp",
-        target_node: Optional[str] = None,  # Phase 11-Fix.E: 支持转发注销
+        target_node: Optional[str] = None, 支持转发注销
+        source_node: Optional[str] = None, 入口节点标识
     ) -> bool:
         """在终端节点注销链路路由
 
@@ -552,8 +559,9 @@ class TunnelAPIClient:
         Args:
             chain_tag: 链路标识
             mark_value: 标记值
-            mark_type: 标记类型 ('dscp' 或 'xray_email')
+            mark_type: 标记类型（仅支持 'dscp'，Xray 隧道不支持多跳链路）
             target_node: 可选的目标节点（用于传递模式，让中继转发注销请求）
+            source_node: 来源节点标识（入口节点），用于链路成员验证
 
         Returns:
             是否成功注销
@@ -564,9 +572,12 @@ class TunnelAPIClient:
                 "mark_value": mark_value,
                 "mark_type": mark_type,
             }
-            # Phase 11-Fix.E: 传递模式下，通过中继转发注销请求
+           传递模式下，通过中继转发注销请求
             if target_node:
                 params["target_node"] = target_node
+           传递入口节点标识
+            if source_node:
+                params["source_node"] = source_node
 
             result = self._make_request("DELETE", "/api/chain-routing/unregister", params=params)
             success = result.get("success", False)
@@ -610,7 +621,7 @@ class TunnelAPIClient:
             raise
 
     def get_peers(self) -> List[Dict[str, Any]]:
-        """Phase 11-Fix.C: 获取远程节点的 peer 列表
+        """ 获取远程节点的 peer 列表
 
         用于验证多跳链路中的后续跳点是否存在于中间节点。
 
@@ -631,7 +642,7 @@ class TunnelAPIClient:
         hops: List[str],
         allow_transitive: bool = False,
     ) -> Dict[str, Any]:
-        """Phase 11-Fix.C: 在远程节点验证链路跳点
+        """ 在远程节点验证链路跳点
 
         用于递归验证多跳链路中后续跳点的有效性。
         例如 A→B→C 链路，A 调用 B 的此方法验证 [C] 是否有效。
@@ -704,7 +715,7 @@ class TunnelAPIClient:
         wg_public_key: str,
         tunnel_local_ip: str,
     ) -> bool:
-        """Phase 11.3: 请求远程节点建立反向连接
+        """ 请求远程节点建立反向连接
 
         在配对完成后，通过隧道调用远程节点的 reverse-setup API，
         请求远程节点也建立到本节点的隧道连接，实现双向通信。
@@ -742,6 +753,56 @@ class TunnelAPIClient:
             logging.error(f"[tunnel-api] 请求反向连接失败 ({self.node_tag}): {e}")
             return False
 
+    def prepare_relay_route(
+        self,
+        chain_tag: str,
+        source_node: str,
+        target_node: str,
+        dscp_value: int,
+        mark_type: str = "dscp",
+    ) -> Dict[str, Any]:
+        """ 2PC 准备阶段 - 验证中继路由可注册性
+
+        在实际注册前调用，验证所有条件但不应用 iptables 规则。
+
+        Args:
+            chain_tag: 链路标识
+            source_node: 流量来源节点 tag（上游）
+            target_node: 流量目标节点 tag（下游）
+            dscp_value: DSCP 标记值 (0-63)
+            mark_type: 标记类型
+
+        Returns:
+            {"prepared": True, "transaction_id": "..."} - 准备成功
+            {"prepared": False, "error": "..."} - 准备失败
+        """
+        try:
+            data = {
+                "chain_tag": chain_tag,
+                "source_node": source_node,
+                "target_node": target_node,
+                "dscp_value": dscp_value,
+                "mark_type": mark_type,
+            }
+            result = self._make_request("POST", "/api/relay-routing/prepare", data=data)
+            prepared = result.get("prepared", False)
+
+            if prepared:
+                tx_id = result.get("transaction_id", "unknown")
+                logging.info(
+                    f"[tunnel-api-2pc] PREPARE 成功: 链路='{chain_tag}' tx={tx_id} ({self.node_tag})"
+                )
+            else:
+                logging.warning(
+                    f"[tunnel-api-2pc] PREPARE 失败 ({self.node_tag}): {result.get('error')}"
+                )
+
+            return result
+
+        except TunnelAPIError as e:
+            logging.error(f"[tunnel-api-2pc] PREPARE 异常 ({self.node_tag}): {e}")
+            return {"prepared": False, "error": str(e)}
+
     def register_relay_route(
         self,
         chain_tag: str,
@@ -750,7 +811,7 @@ class TunnelAPIClient:
         dscp_value: int,
         mark_type: str = "dscp",
     ) -> bool:
-        """Phase 11.4: 在远程节点注册中继转发规则
+        """ 在远程节点注册中继转发规则
 
         用于多跳链路激活：请求中间节点配置 DSCP 匹配 + 策略路由。
 
@@ -788,8 +849,12 @@ class TunnelAPIClient:
             logging.error(f"[tunnel-api] 注册中继路由失败 ({self.node_tag}): {e}")
             return False
 
-    def unregister_relay_route(self, chain_tag: str) -> bool:
-        """Phase 11.4: 在远程节点注销中继转发规则
+    def unregister_relay_route(
+        self,
+        chain_tag: str,
+        source_node: Optional[str] = None, 入口节点标识
+    ) -> bool:
+        """ 在远程节点注销中继转发规则
 
         用于多跳链路停用：请求中间节点清理转发规则。
 
@@ -797,6 +862,7 @@ class TunnelAPIClient:
 
         Args:
             chain_tag: 链路标识
+            source_node: 来源节点标识（入口节点），用于链路成员验证
 
         Returns:
             是否成功清理
@@ -805,6 +871,9 @@ class TunnelAPIClient:
             data = {
                 "chain_tag": chain_tag,
             }
+           传递入口节点标识
+            if source_node:
+                data["source_node"] = source_node
             result = self._make_request("POST", "/api/relay-routing/unregister", data=data)
             success = result.get("success", False)
 
@@ -827,9 +896,8 @@ class TunnelAPIClient:
         local_endpoint: str,
         local_tunnel_ip: str,
         wg_public_key: str,
-        api_port: Optional[int] = None,  # Phase 11-Fix.K
-    ) -> dict:
-        """Phase 11-Tunnel: 请求完成配对握手
+        api_port: Optional[int] = None,    ) -> dict:
+        """ 请求完成配对握手
 
         通过已建立的隧道调用远程节点的 complete-handshake API，
         通知远程节点完成配对流程。
@@ -841,7 +909,7 @@ class TunnelAPIClient:
             local_endpoint: 本节点端点（对方可连接的地址）
             local_tunnel_ip: 本节点隧道 IP
             wg_public_key: 本节点 WireGuard 公钥
-            api_port: 本节点 API 端口（Phase 11-Fix.K，默认 36000）
+            api_port: 本节点 API 端口（默认 36000）
 
         Returns:
             API 响应字典，包含 success 和 message 字段
@@ -854,7 +922,7 @@ class TunnelAPIClient:
                 "endpoint": local_endpoint,
                 "tunnel_ip": local_tunnel_ip,
                 "wg_public_key": wg_public_key,
-                "api_port": api_port,  # Phase 11-Fix.K: 传递 API 端口
+                "api_port": api_port,  # 传递 API 端口
             }
 
             result = self._make_request("POST", "/api/peer-tunnel/complete-handshake", data=data)
@@ -871,7 +939,7 @@ class TunnelAPIClient:
             logging.error(f"[tunnel-api] 完成握手失败 ({self.node_tag}): {e}")
             return {"success": False, "message": str(e)}
 
-    # ============ Phase 11-Cascade: 对等节点事件通知 ============
+    # ============ 对等节点事件通知 ============
 
     def send_peer_event(
         self,
@@ -883,7 +951,7 @@ class TunnelAPIClient:
         reason: str = "",
         details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Phase 11-Cascade: 发送对等节点事件通知
+        """ 发送对等节点事件通知
 
         通用方法，用于发送 delete/disconnect/broadcast 事件。
 
@@ -939,7 +1007,7 @@ class TunnelAPIClient:
         reason: str = "deleted",
         ttl: int = 3,
     ) -> bool:
-        """Phase 11-Cascade: 发送删除通知
+        """ 发送删除通知
 
         通知远程节点：我们已删除它，它应该清理与我们的连接。
 
@@ -967,7 +1035,7 @@ class TunnelAPIClient:
         source_node: str,
         reason: str = "disconnected",
     ) -> bool:
-        """Phase 11-Cascade: 发送断开通知
+        """ 发送断开通知
 
         通知远程节点：我们临时断开隧道（可能会重连）。
 
@@ -996,7 +1064,7 @@ class TunnelAPIClient:
         reason: str = "node_unavailable",
         ttl: int = 2,
     ) -> bool:
-        """Phase 11-Cascade: 发送广播通知
+        """ 发送广播通知
 
         通知远程节点：某个节点已不可用（级联通知）。
 
@@ -1053,6 +1121,298 @@ class TunnelAPIClient:
         )
         return result.get("success", False)
 
+    # ============ Chain Sync Propagation ============
+
+    def get_used_dscp_values(self) -> Dict[str, Any]:
+        """ 获取远程节点已使用的 DSCP 值列表
+
+        用于在创建链路前检查 DSCP 冲突，确保新链路的 DSCP 值
+        在所有节点上都可用。
+
+        Returns:
+            {"success": True, "used_dscp": [1, 3, 5], "chains": {"chain-a": 1, ...}}
+            或 {"success": False, "error": "..."}
+        """
+        try:
+            result = self._make_request("GET", "/api/chain-sync/used-dscp")
+            success = result.get("success", True)  # 默认 True
+
+            if success:
+                used_dscp = result.get("used_dscp", [])
+                logging.debug(
+                    f"[tunnel-api] 获取 {self.node_tag} 已用 DSCP: {used_dscp}"
+                )
+            else:
+                logging.warning(
+                    f"[tunnel-api] 获取已用 DSCP 失败 ({self.node_tag}): "
+                    f"{result.get('error', 'Unknown')}"
+                )
+
+            return result
+
+        except TunnelAPIError as e:
+            logging.error(f"[tunnel-api] 获取已用 DSCP 异常 ({self.node_tag}): {e}")
+            return {"success": False, "error": str(e)}
+
+    def propagate_chain(
+        self,
+        chain_tag: str,
+        dscp_value: int,
+        full_hops: List[str],
+        exit_egress: str,
+        source_node: str,
+        description: str = "",
+        allow_transitive: bool = False,
+        action: str = "create",
+    ) -> Dict[str, Any]:
+        """ 向远程节点同步链路配置
+
+        在创建/更新链路时，将完整的链路配置同步到链路中的所有节点。
+        每个节点收到后会：
+        1. 根据 full_hops 计算自己的角色 (entry/relay/terminal)
+        2. 将链路存储到本地数据库
+        3. 同步到 rust-router
+        4. 继续向下游传播 (如果不是终端节点)
+
+        Args:
+            chain_tag: 链路标识
+            dscp_value: DSCP 值 (1-63)，所有节点统一使用
+            full_hops: 完整跳转列表，所有节点使用相同值
+            exit_egress: 终端出口 (只有 terminal 使用)
+            source_node: 发起同步的节点 (Entry 节点)
+            description: 链路描述
+            allow_transitive: 是否允许传递验证
+            action: 操作类型 ('create', 'update', 'delete')
+
+        Returns:
+            {"success": True, "message": "..."} 或
+            {"success": False, "error": "..."}
+        """
+        try:
+            data = {
+                "chain_tag": chain_tag,
+                "dscp_value": dscp_value,
+                "full_hops": full_hops,
+                "exit_egress": exit_egress,
+                "source_node": source_node,
+                "description": description,
+                "allow_transitive": allow_transitive,
+                "action": action,
+            }
+
+            result = self._make_request("POST", "/api/chain-sync/propagate", data=data)
+            success = result.get("success", False)
+
+            if success:
+                logging.info(
+                    f"[tunnel-api] 链路同步成功: chain={chain_tag}, "
+                    f"dscp={dscp_value}, action={action} @ {self.node_tag}"
+                )
+            else:
+                logging.warning(
+                    f"[tunnel-api] 链路同步失败 ({self.node_tag}): {result.get('error', 'Unknown')}"
+                )
+
+            return result
+
+        except TunnelAPIError as e:
+            logging.error(f"[tunnel-api] 链路同步异常 ({self.node_tag}): {e}")
+            return {"success": False, "error": str(e)}
+
+
+class IpcForwardingTunnelAPIClient:
+    """IPC 转发隧道 API 客户端
+
+    通过 rust-router 的 IPC 接口转发 HTTP 请求到对端节点。
+    这解决了在 userspace WireGuard 模式下无法直接路由到隧道 IP 的问题。
+
+    对于 WireGuard 隧道：rust-router 使用对端的公网端点发起请求
+    对于 Xray 隧道：rust-router 通过 SOCKS5 代理路由请求
+
+    使用示例：
+        client = IpcForwardingTunnelAPIClient("node-tokyo", rust_router_client)
+        egress_list = await client.get_egress_list()
+    """
+
+    def __init__(
+        self,
+        node_tag: str,
+        rust_router_client,  # RustRouterClient instance
+        timeout: int = DEFAULT_TIMEOUT,
+    ):
+        """初始化 IPC 转发客户端
+
+        Args:
+            node_tag: 远程节点标识
+            rust_router_client: RustRouterClient 实例（用于 IPC 通信）
+            timeout: 请求超时时间（秒）
+        """
+        self.node_tag = node_tag
+        self._client = rust_router_client
+        self.timeout = timeout
+
+        logging.debug(f"[ipc-tunnel-api] 初始化 IPC 转发客户端: node={node_tag}")
+
+    async def _make_request(
+        self,
+        method: str,
+        path: str,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """通过 IPC 发送 API 请求
+
+        Args:
+            method: HTTP 方法 (GET, POST, PUT, DELETE)
+            path: API 路径 (如 /api/peer-info/egress)
+            data: 请求体数据
+
+        Returns:
+            响应 JSON 数据
+
+        Raises:
+            TunnelAPIError: API 调用失败
+        """
+        body = json.dumps(data) if data else None
+
+        logging.debug(f"[ipc-tunnel-api] {method} {path} -> {self.node_tag}")
+
+        result = await self._client.forward_peer_request(
+            peer_tag=self.node_tag,
+            method=method,
+            path=path,
+            body=body,
+            timeout_secs=self.timeout,
+        )
+
+        if not result.get("success"):
+            error = result.get("error", "Unknown error")
+            status_code = result.get("status_code", 0)
+
+            if status_code in (401, 403):
+                raise TunnelAuthError(
+                    f"Authentication failed: {status_code}",
+                    status_code=status_code,
+                )
+            elif status_code == 404:
+                raise TunnelNotFoundError(
+                    f"Resource not found: {status_code}",
+                    status_code=status_code,
+                )
+            elif status_code >= 500:
+                raise TunnelServiceError(
+                    f"Service error: {status_code}",
+                    status_code=status_code,
+                )
+            elif status_code == 0:
+                # Connection-level error
+                raise TunnelAPIError(f"IPC forwarding failed: {error}")
+            else:
+                raise TunnelAPIError(
+                    f"API request failed: {status_code}",
+                    status_code=status_code,
+                )
+
+        # Parse response body as JSON
+        response_body = result.get("body", "")
+        if response_body:
+            try:
+                return json.loads(response_body)
+            except json.JSONDecodeError as e:
+                raise TunnelAPIError(f"Invalid JSON response: {e}")
+        return {"success": True, "message": "Empty response"}
+
+    async def get(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """发送 GET 请求（异步）
+
+        Args:
+            path: API 路径
+            params: URL 参数（将附加到路径）
+
+        Returns:
+            响应 JSON 数据
+        """
+        if params:
+            from urllib.parse import urlencode
+            query = urlencode(params)
+            path = f"{path}?{query}"
+        return await self._make_request("GET", path)
+
+    async def post(
+        self,
+        path: str,
+        json: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """发送 POST 请求（异步）
+
+        Args:
+            path: API 路径
+            json: 请求体数据
+
+        Returns:
+            响应 JSON 数据
+        """
+        return await self._make_request("POST", path, data=json)
+
+    async def delete(
+        self,
+        path: str,
+        json: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """发送 DELETE 请求（异步）
+
+        Args:
+            path: API 路径
+            json: 请求体数据
+
+        Returns:
+            响应 JSON 数据
+        """
+        return await self._make_request("DELETE", path, data=json)
+
+    async def ping(self) -> bool:
+        """测试隧道连通性（异步）
+
+        Returns:
+            True 如果隧道连通
+        """
+        try:
+            result = await self._make_request("GET", "/api/health")
+            return result.get("status") == "healthy"
+        except TunnelAPIError as e:
+            logging.warning(f"[ipc-tunnel-api] Ping failed for {self.node_tag}: {e}")
+            return False
+
+    async def get_egress_list(self) -> List[EgressInfo]:
+        """获取远程节点的可用出口列表（异步）
+
+        Returns:
+            出口信息列表
+        """
+        try:
+            result = await self._make_request("GET", "/api/peer-info/egress")
+            egress_list = []
+
+            for item in result.get("egress", []):
+                egress_list.append(EgressInfo(
+                    tag=item["tag"],
+                    name=item.get("name", item["tag"]),
+                    type=item.get("type", "unknown"),
+                    enabled=item.get("enabled", True),
+                    description=item.get("description"),
+                    protocol=item.get("protocol"),
+                ))
+
+            logging.info(f"[ipc-tunnel-api] 获取 {self.node_tag} 出口列表: {len(egress_list)} 个")
+            return egress_list
+
+        except TunnelAPIError as e:
+            logging.error(f"[ipc-tunnel-api] 获取出口列表失败 ({self.node_tag}): {e}")
+            raise
+
 
 class TunnelAPIClientManager:
     """隧道 API 客户端管理器
@@ -1080,7 +1440,7 @@ class TunnelAPIClientManager:
         如果客户端不存在，会从数据库加载节点信息并创建。
         使用 LRU 策略管理缓存：访问时移到末尾，新增时检查大小限制。
 
-        Phase 10.2: 根据隧道类型选择连接方式：
+        根据隧道类型选择连接方式：
         - WireGuard 隧道：直接 HTTP 连接到隧道 IP
         - Xray 隧道：通过 SOCKS5 代理连接
 
@@ -1199,7 +1559,7 @@ class TunnelAPIClientManager:
             logging.error(f"[tunnel-api-mgr] 获取终端出口列表失败: {e}")
             return []
 
-    # ============ Phase 11-Cascade: 广播事件到所有连接的 peer ============
+    # ============ 广播事件到所有连接的 peer ============
 
     def broadcast_delete_event(
         self,
@@ -1209,7 +1569,7 @@ class TunnelAPIClientManager:
         ttl: int = 3,
         exclude_nodes: Optional[List[str]] = None,
     ) -> Dict[str, bool]:
-        """Phase 11-Cascade: 向所有连接的 peer 广播删除事件
+        """ 向所有连接的 peer 广播删除事件
 
         当删除一个节点时，通知所有其他连接的节点该节点已不可用。
 
@@ -1281,7 +1641,7 @@ class TunnelAPIClientManager:
         source_node: str,
         reason: str = "deleted",
     ) -> bool:
-        """Phase 11-Cascade: 通知单个 peer 删除事件
+        """ 通知单个 peer 删除事件
 
         在删除节点前通过隧道通知对方，让对方清理连接。
 

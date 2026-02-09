@@ -216,7 +216,7 @@ export default function ChainManager() {
   // Activation state
   const [activatingChain, setActivatingChain] = useState<string | null>(null);
 
-  // Terminal egress state (with cache support - Phase 11.5)
+  // Terminal egress state (with cache support)
   const [terminalEgressList, setTerminalEgressList] = useState<Array<{ tag: string; type: string; description?: string; enabled: boolean }>>([]);
   const [loadingEgress, setLoadingEgress] = useState(false);
   const [egressCached, setEgressCached] = useState<boolean>(false);
@@ -489,7 +489,7 @@ export default function ChainManager() {
     }
   };
 
-  // Load terminal egress list for a chain (with cache support - Phase 11.5)
+  // Load terminal egress list for a chain (with cache support)
   const loadTerminalEgress = async (chainTag: string, forceRefresh: boolean = false) => {
     // Track current request to prevent race conditions when switching chains quickly
     egressRequestRef.current = chainTag;
@@ -1043,7 +1043,7 @@ export default function ChainManager() {
                 </div>
               </div>
 
-              {/* Exit Egress (for editing existing chains) - with cache indicator (Phase 11.5) */}
+              {/* Exit Egress (for editing existing chains) - with cache indicator */}
               {editingChain && formData.hops.length > 0 && (
                 <div>
                   <label className="block text-sm font-medium text-slate-400 mb-2">

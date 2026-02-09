@@ -8,6 +8,7 @@
 - 应用自定义路由规则（如果有）
 - 支持广告拦截 rule_set（从 ABP/hosts 列表转换）
 """
+import hashlib
 import ipaddress
 import json
 import logging
@@ -156,11 +157,22 @@ def create_tproxy_inbound(wg_config: dict) -> dict:
 
     # TPROXY 入口配置
     # 监听 TCP 和 UDP 流量
-    # 使用 0.0.0.0 而不是 :: 确保 IPv4 TPROXY 流量正确接收
+    #
+    # 必须使用 0.0.0.0 而不是 127.0.0.1
+    # 在 macvlan/bridge 模式下，sing-box 监听 127.0.0.1 会导致黑洞，
+    # 即使 iptables TPROXY --on-ip 127.0.0.1 规则正确设置。
+    # 使用 0.0.0.0 可以同时兼容 host 模式和 macvlan 模式。
+    #
+    # 技术原因：TPROXY 流量的目标地址是原始目标（如 8.8.8.8），不是 127.0.0.1。
+    # --on-ip 127.0.0.1 只是告诉内核使用 127.0.0.1 作为本地投递地址，
+    # 但 socket 匹配需要 sing-box 在 0.0.0.0 上监听才能接收任意目标地址的流量。
+    #
+    # 可通过环境变量 TPROXY_LISTEN_ADDR 覆盖（默认 0.0.0.0）
+    tproxy_listen = os.environ.get("TPROXY_LISTEN_ADDR", "0.0.0.0")
     tproxy_inbound = {
         "type": "tproxy",
         "tag": "tproxy-in",
-        "listen": "0.0.0.0",
+        "listen": tproxy_listen,
         "listen_port": DEFAULT_TPROXY_PORT,
         "sniff": True,
         "sniff_override_destination": False
@@ -567,125 +579,43 @@ def ensure_endpoints(config: dict, pia_profiles: dict, profile_map: Dict[str, st
 # - 更好的性能（内核 vs 用户空间）
 # - wg show 可用于调试
 # - 标准 WireGuard 工具支持
-# - 与入站架构一致
-#
 # 架构：
-# sing-box routing → direct outbound (bind_interface: wg-pia-xxx) → 内核 WireGuard → 远程服务器
+# sing-box routing → rust-router TPROXY → userspace WireGuard (boringtun) → 远程服务器
+# 注意：内核 WireGuard 模式已弃用，所有 WireGuard 出口由 rust-router 的 boringtun 处理
 
 
 def ensure_kernel_wg_egress_outbounds(config: dict, pia_profiles: dict, custom_egress: List[dict]) -> List[str]:
-    """为 PIA 和自定义 WireGuard 出口创建 direct outbound（绑定到内核接口）
+    """获取 PIA 和自定义 WireGuard 出口的 tag 列表
 
-    替代之前的 sing-box WireGuard endpoints，现在使用：
-    - 内核 WireGuard 接口由 setup_kernel_wg_egress.py 创建
-    - sing-box 使用 direct outbound + bind_interface 将流量发送到内核接口
+    注意：内核 WireGuard 模式已弃用。此函数不再创建 direct outbound。
+    实际的 WireGuard 隧道由 rust-router 的 boringtun 处理。
+    此函数仅返回 tag 列表供 DNS 配置和 ECMP groups 使用。
 
     Args:
-        config: sing-box 配置
+        config: sing-box 配置（不再修改）
         pia_profiles: PIA profiles 配置（从数据库加载）
         custom_egress: 自定义 WireGuard 出口列表
 
     Returns:
-        所有创建的出口 tag 列表
+        所有 WireGuard 出口的 tag 列表（由 rust-router 管理）
     """
-    outbounds = config.setdefault("outbounds", [])
-    endpoints = config.get("endpoints", [])
     all_tags = []
 
-    # 获取现有的 outbound tags
-    existing_outbound_tags = {ob.get("tag") for ob in outbounds}
-
-    # 获取所有将要创建的 WireGuard 出口 tags
-    wg_egress_tags = set()
-
-    # 处理 PIA profiles
+    # 处理 PIA profiles - 只收集 tags，不创建 outbound
     profiles_data = pia_profiles.get("profiles", {}) if pia_profiles else {}
     for name, profile in profiles_data.items():
         if not profile.get("private_key"):
             continue  # 跳过没有凭证的 profile
+        all_tags.append(name)
 
-        tag = name  # PIA profile 使用 name 作为 tag
-        interface = get_egress_interface_name(tag, is_pia=True)
-        wg_egress_tags.add(tag)
-        all_tags.append(tag)
-
-        if tag in existing_outbound_tags:
-            # 更新现有 outbound
-            for i, ob in enumerate(outbounds):
-                if ob.get("tag") == tag:
-                    outbounds[i] = {
-                        "type": "direct",
-                        "tag": tag,
-                        "bind_interface": interface
-                    }
-                    break
-        else:
-            # 创建新 outbound（在 block/adblock 之前插入）
-            block_idx = next(
-                (i for i, ob in enumerate(outbounds) if ob.get("tag") in ("block", "adblock")),
-                len(outbounds)
-            )
-            outbounds.insert(block_idx, {
-                "type": "direct",
-                "tag": tag,
-                "bind_interface": interface
-            })
-            print(f"[render] 创建内核 WireGuard 出口: {tag} (接口: {interface})")
-
-    # 处理自定义 WireGuard 出口
+    # 处理自定义 WireGuard 出口 - 只收集 tags
     for egress in custom_egress:
         tag = egress.get("tag")
-        if not tag:
-            continue
+        if tag:
+            all_tags.append(tag)
 
-        interface = get_egress_interface_name(tag, is_pia=False)
-        wg_egress_tags.add(tag)
-        all_tags.append(tag)
-
-        if tag in existing_outbound_tags:
-            # 更新现有 outbound
-            for i, ob in enumerate(outbounds):
-                if ob.get("tag") == tag:
-                    outbounds[i] = {
-                        "type": "direct",
-                        "tag": tag,
-                        "bind_interface": interface
-                    }
-                    break
-        else:
-            # 创建新 outbound
-            block_idx = next(
-                (i for i, ob in enumerate(outbounds) if ob.get("tag") in ("block", "adblock")),
-                len(outbounds)
-            )
-            outbounds.insert(block_idx, {
-                "type": "direct",
-                "tag": tag,
-                "bind_interface": interface
-            })
-            print(f"[render] 创建内核 WireGuard 出口: {tag} (接口: {interface})")
-
-    # 移除旧的 WireGuard endpoints（如果有的话）
-    # 这些是从旧架构遗留的，现在使用 direct outbound + bind_interface
-    if endpoints:
-        old_count = len(endpoints)
-        config["endpoints"] = [
-            ep for ep in endpoints
-            if ep.get("tag") not in wg_egress_tags or ep.get("type") != "wireguard"
-        ]
-        removed = old_count - len(config.get("endpoints", []))
-        if removed > 0:
-            print(f"[render] 移除了 {removed} 个旧的 WireGuard endpoints（已迁移到内核 WireGuard）")
-
-    # 同时移除旧的 WireGuard outbounds（类型为 wireguard 的）
-    old_count = len(outbounds)
-    config["outbounds"] = [
-        ob for ob in outbounds
-        if ob.get("tag") not in wg_egress_tags or ob.get("type") != "wireguard"
-    ]
-    removed = old_count - len(config["outbounds"])
-    if removed > 0:
-        print(f"[render] 移除了 {removed} 个旧的 WireGuard outbounds（已迁移到内核 WireGuard）")
+    if all_tags:
+        print(f"[render] WireGuard 出口由 rust-router 管理 (userspace): {all_tags}")
 
     return all_tags
 
@@ -937,8 +867,18 @@ def ensure_outbound_selector(config: dict, all_egress_tags: List[str], default_o
     """
     outbounds = config.setdefault("outbounds", [])
 
-    # 收集所有可用出口（包括 direct）
-    available = ["direct"] + list(all_egress_tags)
+    # 获取实际存在于 config 中的 outbound tags
+    existing_outbound_tags = {ob.get("tag") for ob in outbounds if ob.get("tag")}
+
+    # 收集所有可用出口（只包含实际存在的 outbounds）
+    # 在 userspace WireGuard 模式下，某些出口（如 WARP）由 rust-router 管理，
+    # 不会在 sing-box config 中创建对应的 outbound。需要过滤掉这些不存在的 tags。
+    available = ["direct"] + [tag for tag in all_egress_tags if tag in existing_outbound_tags]
+
+    # 记录被过滤掉的 tags（便于调试）
+    filtered_tags = [tag for tag in all_egress_tags if tag not in existing_outbound_tags]
+    if filtered_tags:
+        print(f"[render] 过滤掉 {len(filtered_tags)} 个由 IPC 管理的出口: {filtered_tags}")
 
     # 验证 default_outbound 是否有效
     if default_outbound not in available:
@@ -1275,9 +1215,25 @@ def load_v2ray_egress() -> List[dict]:
 
 
 def _build_v2ray_outbound(egress: dict) -> dict:
-    """构建 V2Ray outbound 配置（支持 VMess, VLESS, Trojan）"""
+    """构建 V2Ray outbound 配置 - VLESS only (VMess/Trojan removed in Xray-lite)"""
     protocol = egress.get("protocol")
     tag = egress.get("tag")
+
+    # [Xray-lite] 仅支持 VLESS
+    if protocol == "vmess":
+        raise ValueError(
+            f"VMess protocol is no longer supported in Xray-lite. "
+            f"Egress '{tag}' uses VMess. Please migrate to VLESS. "
+            "See docs/VMESS_TROJAN_MIGRATION.md"
+        )
+    elif protocol == "trojan":
+        raise ValueError(
+            f"Trojan protocol is no longer supported in Xray-lite. "
+            f"Egress '{tag}' uses Trojan. Please migrate to VLESS. "
+            "See docs/VMESS_TROJAN_MIGRATION.md"
+        )
+    elif protocol != "vless":
+        raise ValueError(f"Unsupported protocol: {protocol}. Only 'vless' is supported.")
 
     outbound = {
         "type": protocol,
@@ -1286,18 +1242,10 @@ def _build_v2ray_outbound(egress: dict) -> dict:
         "server_port": egress.get("server_port", 443),
     }
 
-    # Protocol-specific auth
-    if protocol == "vmess":
-        outbound["uuid"] = egress.get("uuid")
-        outbound["security"] = egress.get("security", "auto")
-        if egress.get("alter_id"):
-            outbound["alter_id"] = egress.get("alter_id")
-    elif protocol == "vless":
-        outbound["uuid"] = egress.get("uuid")
-        if egress.get("flow"):
-            outbound["flow"] = egress.get("flow")
-    elif protocol == "trojan":
-        outbound["password"] = egress.get("password")
+    # VLESS auth
+    outbound["uuid"] = egress.get("uuid")
+    if egress.get("flow"):
+        outbound["flow"] = egress.get("flow")
 
     # TLS configuration
     if egress.get("tls_enabled"):
@@ -1476,7 +1424,19 @@ def ensure_peer_outbounds(config: dict, peer_nodes: List[dict]) -> List[str]:
         peer_tags.append(outbound_tag)
 
         # 获取 SOCKS 端口（与 xray_manager.py 中分配的端口一致）
-        socks_port = peer.get("xray_socks_port") or (PEER_SOCKS_PORT_BASE + idx)
+        # 必须使用数据库中分配的端口以确保一致性
+        socks_port = peer.get("xray_socks_port")
+        if not socks_port:
+            # 基于 peer_tag 计算确定性端口（使用 MD5 而非 hash()）
+            # hash() 在不同 Python 进程间不稳定（hash randomization）
+            # MD5 确保跨进程、跨重启的一致性
+            # 注意：必须与 xray_manager.py 使用相同的算法
+            tag_hash = int(hashlib.md5(tag.encode()).hexdigest()[:8], 16) % 99
+            socks_port = PEER_SOCKS_PORT_BASE + tag_hash
+            print(
+                f"[render] 警告: Peer {tag} 缺少 xray_socks_port，"
+                f"使用基于哈希的端口 {socks_port}"
+            )
 
         socks_outbound = {
             "type": "socks",
@@ -1524,9 +1484,9 @@ def ensure_peer_dns_servers(config: dict, peer_tags: List[str]) -> None:
 
 
 # ============ WARP Egress 支持 ============
-# Cloudflare WARP 通过 usque (MASQUE 协议) 提供出口
-# - 每个 WARP 出口运行独立的 usque SOCKS5 代理
-# - sing-box 通过 SOCKS outbound 连接到 usque
+# Cloudflare WARP 通过 WireGuard 提供出口
+# - MASQUE 协议已弃用，仅支持 WireGuard
+# - sing-box 通过 direct outbound + bind_interface 连接
 
 
 def load_warp_egress() -> List[dict]:
@@ -1545,9 +1505,12 @@ def load_warp_egress() -> List[dict]:
 def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[str]:
     """确保每个 WARP 出口都有对应的 outbound
 
-    WARP 支持两种协议:
-    - MASQUE: 通过 usque SOCKS5 代理桥接 (sing-box SOCKS outbound)
+    WARP 仅支持 WireGuard 协议：
     - WireGuard: 通过内核 WireGuard 接口 (sing-box direct outbound + bind_interface)
+    - MASQUE 协议已弃用
+
+    在 userspace WireGuard 模式下，WARP 隧道由 rust-router 管理，
+    不需要在 sing-box 中创建 outbound。只返回 tags 供 all_egress_tags 使用。
 
     Args:
         config: sing-box 配置
@@ -1559,57 +1522,19 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
     if not warp_egress:
         return []
 
-    # Import here to avoid circular dependency
-    from setup_kernel_wg_egress import get_egress_interface_name
-
-    outbounds = config.setdefault("outbounds", [])
-    existing_tags = {ob.get("tag") for ob in outbounds}
+    # WARP tunnels are managed by rust-router (userspace WireGuard mode)
+    # No sing-box outbounds needed - just collect tags for DNS configuration
     warp_tags = []
 
     for egress in warp_egress:
         tag = egress.get("tag")
-        protocol = egress.get("protocol", "masque")
 
         if not tag:
             print(f"[render] 警告: WARP 出口缺少 tag，跳过")
             continue
 
         warp_tags.append(tag)
-
-        if protocol == "wireguard":
-            # WireGuard 协议: 使用内核 WireGuard 接口
-            interface = get_egress_interface_name(tag, egress_type="warp")
-            outbound = {
-                "type": "direct",
-                "tag": tag,
-                "bind_interface": interface
-            }
-            outbound_type = f"direct -> {interface}"
-        else:
-            # MASQUE 协议: 使用 usque SOCKS5 代理
-            socks_port = egress.get("socks_port")
-            if not socks_port:
-                print(f"[render] 警告: WARP MASQUE 出口 {tag} 缺少 socks_port，跳过")
-                continue
-            outbound = {
-                "type": "socks",
-                "tag": tag,
-                "server": "127.0.0.1",
-                "server_port": socks_port
-            }
-            outbound_type = f"SOCKS -> 127.0.0.1:{socks_port}"
-
-        if tag in existing_tags:
-            # 更新现有 outbound
-            for i, ob in enumerate(outbounds):
-                if ob.get("tag") == tag:
-                    outbounds[i] = outbound
-                    break
-        else:
-            # 在 block 之前插入
-            block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
-            outbounds.insert(block_idx, outbound)
-            print(f"[render] 创建 WARP 出口 ({protocol}): {tag} -> {outbound_type}")
+        print(f"[render] WARP 出口 {tag} 由 rust-router 管理 (userspace WireGuard)")
 
     return warp_tags
 
@@ -2030,21 +1955,26 @@ def ensure_v2ray_inbound(config: dict) -> bool:
         return False
 
     # 以下是旧的 sing-box 内置 V2Ray 支持（保留供参考但不再使用）
+    # [Xray-lite] 现仅支持 VLESS，VMess/Trojan 已移除
     inbounds = config.setdefault("inbounds", [])
     users = v2ray_config["users"]
     protocol = cfg.get("protocol")
 
-    # Build users list
+    # [Xray-lite] 验证协议 - 仅支持 VLESS
+    if protocol != "vless":
+        raise ValueError(
+            f"Only VLESS protocol is supported in Xray-lite. "
+            f"Current protocol: {protocol}. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
+
+    # Build users list - VLESS only
     users_config = []
     for user in users:
-        user_cfg = {"name": user.get("name")}
-        if protocol in ("vmess", "vless"):
-            user_cfg["uuid"] = user.get("uuid")
-        elif protocol == "trojan":
-            user_cfg["password"] = user.get("password")
-        if protocol == "vmess" and user.get("alter_id"):
-            user_cfg["alter_id"] = user.get("alter_id")
-        if protocol == "vless" and user.get("flow"):
+        user_cfg = {
+            "name": user.get("name"),
+            "uuid": user.get("uuid")
+        }
+        if user.get("flow"):
             user_cfg["flow"] = user.get("flow")
         users_config.append(user_cfg)
 
@@ -2673,13 +2603,11 @@ def main() -> None:
     pia_profiles = load_pia_profiles_from_db()
     custom_egress = load_custom_egress()
 
-    # 使用内核 WireGuard 模块处理所有 WireGuard 出口
-    # 这些接口由 setup_kernel_wg_egress.py 在容器启动时创建
-    # sing-box 使用 direct outbound + bind_interface 将流量发送到内核接口
+    # 获取 WireGuard 出口 tags（由 rust-router 的 boringtun 管理）
+    # 内核 WireGuard 模式已弃用
     wg_egress_tags = ensure_kernel_wg_egress_outbounds(config, pia_profiles, custom_egress)
 
     if wg_egress_tags:
-        print(f"[render] 内核 WireGuard 出口: {wg_egress_tags}")
         all_egress_tags.extend(wg_egress_tags)
 
         # 确保 DNS 服务器存在
@@ -2709,7 +2637,7 @@ def main() -> None:
         ensure_openvpn_dns_servers(config, openvpn_tags)
         all_egress_tags.extend(openvpn_tags)
 
-    # 加载并处理 V2Ray 出口（支持 VMess, VLESS, Trojan）
+    # 加载并处理 V2Ray 出口 - VLESS only (VMess/Trojan removed in Xray-lite)
     # 使用 Xray 进程处理所有 V2Ray 出口，通过 SOCKS5 代理桥接
     # Xray 提供 sing-box 不支持的功能：XHTTP, REALITY, XTLS-Vision
     v2ray_egress = load_v2ray_egress()
@@ -2719,11 +2647,11 @@ def main() -> None:
         ensure_v2ray_dns_servers(config, v2ray_tags)
         all_egress_tags.extend(v2ray_tags)
 
-    # 加载并处理 WARP 出口（Cloudflare WARP 通过 usque MASQUE 协议）
-    # 每个 WARP 出口运行独立的 usque SOCKS5 代理
+    # 加载并处理 WARP 出口（WireGuard only, MASQUE deprecated）
+    # sing-box 通过 direct outbound + bind_interface 连接 WireGuard 接口
     warp_egress = load_warp_egress()
     if warp_egress:
-        print(f"[render] 处理 {len(warp_egress)} 个 WARP 出口 (通过 usque SOCKS5)")
+        print(f"[render] 处理 {len(warp_egress)} 个 WARP 出口 (WireGuard)")
         warp_tags = ensure_warp_egress_outbounds(config, warp_egress)
         ensure_warp_dns_servers(config, warp_tags)
         all_egress_tags.extend(warp_tags)

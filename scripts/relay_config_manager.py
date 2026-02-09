@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """中继节点配置管理器
 
-Phase 11.4: 对于 WireGuard 多跳链路，中间节点需要 iptables 规则来转发流量。
+.. deprecated::
+    此模块已弃用。rust-router 现在在用户空间处理多跳中继路由。
 
-架构：
+    - 在 userspace WireGuard 模式下，rust-router 直接处理多跳转发
+    - 无需 iptables DSCP 标记规则
+    - 参见 rust-router/src/tunnel/ 目录
+
+    保留此文件仅用于向后兼容和参考。
+
+原始功能说明（已废弃）：
+对于 WireGuard 多跳链路，中间节点需要 iptables 规则来转发流量。
+
+架构（已迁移到 rust-router 用户空间）：
     入口(A) -> wg-peer-B [DSCP 标记] -> 中继(B) -> wg-peer-C -> 终端(C)
 
 中继规则（在节点 B 上）：
@@ -14,10 +24,11 @@ Phase 11.4: 对于 WireGuard 多跳链路，中间节点需要 iptables 规则�
 设计决策：
     - 中继节点仅透传流量到下一跳，不在本地出口（简化实现）
     - 使用独立的 fwmark 范围 (400-463) 避免与终端 (300) 和 ECMP (200) 冲突
-    - 支持 WireGuard 和 Xray 两种隧道类型
+    - 仅支持 WireGuard 隧道（Xray 使用 SOCKS5，无法保留 DSCP 标记）
 """
 
 import logging
+import os
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -38,7 +49,7 @@ class RelayRule:
     source_interface: str       # 流量来源接口 (如 wg-peer-node-a)
     target_interface: str       # 流量目标接口 (如 wg-peer-node-c)
     dscp_value: int             # DSCP 标记值
-    mark_type: str = "dscp"     # 标记类型: 'dscp' 或 'xray_email'
+    mark_type: str = "dscp"     # 标记类型（仅支持 'dscp'，Xray 隧道不支持中继）
     fwmark: int = 0             # 分配的 fwmark 值
     table_id: int = 0           # 分配的路由表 ID
     active: bool = False        # 是否已激活
@@ -50,7 +61,8 @@ class RelayConfigManager:
     管理多跳链路中间节点的转发规则，包括：
     - iptables DSCP 匹配和标记
     - 策略路由（ip rule + ip route）
-    - Xray email 路由规则
+
+    注意：仅支持 WireGuard 隧道，Xray 隧道使用 SOCKS5 代理，无法保留 DSCP 标记。
     """
 
     def __init__(self, db=None):
@@ -82,7 +94,7 @@ class RelayConfigManager:
             source_interface: 流量来源接口
             target_interface: 流量目标接口
             dscp_value: DSCP 标记值
-            mark_type: 标记类型 ('dscp' 或 'xray_email')
+            mark_type: 标记类型（仅支持 'dscp'，Xray 隧道不支持中继）
 
         Returns:
             是否成功配置
@@ -92,6 +104,20 @@ class RelayConfigManager:
             if chain_tag in self._rules:
                 logger.warning(f"[relay] 链路 '{chain_tag}' 的中继规则已存在")
                 return True
+
+            if any(
+                rule.dscp_value == dscp_value and rule.mark_type == mark_type
+                for rule in self._rules.values()
+            ):
+                conflict = next(
+                    rule
+                    for rule in self._rules.values()
+                    if rule.dscp_value == dscp_value and rule.mark_type == mark_type
+                )
+                logger.error(
+                    f"[relay] DSCP={dscp_value} 已被链路 '{conflict.chain_tag}' 使用，拒绝重复注册"
+                )
+                return False
 
             # 分配 fwmark 和路由表
             fwmark = self._allocate_fwmark()
@@ -193,6 +219,16 @@ class RelayConfigManager:
                     logger.warning(f"[relay] 链路 '{chain_tag}' 的节点不存在")
                     continue
 
+                # 验证节点使用 WireGuard 隧道（非 Xray）
+                source_tunnel_type = source_node.get("tunnel_type", "wireguard")
+                target_tunnel_type = target_node.get("tunnel_type", "wireguard")
+                if source_tunnel_type == "xray" or target_tunnel_type == "xray":
+                    logger.warning(
+                        f"[relay] 链路 '{chain_tag}' 包含 Xray 节点，跳过中继路由同步 "
+                        f"(source={source_peer}:{source_tunnel_type}, target={target_peer}:{target_tunnel_type})"
+                    )
+                    continue
+
                 source_interface = source_node.get("tunnel_interface", f"wg-peer-{source_peer}")
                 target_interface = target_node.get("tunnel_interface", f"wg-peer-{target_peer}")
 
@@ -264,122 +300,50 @@ class RelayConfigManager:
     def _setup_dscp_relay(self, rule: RelayRule) -> bool:
         """设置 DSCP 匹配的中继转发
 
-        1. iptables -t mangle -A PREROUTING -i {source} -m dscp --dscp {value} -j MARK --set-mark {fwmark}
-        2. ip rule add fwmark {fwmark} table {table}
-        3. ip route add default dev {target} table {table}
+        rust-router 在用户空间处理 DSCP 路由，无需内核 iptables 规则。
+        此函数保留用于日志记录和兼容性。
         """
-        try:
-            # 1. 添加 iptables 规则 - DSCP 匹配并设置 fwmark
-            iptables_cmd = [
-                "iptables", "-t", "mangle", "-A", "PREROUTING",
-                "-i", rule.source_interface,
-                "-m", "dscp", "--dscp", str(rule.dscp_value),
-                "-j", "MARK", "--set-mark", str(rule.fwmark)
-            ]
-            subprocess.run(iptables_cmd, check=True, capture_output=True, timeout=10)
-            logger.debug(f"[relay] 添加 iptables 规则: {' '.join(iptables_cmd)}")
-
-            # 2. 添加策略路由规则
-            rule_cmd = ["ip", "rule", "add", "fwmark", str(rule.fwmark), "table", str(rule.table_id)]
-            subprocess.run(rule_cmd, check=True, capture_output=True, timeout=10)
-            logger.debug(f"[relay] 添加 ip rule: {' '.join(rule_cmd)}")
-
-            # 3. 添加默认路由到目标接口
-            route_cmd = ["ip", "route", "add", "default", "dev", rule.target_interface, "table", str(rule.table_id)]
-            result = subprocess.run(route_cmd, capture_output=True, timeout=10)
-            if result.returncode != 0:
-                # 如果路由已存在，尝试替换
-                route_cmd = ["ip", "route", "replace", "default", "dev", rule.target_interface, "table", str(rule.table_id)]
-                subprocess.run(route_cmd, check=True, capture_output=True, timeout=10)
-            logger.debug(f"[relay] 添加 ip route: {' '.join(route_cmd)}")
-
-            return True
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"[relay] 设置 DSCP 中继失败: {e.stderr.decode() if e.stderr else e}")
-            # 尝试回滚已添加的规则
-            self._cleanup_dscp_relay(rule)
-            return False
-        except subprocess.TimeoutExpired:
-            logger.error("[relay] 设置 DSCP 中继超时")
-            return False
-        except Exception as e:
-            logger.error(f"[relay] 设置 DSCP 中继异常: {e}")
-            return False
+        logger.info(
+            f"[relay] DSCP relay managed by rust-router (userspace mode): "
+            f"chain={rule.chain_tag}, dscp={rule.dscp_value}"
+        )
+        return True
 
     def _cleanup_dscp_relay(self, rule: RelayRule) -> bool:
-        """清理 DSCP 中继规则"""
-        success = True
+        """清理 DSCP 中继规则
 
-        # 1. 删除路由
-        try:
-            route_cmd = ["ip", "route", "del", "default", "table", str(rule.table_id)]
-            subprocess.run(route_cmd, capture_output=True, timeout=10)
-        except Exception as e:
-            logger.warning(f"[relay] 删除路由失败: {e}")
-
-        # 2. 删除策略路由规则
-        try:
-            rule_cmd = ["ip", "rule", "del", "fwmark", str(rule.fwmark), "table", str(rule.table_id)]
-            subprocess.run(rule_cmd, capture_output=True, timeout=10)
-        except Exception as e:
-            logger.warning(f"[relay] 删除 ip rule 失败: {e}")
-
-        # 3. 删除 iptables 规则
-        try:
-            iptables_cmd = [
-                "iptables", "-t", "mangle", "-D", "PREROUTING",
-                "-i", rule.source_interface,
-                "-m", "dscp", "--dscp", str(rule.dscp_value),
-                "-j", "MARK", "--set-mark", str(rule.fwmark)
-            ]
-            subprocess.run(iptables_cmd, capture_output=True, timeout=10)
-        except Exception as e:
-            logger.warning(f"[relay] 删除 iptables 规则失败: {e}")
-            success = False
-
-        return success
+        rust-router 在用户空间处理 DSCP 路由，无需清理内核规则。
+        """
+        logger.debug(f"[relay] DSCP cleanup (no-op in userspace mode): chain={rule.chain_tag}")
+        return True
 
     def _setup_xray_relay(self, rule: RelayRule) -> bool:
-        """设置 Xray email 路由规则
+        """Xray 中继路由不支持
 
-        对于 Xray 链路，使用 email 路由规则透传流量。
-        设计决策：中继节点仅透传到下一跳，不在本地出口。
+        设计决策：多跳链路应使用 WireGuard 隧道，而非 Xray。
+        Xray 隧道用于入口/出口，不用于中继。
+
+        WireGuard 中继优势：
+        - 内核级转发，性能更高
+        - DSCP 标记保留，路由更简单
+        - 无需复杂的 email 路由规则
+
+        Returns:
+            False - Xray 中继不支持
         """
-        try:
-            from xray_manager import get_xray_manager
-
-            xray_mgr = get_xray_manager()
-            if not xray_mgr:
-                logger.error("[relay] Xray manager 不可用")
-                return False
-
-            # 构造 email 标识符
-            # 格式: chain-{chain_tag}@{source_node}
-            email = f"chain-{rule.chain_tag}@relay"
-
-            # 添加路由规则：匹配 email -> 转发到目标节点的出站
-            # TODO: 需要 xray_manager 支持动态添加路由规则
-            logger.info(f"[relay] Xray 中继规则已配置 (email={email})")
-
-            return True
-
-        except ImportError:
-            logger.error("[relay] 无法导入 xray_manager")
-            return False
-        except Exception as e:
-            logger.error(f"[relay] 设置 Xray 中继失败: {e}")
-            return False
+        logger.error(
+            f"[relay] Xray relay not supported for multi-hop chains. "
+            f"Use WireGuard tunnels instead. chain={rule.chain_tag}"
+        )
+        return False
 
     def _cleanup_xray_relay(self, rule: RelayRule) -> bool:
-        """清理 Xray 中继规则"""
-        try:
-            # TODO: 需要 xray_manager 支持动态删除路由规则
-            logger.info(f"[relay] Xray 中继规则已清理 (chain={rule.chain_tag})")
-            return True
-        except Exception as e:
-            logger.error(f"[relay] 清理 Xray 中继失败: {e}")
-            return False
+        """清理 Xray 中继规则
+
+        由于 Xray 中继不支持，此方法仅记录日志。
+        """
+        logger.debug(f"[relay] Xray relay cleanup (no-op): chain={rule.chain_tag}")
+        return True
 
     def _save_rule_to_db(self, rule: RelayRule):
         """将规则保存到数据库"""

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""将 Adblock Plus 语法转换为 sing-box rule-set 格式
+"""将 Adblock Plus 语法转换为 sing-box rule-set 格式或 msgpack 二进制格式
 
 支持的输入格式:
 - ABP 语法: ||domain^ (只提取域名规则，忽略元素隐藏)
@@ -7,13 +7,27 @@
 - 纯域名格式: domain.com
 
 输出格式:
-- sing-box rule-set JSON (source 格式)
+- sing-box rule-set JSON (source 格式) - 向后兼容
+- msgpack 二进制文件 (高性能) - 新架构
 """
 import json
 import re
+import hashlib
 import urllib.request
 from pathlib import Path
-from typing import Set, Optional
+from typing import Set, Optional, Tuple
+
+try:
+    import msgpack
+    HAS_MSGPACK = True
+except ImportError:
+    HAS_MSGPACK = False
+
+try:
+    from rule_binary import write_rule_binary
+    HAS_RULE_BINARY = True
+except ImportError:
+    HAS_RULE_BINARY = False
 
 
 def parse_adblock_rule(line: str) -> Optional[str]:
@@ -167,6 +181,52 @@ def save_singbox_ruleset(domains: Set[str], output_path: Path):
 
     file_size = output_path.stat().st_size / 1024
     print(f"已保存: {output_path} ({file_size:.1f} KB)")
+
+
+def save_binary_ruleset(domains: Set[str], output_path: Path, outbound: str = "block") -> Tuple[str, int]:
+    """保存为 msgpack 二进制格式（与 rule_binary.py 格式兼容）
+
+    Args:
+        domains: 域名集合
+        output_path: 输出路径（.bin 文件）
+        outbound: 出口标签
+
+    Returns:
+        (checksum, domain_count) 元组
+    """
+    if not HAS_RULE_BINARY:
+        raise ImportError("rule_binary module not available")
+
+    # 使用 rule_binary 模块写入，保证格式兼容
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    checksum = write_rule_binary(
+        str(output_path),
+        rules=sorted(domains),  # 排序以保证一致性
+        rule_type="domain_suffix",
+        outbound=outbound
+    )
+
+    file_size = output_path.stat().st_size / 1024
+    print(f"已保存二进制: {output_path} ({file_size:.1f} KB, {len(domains):,} 条规则)")
+    return checksum, len(domains)
+
+
+def convert_to_binary(url: str, format: str, output_path: Path, outbound: str = "block") -> Tuple[Optional[str], int]:
+    """下载并转换为 msgpack 二进制格式
+
+    Args:
+        url: 规则列表 URL
+        format: 格式类型 (adblock, hosts, domains)
+        output_path: 输出路径（.bin 文件）
+        outbound: 出口标签
+
+    Returns:
+        (checksum, domain_count) 元组，失败时 checksum 为 None
+    """
+    domains = download_and_convert(url, format)
+    if not domains:
+        return None, 0
+    return save_binary_ruleset(domains, output_path, outbound)
 
 
 def convert_rule_set(url: str, format: str, output_path: Path) -> int:

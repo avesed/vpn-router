@@ -1,0 +1,212 @@
+{
+  "description": "Phase 6 DSCP Packet Modification Test Vectors",
+  "version": "1.0.0",
+  "generated": "2026-01-07",
+  "test_vectors": [
+    {
+      "name": "ipv4_set_dscp_10",
+      "description": "Set DSCP value 10 on IPv4 packet",
+      "input_packet_hex": "45000028000040004006000001020304c0a80001",
+      "dscp_value": 10,
+      "expected_tos_byte": "28",
+      "expected_checksum_valid": true
+    },
+    {
+      "name": "ipv4_set_dscp_0",
+      "description": "Set DSCP value 0 on IPv4 packet",
+      "input_packet_hex": "45280028000040004006000001020304c0a80001",
+      "dscp_value": 0,
+      "expected_tos_byte": "00",
+      "expected_checksum_valid": true
+    },
+    {
+      "name": "ipv4_set_dscp_63",
+      "description": "Set maximum DSCP value 63 on IPv4 packet",
+      "input_packet_hex": "45000028000040004006000001020304c0a80001",
+      "dscp_value": 63,
+      "expected_tos_byte": "fc",
+      "expected_checksum_valid": true
+    },
+    {
+      "name": "ipv4_set_dscp_1",
+      "description": "Set minimum DSCP value 1 on IPv4 packet",
+      "input_packet_hex": "45000028000040004006000001020304c0a80001",
+      "dscp_value": 1,
+      "expected_tos_byte": "04",
+      "expected_checksum_valid": true
+    },
+    {
+      "name": "ipv4_preserve_ecn_01",
+      "description": "Preserve ECN bits 01 when setting DSCP",
+      "input_packet_hex": "45010028000040004006000001020304c0a80001",
+      "dscp_value": 20,
+      "expected_tos_byte": "51",
+      "expected_checksum_valid": true,
+      "note": "ECN bits (lower 2) should remain 01"
+    },
+    {
+      "name": "ipv4_preserve_ecn_10",
+      "description": "Preserve ECN bits 10 when setting DSCP",
+      "input_packet_hex": "45020028000040004006000001020304c0a80001",
+      "dscp_value": 20,
+      "expected_tos_byte": "52",
+      "expected_checksum_valid": true,
+      "note": "ECN bits (lower 2) should remain 10"
+    },
+    {
+      "name": "ipv4_preserve_ecn_11",
+      "description": "Preserve ECN bits 11 when setting DSCP",
+      "input_packet_hex": "45030028000040004006000001020304c0a80001",
+      "dscp_value": 20,
+      "expected_tos_byte": "53",
+      "expected_checksum_valid": true,
+      "note": "ECN bits (lower 2) should remain 11"
+    },
+    {
+      "name": "ipv4_get_dscp_10",
+      "description": "Extract DSCP value 10 from IPv4 packet",
+      "input_packet_hex": "45280028000040004006000001020304c0a80001",
+      "test_type": "get",
+      "expected_dscp": 10
+    },
+    {
+      "name": "ipv4_get_dscp_42",
+      "description": "Extract DSCP value 42 from IPv4 packet",
+      "input_packet_hex": "45a80028000040004006000001020304c0a80001",
+      "test_type": "get",
+      "expected_dscp": 42
+    },
+    {
+      "name": "ipv6_set_dscp_10",
+      "description": "Set DSCP value 10 on IPv6 packet",
+      "input_packet_hex": "60000000001406402001db800000000000000000000000012001db80000000000000000000000002",
+      "dscp_value": 10,
+      "expected_traffic_class": "28",
+      "expected_checksum_valid": true,
+      "note": "IPv6 has no checksum, always valid"
+    },
+    {
+      "name": "ipv6_set_dscp_63",
+      "description": "Set maximum DSCP value on IPv6 packet",
+      "input_packet_hex": "60000000001406402001db800000000000000000000000012001db80000000000000000000000002",
+      "dscp_value": 63,
+      "expected_traffic_class": "fc",
+      "expected_checksum_valid": true
+    },
+    {
+      "name": "ipv6_preserve_ecn",
+      "description": "Preserve ECN bits when setting DSCP on IPv6",
+      "input_packet_hex": "60300000001406402001db800000000000000000000000012001db80000000000000000000000002",
+      "dscp_value": 20,
+      "expected_traffic_class": "53",
+      "expected_checksum_valid": true,
+      "note": "Original ECN=11 should be preserved"
+    },
+    {
+      "name": "ipv6_get_dscp_20",
+      "description": "Extract DSCP value 20 from IPv6 packet",
+      "input_packet_hex": "65000000001406402001db800000000000000000000000012001db80000000000000000000000002",
+      "test_type": "get",
+      "expected_dscp": 20
+    },
+    {
+      "name": "invalid_dscp_64",
+      "description": "DSCP value 64 is invalid (exceeds 6-bit field)",
+      "input_packet_hex": "45000028000040004006000001020304c0a80001",
+      "dscp_value": 64,
+      "expected": "error",
+      "expected_error": "InvalidDscpValue"
+    },
+    {
+      "name": "invalid_dscp_255",
+      "description": "DSCP value 255 is invalid (exceeds 6-bit field)",
+      "input_packet_hex": "45000028000040004006000001020304c0a80001",
+      "dscp_value": 255,
+      "expected": "error",
+      "expected_error": "InvalidDscpValue"
+    },
+    {
+      "name": "invalid_empty_packet",
+      "description": "Empty packet should return error",
+      "input_packet_hex": "",
+      "dscp_value": 10,
+      "expected": "error",
+      "expected_error": "EmptyPacket"
+    },
+    {
+      "name": "invalid_packet_too_short_ipv4",
+      "description": "IPv4 packet shorter than minimum header (20 bytes)",
+      "input_packet_hex": "4500002800004000",
+      "dscp_value": 10,
+      "expected": "error",
+      "expected_error": "PacketTooShort"
+    },
+    {
+      "name": "invalid_packet_too_short_ipv6",
+      "description": "IPv6 packet shorter than minimum header (40 bytes)",
+      "input_packet_hex": "60000000001406402001db80000000000000000000000001",
+      "dscp_value": 10,
+      "expected": "error",
+      "expected_error": "PacketTooShort"
+    },
+    {
+      "name": "invalid_ip_version",
+      "description": "Invalid IP version (7) should return error",
+      "input_packet_hex": "75000028000040004006000001020304c0a80001",
+      "dscp_value": 10,
+      "expected": "error",
+      "expected_error": "InvalidIpVersion"
+    },
+    {
+      "name": "invalid_ip_version_3",
+      "description": "Invalid IP version (3) should return error",
+      "input_packet_hex": "35000028000040004006000001020304c0a80001",
+      "dscp_value": 10,
+      "expected": "error",
+      "expected_error": "InvalidIpVersion"
+    },
+    {
+      "name": "ipv4_checksum_recalc_10_0_0_1",
+      "description": "Verify checksum recalculation for 10.0.0.1 -> 192.168.0.1",
+      "input_packet_hex": "450000280001400040060000c0a80001c0a80002",
+      "dscp_value": 30,
+      "expected_tos_byte": "78",
+      "expected_checksum_valid": true,
+      "verify_checksum": true
+    },
+    {
+      "name": "dscp_roundtrip_all_values",
+      "description": "Test set and get for all valid DSCP values",
+      "test_type": "roundtrip",
+      "dscp_range": [0, 63],
+      "note": "Verifies that set_dscp followed by get_dscp returns same value"
+    },
+    {
+      "name": "ipv4_standard_qos_ef",
+      "description": "Set Expedited Forwarding (EF) DSCP = 46",
+      "input_packet_hex": "45000028000040004006000001020304c0a80001",
+      "dscp_value": 46,
+      "expected_tos_byte": "b8",
+      "expected_checksum_valid": true,
+      "note": "EF PHB (101110 binary)"
+    },
+    {
+      "name": "ipv4_standard_qos_af11",
+      "description": "Set Assured Forwarding AF11 DSCP = 10",
+      "input_packet_hex": "45000028000040004006000001020304c0a80001",
+      "dscp_value": 10,
+      "expected_tos_byte": "28",
+      "expected_checksum_valid": true,
+      "note": "AF11 PHB (001010 binary)"
+    },
+    {
+      "name": "ipv4_standard_qos_cs7",
+      "description": "Set Network Control CS7 DSCP = 56",
+      "input_packet_hex": "45000028000040004006000001020304c0a80001",
+      "dscp_value": 56,
+      "expected_tos_byte": "e0",
+      "expected_checksum_valid": true,
+      "note": "CS7 PHB (111000 binary)"
+    }
+  ]
+}

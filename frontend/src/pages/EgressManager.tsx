@@ -2355,8 +2355,21 @@ export default function EgressManager() {
                     </div>
 
                     <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
-                      <p className="text-xs text-slate-400">
-                        <span className="text-slate-500">{t('v2rayEgress.protocol')}:</span> {getV2rayProtocolLabel(egress.protocol)}
+                      <p className="text-xs text-slate-400 flex items-center gap-2">
+                        <span>
+                          <span className="text-slate-500">{t('v2rayEgress.protocol')}:</span> {getV2rayProtocolLabel(egress.protocol)}
+                        </span>
+                        {(egress.protocol === "vmess" || egress.protocol === "trojan") && (
+                          <span
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 text-[11px] font-medium"
+                            title={t('v2rayEgress.deprecatedProtocolTooltip')}
+                            aria-label={t('v2rayEgress.deprecatedProtocolTooltip')}
+                            role="status"
+                          >
+                            <ExclamationTriangleIcon className="h-3 w-3" aria-hidden="true" />
+                            {t('v2rayEgress.deprecatedProtocol')}
+                          </span>
+                        )}
                       </p>
                       <p className="text-xs text-slate-400 truncate">
                         <span className="text-slate-500">{t('v2rayEgress.server')}:</span> {egress.server}:{egress.server_port}

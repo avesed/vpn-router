@@ -1,0 +1,5765 @@
+//! IPC Protocol definitions
+//!
+//! This module defines the command and response types used for
+//! inter-process communication via Unix socket.
+
+use serde::{Deserialize, Serialize};
+
+use crate::config::OutboundConfig;
+use crate::connection::StatsSnapshot;
+use crate::ingress::{ForwardingStatsSnapshot, IngressReplyStatsSnapshot, WgIngressStats};
+
+/// IPC command types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IpcCommand {
+    /// Ping to check if the server is alive
+    Ping,
+
+    /// Get server status
+    Status,
+
+    /// Get server capabilities
+    GetCapabilities,
+
+    /// Get overall statistics
+    GetStats,
+
+    /// Get per-outbound statistics
+    GetOutboundStats,
+
+    /// Reload configuration
+    Reload {
+        /// Path to configuration file
+        config_path: String,
+    },
+
+    /// Add a new outbound
+    AddOutbound {
+        /// Outbound configuration
+        config: OutboundConfig,
+    },
+
+    /// Remove an outbound
+    RemoveOutbound {
+        /// Outbound tag to remove
+        tag: String,
+    },
+
+    /// Enable an outbound
+    EnableOutbound {
+        /// Outbound tag
+        tag: String,
+    },
+
+    /// Disable an outbound
+    DisableOutbound {
+        /// Outbound tag
+        tag: String,
+    },
+
+    /// Get outbound info
+    GetOutbound {
+        /// Outbound tag
+        tag: String,
+    },
+
+    /// List all outbounds
+    ListOutbounds,
+
+    /// Initiate graceful shutdown
+    Shutdown {
+        /// Optional drain timeout in seconds
+        drain_timeout_secs: Option<u32>,
+    },
+
+    /// Test rule matching (for debugging/parity testing)
+    ///
+    /// This command tests the rule engine against a specific connection.
+    /// It is primarily used for debugging and parity testing with the
+    /// Python reference implementation.
+    TestMatch {
+        /// Domain name (optional)
+        domain: Option<String>,
+        /// Destination IP address (optional)
+        dest_ip: Option<String>,
+        /// Destination port
+        dest_port: u16,
+        /// Transport protocol (tcp/udp)
+        protocol: String,
+        /// Sniffed protocol (optional: tls/http/quic)
+        #[serde(default)]
+        sniffed_protocol: Option<String>,
+    },
+
+    /// Get rule engine statistics
+    ///
+    /// Returns statistics about the current routing configuration,
+    /// including rule counts and version information.
+    GetRuleStats,
+
+    /// Reload rules from configuration
+    ///
+    /// Reloads the rule engine configuration from the specified path.
+    /// If no path is provided, uses the current configuration.
+    ReloadRules {
+        /// Optional path to configuration file (uses current config if None)
+        #[serde(default)]
+        config_path: Option<String>,
+    },
+
+    /// Add a SOCKS5 outbound with connection pool
+    ///
+    /// Creates a new SOCKS5 client outbound with deadpool connection pooling.
+    /// Supports optional username/password authentication (RFC 1929).
+    AddSocks5Outbound {
+        /// Unique tag for this outbound
+        tag: String,
+        /// SOCKS5 server address (host:port)
+        server_addr: String,
+        /// Optional username for authentication
+        #[serde(default)]
+        username: Option<String>,
+        /// Optional password for authentication
+        #[serde(default)]
+        password: Option<String>,
+        /// Connection timeout in seconds (default: 10)
+        #[serde(default = "default_connect_timeout")]
+        connect_timeout_secs: u64,
+        /// Idle timeout in seconds (default: 300)
+        #[serde(default = "default_idle_timeout")]
+        idle_timeout_secs: u64,
+        /// Maximum pool size (default: 32)
+        #[serde(default = "default_pool_size")]
+        pool_max_size: usize,
+    },
+
+    /// Get connection pool statistics for a SOCKS5 outbound
+    ///
+    /// Returns pool statistics including current size, available connections,
+    /// and number of waiters.
+    GetPoolStats {
+        /// Outbound tag (if None, returns stats for all SOCKS5 outbounds)
+        #[serde(default)]
+        tag: Option<String>,
+    },
+
+    // ========================================================================
+    // IPC Protocol v2.1 Commands
+    // ========================================================================
+    /// Add a `WireGuard` outbound using `DirectOutbound` with `bind_interface`
+    ///
+    /// Creates a direct outbound bound to a `WireGuard` tunnel (e.g., wg-pia-us-east).
+    /// In userspace mode, tunnels are managed by rust-router's boringtun integration.
+    AddWireguardOutbound {
+        /// Unique tag for this outbound
+        tag: String,
+        /// `WireGuard` interface name (e.g., "wg-pia-us-east")
+        interface: String,
+        /// Optional routing mark for policy routing
+        #[serde(default)]
+        routing_mark: Option<u32>,
+        /// Optional routing table for policy routing
+        #[serde(default)]
+        routing_table: Option<u32>,
+    },
+
+    /// Drain an outbound gracefully before removal
+    ///
+    /// Waits for existing connections to complete (up to timeout),
+    /// then removes the outbound. New connections are rejected during drain.
+    DrainOutbound {
+        /// Outbound tag to drain
+        tag: String,
+        /// Timeout in seconds (connections are forcefully closed after this)
+        #[serde(default = "default_drain_timeout")]
+        timeout_secs: u32,
+    },
+
+    /// Update routing rules atomically
+    ///
+    /// Replaces the current routing configuration with new rules.
+    /// Uses `ArcSwap` for lock-free hot-reload.
+    UpdateRouting {
+        /// New routing rules
+        rules: Vec<RuleConfig>,
+        /// Default outbound for unmatched traffic
+        default_outbound: String,
+    },
+
+    /// Set the default outbound for unmatched traffic
+    ///
+    /// Changes only the default outbound without modifying rules.
+    SetDefaultOutbound {
+        /// New default outbound tag
+        tag: String,
+    },
+
+    /// Get health status for all outbounds
+    ///
+    /// Returns a map of outbound tags to their current health status.
+    GetOutboundHealth,
+
+    /// Notify about egress configuration change from Python
+    ///
+    /// Python sends this when egress is added/removed/updated so rust-router
+    /// can update its state accordingly.
+    NotifyEgressChange {
+        /// Action type: added, removed, updated
+        action: EgressAction,
+        /// Outbound tag affected
+        tag: String,
+        /// Egress type (pia, custom, warp, v2ray, direct, openvpn)
+        egress_type: String,
+    },
+
+    /// Get Prometheus-formatted metrics
+    ///
+    /// Returns all metrics in Prometheus text exposition format for scraping.
+    GetPrometheusMetrics,
+
+    // ========================================================================
+    // UDP IPC Commands
+    // ========================================================================
+    /// Get UDP statistics (sessions, packets, worker pool stats).
+    ///
+    /// Returns comprehensive UDP statistics including session manager stats,
+    /// worker pool stats, and buffer pool stats.
+    GetUdpStats,
+
+    /// List active UDP sessions.
+    ///
+    /// Returns snapshots of active UDP sessions with optional limit.
+    ListUdpSessions {
+        /// Maximum number of sessions to return (default: 100)
+        #[serde(default = "default_udp_session_limit")]
+        limit: usize,
+    },
+
+    /// Get a specific UDP session by client and destination address.
+    ///
+    /// Returns detailed information about a single UDP session.
+    GetUdpSession {
+        /// Client address (e.g., "192.168.1.100:12345")
+        client_addr: String,
+        /// Destination address (e.g., "8.8.8.8:443")
+        dest_addr: String,
+    },
+
+    /// Get UDP worker pool statistics.
+    ///
+    /// Returns statistics about the UDP worker pool including active workers,
+    /// packets processed, and bytes received.
+    GetUdpWorkerStats,
+
+    /// Get UDP buffer pool statistics.
+    ///
+    /// Returns statistics about the lock-free UDP buffer pool including
+    /// allocations, reuses, returns, and drops.
+    GetBufferPoolStats,
+
+    // ========================================================================
+    // IPC Protocol v3.0 - WireGuard Tunnel Management
+    // ========================================================================
+    /// Create a userspace `WireGuard` tunnel
+    ///
+    /// Creates a new `WireGuard` tunnel using boringtun.
+    CreateWgTunnel {
+        /// Unique tag for this tunnel
+        tag: String,
+        /// `WireGuard` tunnel configuration
+        config: WgTunnelConfig,
+    },
+
+    /// Remove a `WireGuard` tunnel
+    ///
+    /// Removes a userspace `WireGuard` tunnel with optional drain timeout.
+    RemoveWgTunnel {
+        /// Tunnel tag to remove
+        tag: String,
+        /// Optional drain timeout in seconds (default: 30)
+        #[serde(default)]
+        drain_timeout_secs: Option<u32>,
+    },
+
+    /// Get `WireGuard` tunnel status
+    ///
+    /// Returns status information for a specific `WireGuard` tunnel.
+    GetWgTunnelStatus {
+        /// Tunnel tag
+        tag: String,
+    },
+
+    /// List all `WireGuard` tunnels
+    ///
+    /// Returns a list of all userspace `WireGuard` tunnels.
+    ListWgTunnels,
+
+    // ========================================================================
+    // Ingress Peer Management
+    // ========================================================================
+    /// Add a peer to `WireGuard` ingress
+    ///
+    /// Adds a new client peer to the userspace `WireGuard` ingress.
+    AddIngressPeer {
+        /// Peer public key (Base64-encoded)
+        public_key: String,
+        /// Allowed IPs for this peer (e.g., "10.25.0.2/32")
+        allowed_ips: String,
+        /// Optional peer name/description
+        name: Option<String>,
+        /// Optional preshared key (Base64-encoded)
+        preshared_key: Option<String>,
+    },
+
+    /// Remove a peer from `WireGuard` ingress
+    ///
+    /// Removes a client peer from the userspace `WireGuard` ingress.
+    RemoveIngressPeer {
+        /// Peer public key (Base64-encoded)
+        public_key: String,
+    },
+
+    /// List all `WireGuard` ingress peers
+    ///
+    /// Returns a list of all peers registered with the ingress.
+    ListIngressPeers,
+
+    /// Get userspace `WireGuard` ingress statistics
+    ///
+    /// Returns ingress manager, forwarding, and reply statistics when available.
+    GetIngressStats,
+
+    // ========================================================================
+    // IPC Protocol v3.0 - ECMP Group Management
+    // ========================================================================
+    /// Create an ECMP (Equal-Cost Multi-Path) load balancing group
+    ///
+    /// Creates a new ECMP group for distributing traffic across multiple outbounds.
+    CreateEcmpGroup {
+        /// Unique tag for this group
+        tag: String,
+        /// ECMP group configuration
+        config: EcmpGroupConfig,
+    },
+
+    /// Remove an ECMP group
+    ///
+    /// Removes an ECMP load balancing group.
+    RemoveEcmpGroup {
+        /// Group tag to remove
+        tag: String,
+    },
+
+    /// Get ECMP group status
+    ///
+    /// Returns status information for a specific ECMP group.
+    GetEcmpGroupStatus {
+        /// Group tag
+        tag: String,
+    },
+
+    /// List all ECMP groups
+    ///
+    /// Returns a list of all ECMP load balancing groups.
+    ListEcmpGroups,
+
+    /// Update ECMP group members
+    ///
+    /// Replaces the members of an existing ECMP group.
+    UpdateEcmpGroupMembers {
+        /// Group tag to update
+        tag: String,
+        /// New members list
+        members: Vec<EcmpMemberConfig>,
+    },
+
+    // ========================================================================
+    // IPC Protocol v3.2 - Peer Management
+    // ========================================================================
+    /// Generate offline pairing request code
+    ///
+    /// Generates a Base64-encoded pairing request for offline node pairing.
+    /// Supports bidirectional pairing with pre-generated remote keys.
+    GeneratePairRequest {
+        /// Local node tag
+        local_tag: String,
+        /// Local node description
+        local_description: String,
+        /// Local endpoint (IP:port or hostname:port)
+        local_endpoint: String,
+        /// Local Web API port (default: 36000)
+        local_api_port: u16,
+        /// Whether to enable bidirectional auto-connect
+        bidirectional: bool,
+        /// Tunnel type (`WireGuard` or Xray)
+        tunnel_type: TunnelType,
+    },
+
+    /// Import pairing request from another node
+    ///
+    /// Imports and processes a pairing request code from another node.
+    /// Returns a response code to complete the handshake.
+    ImportPairRequest {
+        /// Base64-encoded pairing request code
+        code: String,
+        /// Local node tag
+        local_tag: String,
+        /// Local node description
+        local_description: String,
+        /// Local endpoint (IP:port or hostname:port)
+        local_endpoint: String,
+        /// Local Web API port (default: 36000)
+        local_api_port: u16,
+    },
+
+    /// Complete the pairing handshake
+    ///
+    /// Completes the pairing process with the response code.
+    CompleteHandshake {
+        /// Base64-encoded pairing response code
+        code: String,
+    },
+
+    /// Add a peer node configuration directly
+    ///
+    /// Adds a peer node configuration without going through the full pairing flow.
+    /// This is useful for testing or manual configuration recovery.
+    AddPeer {
+        /// Peer configuration
+        config: PeerConfig,
+    },
+
+    /// Connect to a configured peer node
+    ///
+    /// Initiates connection to a previously configured peer.
+    ConnectPeer {
+        /// Peer node tag
+        tag: String,
+    },
+
+    /// Disconnect from a peer node
+    ///
+    /// Disconnects from a connected peer.
+    DisconnectPeer {
+        /// Peer node tag
+        tag: String,
+    },
+
+    /// Get peer node status
+    ///
+    /// Returns status information for a specific peer.
+    GetPeerStatus {
+        /// Peer node tag
+        tag: String,
+    },
+
+    /// Get peer tunnel health status
+    ///
+    /// Returns health information based on `WireGuard` handshake for a peer.
+    GetPeerTunnelHealth {
+        /// Peer node tag
+        tag: String,
+    },
+
+    /// List all peer nodes
+    ///
+    /// Returns a list of all configured peer nodes.
+    ListPeers,
+
+    /// Remove a peer node configuration
+    ///
+    /// Removes a peer node and its associated tunnel.
+    RemovePeer {
+        /// Peer node tag
+        tag: String,
+    },
+
+    // ========================================================================
+    // IPC Protocol v3.2 - Chain Management
+    // ========================================================================
+    /// Create a multi-node routing chain
+    ///
+    /// Creates a new chain for multi-hop traffic routing with DSCP marking.
+    CreateChain {
+        /// Unique tag for this chain
+        tag: String,
+        /// Chain configuration
+        config: ChainConfig,
+    },
+
+    /// Remove a routing chain
+    ///
+    /// Removes a chain and cleans up associated routes.
+    RemoveChain {
+        /// Chain tag to remove
+        tag: String,
+    },
+
+    /// Activate a routing chain
+    ///
+    /// Activates a chain using Two-Phase Commit protocol for distributed activation.
+    ActivateChain {
+        /// Chain tag to activate
+        tag: String,
+    },
+
+    /// Deactivate a routing chain
+    ///
+    /// Deactivates a chain and removes its routing rules.
+    DeactivateChain {
+        /// Chain tag to deactivate
+        tag: String,
+    },
+
+    /// Get chain status
+    ///
+    /// Returns status information for a specific chain.
+    GetChainStatus {
+        /// Chain tag
+        tag: String,
+    },
+
+    /// List all routing chains
+    ///
+    /// Returns a list of all configured chains.
+    ListChains,
+
+    /// Get local node's role in a chain
+    ///
+    /// Returns the role (entry/relay/terminal) of the local node in a chain.
+    GetChainRole {
+        /// Chain tag
+        chain_tag: String,
+    },
+
+    /// Diagnose chain routing status
+    ///
+    /// Returns comprehensive diagnostics for a chain, including:
+    /// - Chain state in ChainManager
+    /// - Registration status in FwmarkRouter
+    /// - Next hop tunnel availability
+    /// - Exit egress configuration
+    ///
+    /// Use this command to troubleshoot chain routing issues.
+    DiagnoseChain {
+        /// Chain tag to diagnose
+        tag: String,
+    },
+
+    /// Update chain state in database
+    ///
+    /// Updates the chain state for persistence and recovery.
+    UpdateChainState {
+        /// Chain tag
+        tag: String,
+        /// New chain state
+        state: ChainState,
+        /// Optional error message
+        #[serde(default)]
+        last_error: Option<String>,
+    },
+
+    /// Update an existing chain configuration
+    ///
+    /// Updates a chain configuration. Chain must be inactive to update.
+    /// Only specified fields are updated; others retain their current values.
+    UpdateChain {
+        /// Chain tag to update
+        tag: String,
+        /// New hops (if provided)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hops: Option<Vec<ChainHop>>,
+        /// New exit egress (if provided)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_egress: Option<String>,
+        /// New description (if provided)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// New `allow_transitive` flag (if provided)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_transitive: Option<bool>,
+    },
+
+    // ========================================================================
+    // IPC Protocol v3.2 - Two-Phase Commit Commands
+    // ========================================================================
+    /// Prepare chain route (validate only, no apply)
+    ///
+    /// Validates chain configuration on this node without applying rules.
+    /// Part of the Two-Phase Commit protocol for distributed chain activation.
+    PrepareChainRoute {
+        /// Chain tag
+        chain_tag: String,
+        /// Chain configuration to validate
+        config: ChainConfig,
+        /// Node that initiated this request
+        source_node: String,
+    },
+
+    /// Commit chain route (apply rules)
+    ///
+    /// Applies chain routing rules after successful PREPARE on all nodes.
+    CommitChainRoute {
+        /// Chain tag
+        chain_tag: String,
+        /// Node that initiated this request
+        source_node: String,
+    },
+
+    /// Abort chain route (rollback any state)
+    ///
+    /// Rolls back any prepared state after a PREPARE failure.
+    AbortChainRoute {
+        /// Chain tag
+        chain_tag: String,
+        /// Node that initiated this request
+        source_node: String,
+    },
+
+    // ========================================================================
+    // IPC Protocol v3.3 - DNS Commands
+    // ========================================================================
+    /// Get overall DNS statistics
+    ///
+    /// Returns comprehensive DNS statistics including cache, blocking, and upstream metrics.
+    GetDnsStats,
+
+    /// Get detailed DNS cache statistics
+    ///
+    /// Returns cache-specific statistics including hit rate, entry count, and evictions.
+    GetDnsCacheStats,
+
+    /// Flush DNS cache entries
+    ///
+    /// Flushes cache entries matching the optional pattern.
+    /// If no pattern is provided, flushes the entire cache.
+    FlushDnsCache {
+        /// Optional pattern for selective flush (exact or suffix match)
+        #[serde(default)]
+        pattern: Option<String>,
+    },
+
+    /// Get DNS blocking/filter statistics
+    ///
+    /// Returns statistics about DNS blocking including blocked queries and rule counts.
+    GetDnsBlockStats,
+
+    /// Reload DNS blocklist rules
+    ///
+    /// Reloads blocking rules from the database, performing a hot-reload.
+    ReloadDnsBlocklist,
+
+    /// Add a DNS upstream server
+    ///
+    /// Adds a new upstream DNS server with the specified configuration.
+    ///
+    /// # Status: NOT YET IMPLEMENTED
+    ///
+    /// This command is reserved for future use. Currently returns an error.
+    /// Dynamic upstream management will be implemented in a future phase.
+    AddDnsUpstream {
+        /// Unique tag for this upstream
+        tag: String,
+        /// Upstream configuration
+        config: DnsUpstreamConfig,
+    },
+
+    /// Remove a DNS upstream server
+    ///
+    /// Removes an upstream DNS server by tag.
+    ///
+    /// # Status: NOT YET IMPLEMENTED
+    ///
+    /// This command is reserved for future use. Currently returns an error.
+    /// Dynamic upstream management will be implemented in a future phase.
+    RemoveDnsUpstream {
+        /// Upstream tag to remove
+        tag: String,
+    },
+
+    /// Get DNS upstream status
+    ///
+    /// Returns status information for upstream servers.
+    /// If tag is None, returns status for all upstreams.
+    GetDnsUpstreamStatus {
+        /// Optional tag to query specific upstream (all if None)
+        #[serde(default)]
+        tag: Option<String>,
+    },
+
+    /// Add a DNS routing rule
+    ///
+    /// Adds a rule to route queries for matching domains to a specific upstream.
+    AddDnsRoute {
+        /// Domain pattern to match
+        pattern: String,
+        /// Match type (exact, suffix, keyword, regex)
+        match_type: String,
+        /// Upstream tag to route to
+        upstream_tag: String,
+    },
+
+    /// Remove a DNS routing rule
+    ///
+    /// Removes a DNS routing rule by pattern.
+    RemoveDnsRoute {
+        /// Domain pattern to remove
+        pattern: String,
+    },
+
+    /// Get DNS query log entries
+    ///
+    /// Returns recent DNS query log entries with optional pagination.
+    ///
+    /// # Status: PARTIAL IMPLEMENTATION
+    ///
+    /// Currently returns an empty list with metadata. The `QueryLogger`
+    /// is write-only by design. A log reader implementation is planned for
+    /// future work to enable reading logs from disk.
+    GetDnsQueryLog {
+        /// Maximum number of entries to return (default: 100)
+        #[serde(default = "default_dns_query_limit")]
+        limit: usize,
+        /// Offset for pagination (default: 0)
+        #[serde(default)]
+        offset: usize,
+    },
+
+    /// Perform a test DNS query
+    ///
+    /// Executes a DNS query for debugging and testing purposes.
+    DnsQuery {
+        /// Domain name to query
+        domain: String,
+        /// Query type (e.g., 1 for A, 28 for AAAA; default: A)
+        #[serde(default)]
+        qtype: Option<u16>,
+        /// Optional specific upstream to use (uses default routing if None)
+        #[serde(default)]
+        upstream: Option<String>,
+    },
+
+    /// Get current DNS configuration
+    ///
+    /// Returns the current DNS engine configuration.
+    GetDnsConfig,
+
+    /// Register a new WARP device
+    ///
+    /// Generates WireGuard keypair, registers with Cloudflare API,
+    /// and returns the complete configuration.
+    RegisterWarp {
+        /// User-defined tag for this WARP device
+        tag: String,
+        /// Display name (optional)
+        name: Option<String>,
+        /// WARP+ license key (optional, for upgrade)
+        warp_plus_license: Option<String>,
+    },
+
+    // ========================================================================
+    // Speed Test Command
+    // ========================================================================
+    /// Run speed test through a specific outbound/tunnel
+    ///
+    /// Downloads a file through the specified outbound and measures speed.
+    /// Supports WireGuard tunnels, ECMP groups, and other outbound types.
+    SpeedTest {
+        /// Outbound or tunnel tag to test
+        tag: String,
+        /// Download size in bytes (default: 10MB)
+        #[serde(default = "default_speed_test_size")]
+        size_bytes: u64,
+        /// Timeout in seconds (default: 30)
+        #[serde(default = "default_speed_test_timeout")]
+        timeout_secs: u64,
+    },
+
+    // ========================================================================
+    // Peer API Forwarding
+    // ========================================================================
+    /// Forward an HTTP request to a peer node through its WireGuard tunnel
+    ///
+    /// This command allows Python to make API calls to peer nodes by forwarding
+    /// HTTP requests through rust-router's userspace WireGuard tunnels.
+    /// The tunnel handles encryption/decryption transparently.
+    ForwardPeerRequest {
+        /// Peer node tag (for logging)
+        peer_tag: String,
+        /// HTTP method (GET, POST, PUT, DELETE)
+        method: String,
+        /// Request path (e.g., "/api/peer-info/egress")
+        path: String,
+        /// Optional JSON request body
+        #[serde(default)]
+        body: Option<String>,
+        /// Request timeout in seconds (default: 30)
+        #[serde(default = "default_peer_request_timeout")]
+        timeout_secs: u32,
+        /// Peer endpoint (host:port) - if provided, uses this instead of PeerManager lookup
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Tunnel type ("wireguard" or "xray") - required if endpoint is provided
+        #[serde(default)]
+        tunnel_type: Option<String>,
+        /// API port on the peer (default: 36000)
+        #[serde(default)]
+        api_port: Option<u16>,
+        /// Tunnel IP for remote peer (where the API server listens, e.g., 10.200.200.1)
+        #[serde(default)]
+        tunnel_ip: Option<String>,
+        /// Local tunnel IP (our end of the tunnel, e.g., 10.200.200.2)
+        /// Required for WireGuard tunnel forwarding
+        #[serde(default)]
+        tunnel_local_ip: Option<String>,
+        /// Custom headers to include in the request (e.g., {"X-Peer-Node-ID": "my-node-tag"})
+        #[serde(default)]
+        headers: Option<std::collections::HashMap<String, String>>,
+    },
+
+    // ========================================================================
+    // VLESS Protocol Commands (v3.3)
+    // ========================================================================
+    /// Add a VLESS outbound
+    ///
+    /// Creates a new VLESS outbound with the specified configuration.
+    /// Supports TCP, TLS, and WebSocket transports.
+    AddVlessOutbound {
+        /// Unique tag for this outbound
+        tag: String,
+        /// VLESS server address (host or IP)
+        server_address: String,
+        /// VLESS server port
+        server_port: u16,
+        /// User UUID for authentication
+        uuid: String,
+        /// Flow control (e.g., "xtls-rprx-vision", empty for none)
+        #[serde(default)]
+        flow: String,
+        /// Transport type: "tcp", "tls", "websocket", or "websocket_tls"
+        #[serde(default = "default_vless_transport")]
+        transport: String,
+        /// TLS server name (for TLS/WebSocket+TLS)
+        #[serde(default)]
+        tls_server_name: Option<String>,
+        /// Skip TLS certificate verification (for testing)
+        #[serde(default)]
+        tls_skip_verify: bool,
+        /// WebSocket path (for WebSocket transport)
+        #[serde(default)]
+        ws_path: Option<String>,
+        /// WebSocket host header (for WebSocket transport)
+        #[serde(default)]
+        ws_host: Option<String>,
+    },
+
+    /// Remove a VLESS outbound
+    RemoveVlessOutbound {
+        /// Outbound tag to remove
+        tag: String,
+    },
+
+    /// List all VLESS outbounds
+    ListVlessOutbounds,
+
+    /// Get VLESS outbound info
+    GetVlessOutbound {
+        /// Outbound tag
+        tag: String,
+    },
+
+    /// Configure VLESS inbound listener
+    ///
+    /// Sets up a VLESS inbound listener that accepts connections from VLESS clients.
+    /// Supports plain TCP, TLS, and REALITY transport modes.
+    ConfigureVlessInbound {
+        /// Listen address (e.g., "0.0.0.0:443")
+        listen: String,
+        /// Allowed users
+        users: Vec<VlessUserConfig>,
+        /// TLS certificate path (optional, for VLESS over TLS)
+        ///
+        /// Note: Ignored when REALITY is enabled.
+        #[serde(default)]
+        tls_cert_path: Option<String>,
+        /// TLS private key path
+        ///
+        /// Note: Ignored when REALITY is enabled.
+        #[serde(default)]
+        tls_key_path: Option<String>,
+        /// Fallback address for non-VLESS connections
+        ///
+        /// Note: When REALITY is enabled, use `reality_dest` instead.
+        #[serde(default)]
+        fallback: Option<String>,
+        /// Enable UDP support (default: true)
+        ///
+        /// When enabled, VLESS command 0x02 (UDP) is accepted and forwarded.
+        /// Supports both Basic and XUDP modes.
+        #[serde(default = "default_enabled")]
+        udp_enabled: bool,
+        /// REALITY private key (Base64-encoded X25519, 32 bytes)
+        ///
+        /// When set, enables REALITY protocol for TLS 1.3 camouflage.
+        /// Generate with: `openssl rand -base64 32`
+        #[serde(default)]
+        reality_private_key: Option<String>,
+        /// REALITY allowed short IDs (hex strings, up to 16 characters each)
+        ///
+        /// Each short ID is used for client authentication.
+        /// Clients must use one of these IDs in their encrypted session_id.
+        #[serde(default)]
+        reality_short_ids: Option<Vec<String>>,
+        /// REALITY fallback destination (e.g., "www.google.com:443")
+        ///
+        /// Unauthenticated connections are transparently proxied to this address.
+        #[serde(default)]
+        reality_dest: Option<String>,
+        /// REALITY allowed SNI server names
+        ///
+        /// Connections with SNI not in this list are proxied to fallback.
+        #[serde(default)]
+        reality_server_names: Option<Vec<String>>,
+        /// REALITY maximum timestamp difference in milliseconds (default: 120000)
+        ///
+        /// REALITY validates that the timestamp in the encrypted session_id
+        /// is within this range of the server's current time.
+        #[serde(default)]
+        reality_max_time_diff_ms: Option<u64>,
+    },
+
+    /// Add a user to VLESS inbound
+    AddVlessUser {
+        /// User UUID
+        uuid: String,
+        /// User email (optional, for logging)
+        #[serde(default)]
+        email: Option<String>,
+        /// Flow control type
+        #[serde(default)]
+        flow: Option<String>,
+    },
+
+    /// Remove a user from VLESS inbound
+    RemoveVlessUser {
+        /// User UUID to remove
+        uuid: String,
+    },
+
+    /// List all VLESS inbound users
+    ListVlessUsers,
+
+    /// Get VLESS inbound status
+    GetVlessInboundStatus,
+
+    /// Stop VLESS inbound listener
+    StopVlessInbound,
+
+    // ========================================================================
+    // Shadowsocks Protocol Commands
+    // ========================================================================
+    /// Add a Shadowsocks outbound
+    ///
+    /// Creates a new Shadowsocks client outbound for encrypted proxy connections.
+    #[cfg(feature = "shadowsocks")]
+    AddShadowsocksOutbound {
+        /// Unique tag for this outbound
+        tag: String,
+        /// Server hostname or IP address
+        server: String,
+        /// Server port
+        server_port: u16,
+        /// Encryption method (default: 2022-blake3-aes-256-gcm)
+        #[serde(default = "default_shadowsocks_method")]
+        method: String,
+        /// Password for authentication
+        password: String,
+        /// Enable UDP support (default: false, not yet implemented)
+        #[serde(default)]
+        udp: bool,
+    },
+
+    /// Remove a Shadowsocks outbound
+    #[cfg(feature = "shadowsocks")]
+    RemoveShadowsocksOutbound {
+        /// Outbound tag to remove
+        tag: String,
+    },
+
+    /// List all Shadowsocks outbounds
+    #[cfg(feature = "shadowsocks")]
+    ListShadowsocksOutbounds,
+
+    /// Get Shadowsocks outbound info
+    #[cfg(feature = "shadowsocks")]
+    GetShadowsocksOutbound {
+        /// Outbound tag
+        tag: String,
+    },
+
+    // ========================================================================
+    // Shadowsocks Inbound Commands
+    // ========================================================================
+    /// Configure Shadowsocks inbound listener
+    ///
+    /// Sets up a Shadowsocks inbound listener that accepts connections from
+    /// Shadowsocks clients. Supports AEAD 2022 and legacy AEAD ciphers.
+    #[cfg(feature = "shadowsocks")]
+    ConfigureShadowsocksInbound {
+        /// Listen address (e.g., "0.0.0.0:8388")
+        listen: String,
+        /// Encryption method (default: 2022-blake3-aes-256-gcm)
+        #[serde(default = "default_shadowsocks_method")]
+        method: String,
+        /// Password for authentication
+        ///
+        /// For AEAD 2022 ciphers, this should be a Base64-encoded key.
+        /// For legacy AEAD ciphers, this is a plaintext password.
+        password: String,
+        /// Enable UDP support (default: false, not yet implemented)
+        #[serde(default)]
+        udp_enabled: bool,
+    },
+
+    /// Get Shadowsocks inbound status
+    #[cfg(feature = "shadowsocks")]
+    GetShadowsocksInboundStatus,
+
+    /// Stop Shadowsocks inbound listener
+    #[cfg(feature = "shadowsocks")]
+    StopShadowsocksInbound,
+
+    // ========================================================================
+    // TCP Connection Statistics
+    // ========================================================================
+    /// Get TCP connection statistics
+    ///
+    /// Returns detailed TCP connection statistics for debugging, including:
+    /// - Active write halves (outbound connections)
+    /// - Pending streams (Shadowsocks waiting for first data)
+    /// - UDP session counts
+    /// - Ingress session tracker counts (if available)
+    GetTcpStats,
+
+    // ========================================================================
+    // WireGuard SNI Routing Configuration
+    // ========================================================================
+    /// Set SNI routing for a specific WireGuard tunnel
+    ///
+    /// Enables or disables SNI-based domain routing for a specific WG egress tunnel.
+    /// When enabled, traffic matching domain-based rules will go through ipstack
+    /// for SNI extraction (30-80 Mbps). When disabled, direct IP packet forwarding
+    /// is used (200+ Mbps).
+    SetWgSniRouting {
+        /// WireGuard tunnel tag (e.g., "wg-pia-nyc")
+        tunnel_tag: String,
+        /// Whether to enable SNI routing for this tunnel
+        enabled: bool,
+    },
+
+    /// Get current WireGuard SNI routing configuration
+    ///
+    /// Returns the global SNI routing state and list of tunnels with SNI routing enabled.
+    GetWgSniRoutingConfig,
+
+    /// Set global WireGuard SNI routing enable/disable
+    ///
+    /// Globally enables or disables SNI routing for all WG egress tunnels.
+    /// Individual tunnel settings are preserved but only take effect when global
+    /// routing is enabled.
+    SetGlobalWgSniRouting {
+        /// Whether to enable SNI routing globally
+        enabled: bool,
+    },
+
+    // ========================================================================
+    // Sharded VLESS-WG Bridge Commands (feature: sharded-vless-wg-bridge)
+    // ========================================================================
+    /// Get sharded VLESS-WG bridge statistics
+    ///
+    /// Returns aggregated statistics across all shards including per-shard stats,
+    /// total events processed, WG packets sent/received, and session counts.
+    /// Only available when `sharded-vless-wg-bridge` feature is enabled.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    GetShardedBridgeStats,
+
+    /// Get health status for a specific shard
+    ///
+    /// Returns detailed health information for a single shard including
+    /// event counts, WG packet stats, and cleanup stats.
+    /// Only available when `sharded-vless-wg-bridge` feature is enabled.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    GetShardHealth {
+        /// Shard index (0-based)
+        shard_index: usize,
+    },
+
+    /// Get supervisor statistics
+    ///
+    /// Returns supervisor statistics including restart counts per shard,
+    /// circuit breaker trips, and health check counts.
+    /// Only available when `sharded-vless-wg-bridge` feature is enabled.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    GetSupervisorStats,
+}
+
+/// Default connect timeout for SOCKS5 connections
+fn default_connect_timeout() -> u64 {
+    10
+}
+
+/// Default idle timeout for SOCKS5 connections
+fn default_idle_timeout() -> u64 {
+    300
+}
+
+/// Default pool size for SOCKS5 connections
+fn default_pool_size() -> usize {
+    32
+}
+
+/// Default drain timeout in seconds
+fn default_drain_timeout() -> u32 {
+    30
+}
+
+/// Default limit for UDP session listing
+fn default_udp_session_limit() -> usize {
+    100
+}
+
+/// Default limit for DNS query log listing
+fn default_dns_query_limit() -> usize {
+    100
+}
+
+/// Default speed test download size (10MB)
+fn default_speed_test_size() -> u64 {
+    10 * 1024 * 1024
+}
+
+/// Default speed test timeout (30 seconds)
+fn default_speed_test_timeout() -> u64 {
+    30
+}
+
+/// Default peer request timeout (30 seconds)
+fn default_peer_request_timeout() -> u32 {
+    30
+}
+
+/// Default VLESS transport type (TCP)
+fn default_vless_transport() -> String {
+    "tcp".to_string()
+}
+
+/// Default Shadowsocks encryption method
+#[cfg(feature = "shadowsocks")]
+fn default_shadowsocks_method() -> String {
+    "2022-blake3-aes-256-gcm".to_string()
+}
+
+/// Egress action type for `NotifyEgressChange`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressAction {
+    /// Egress was added
+    Added,
+    /// Egress was removed
+    Removed,
+    /// Egress was updated (config changed)
+    Updated,
+}
+
+/// Rule configuration for `UpdateRouting`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleConfig {
+    /// Rule type (domain, `domain_suffix`, `domain_keyword`, geoip, port, protocol)
+    pub rule_type: String,
+    /// Target value (e.g., "google.com", "CN", "443", "tcp")
+    pub target: String,
+    /// Outbound tag to route to
+    pub outbound: String,
+    /// Rule priority (lower = higher priority)
+    #[serde(default)]
+    pub priority: i32,
+    /// Whether the rule is enabled
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// IPC response types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IpcResponse {
+    /// Ping response
+    Pong,
+
+    /// Status response
+    Status(ServerStatus),
+
+    /// Capabilities response
+    Capabilities(ServerCapabilities),
+
+    /// Statistics response
+    Stats(StatsSnapshot),
+
+    /// Per-outbound statistics response
+    OutboundStats(OutboundStatsResponse),
+
+    /// Outbound info response
+    OutboundInfo(OutboundInfo),
+
+    /// List of outbounds
+    OutboundList {
+        /// List of outbound information
+        outbounds: Vec<OutboundInfo>,
+    },
+
+    /// Test match result
+    TestMatchResult(TestMatchResult),
+
+    /// Rule engine statistics response
+    RuleStats(RuleStatsResponse),
+
+    /// Connection pool statistics response
+    PoolStats(PoolStatsResponse),
+
+    // ========================================================================
+    // IPC Protocol v2.1 Response Types
+    // ========================================================================
+    /// Outbound health status response
+    OutboundHealth(OutboundHealthResponse),
+
+    /// Update routing result
+    UpdateRoutingResult(UpdateRoutingResponse),
+
+    /// Drain outbound result
+    DrainResult(DrainResponse),
+
+    /// Prometheus metrics response
+    PrometheusMetrics(PrometheusMetricsResponse),
+
+    // ========================================================================
+    // UDP IPC Response Types
+    // ========================================================================
+    /// UDP statistics response
+    UdpStats(UdpStatsResponse),
+
+    /// UDP sessions list response
+    UdpSessions(UdpSessionsResponse),
+
+    /// Single UDP session response
+    UdpSession(UdpSessionResponse),
+
+    /// UDP worker pool statistics response
+    UdpWorkerStats(UdpWorkerStatsResponse),
+
+    /// UDP buffer pool statistics response
+    BufferPoolStats(BufferPoolStatsResponse),
+
+    // ========================================================================
+    // IPC Protocol v3.2 Response Types
+    // ========================================================================
+    /// `WireGuard` tunnel status response
+    WgTunnelStatus(WgTunnelStatus),
+
+    /// `WireGuard` tunnel list response
+    WgTunnelList(WgTunnelListResponse),
+
+    /// Ingress peer list response
+    IngressPeerList(IngressPeerListResponse),
+
+    /// Userspace `WireGuard` ingress statistics response
+    IngressStats(IngressStatsResponse),
+
+    /// ECMP group status response
+    EcmpGroupStatus(EcmpGroupStatus),
+
+    /// ECMP group list response
+    EcmpGroupList(EcmpGroupListResponse),
+
+    /// Peer status response
+    PeerStatus(PeerStatus),
+
+    /// Peer list response
+    PeerList(PeerListResponse),
+
+    /// Pairing operation response
+    Pairing(PairingResponse),
+
+    /// Chain status response
+    ChainStatus(ChainStatus),
+
+    /// Chain list response
+    ChainList(ChainListResponse),
+
+    /// Chain role response
+    ChainRole(ChainRoleResponse),
+
+    /// Chain diagnostics response
+    ChainDiagnostics(ChainDiagnosticsResponse),
+
+    /// Two-Phase Commit prepare response
+    PrepareResult(PrepareResponse),
+
+    // ========================================================================
+    // IPC Protocol v3.3 - DNS Response Types
+    // ========================================================================
+    /// DNS overall statistics response
+    DnsStats(DnsStatsResponse),
+
+    /// DNS cache statistics response
+    DnsCacheStats(DnsCacheStatsResponse),
+
+    /// DNS blocking statistics response
+    DnsBlockStats(DnsBlockStatsResponse),
+
+    /// DNS upstream status response
+    DnsUpstreamStatus(DnsUpstreamStatusResponse),
+
+    /// DNS query log response
+    DnsQueryLog(DnsQueryLogResponse),
+
+    /// DNS query result response
+    DnsQueryResult(DnsQueryResponse),
+
+    /// DNS configuration response
+    DnsConfig(DnsConfigResponse),
+
+    /// WARP registration response
+    WarpRegistration(WarpRegistrationResponse),
+
+    /// Speed test result response
+    SpeedTestResult(SpeedTestResponse),
+
+    /// Peer API request result response
+    PeerRequestResult(PeerRequestResponse),
+
+    // ========================================================================
+    // VLESS Protocol Response Types (v3.3)
+    // ========================================================================
+    /// VLESS outbound info response
+    VlessOutboundInfo(VlessOutboundInfoResponse),
+
+    /// VLESS outbound list response
+    VlessOutboundList {
+        outbounds: Vec<VlessOutboundInfoResponse>,
+    },
+
+    /// VLESS inbound status response
+    VlessInboundStatus(VlessInboundStatusResponse),
+
+    /// VLESS user list response
+    VlessUserList { users: Vec<VlessUserInfo> },
+
+    // ========================================================================
+    // Shadowsocks Protocol Responses
+    // ========================================================================
+    /// Shadowsocks outbound added successfully
+    #[cfg(feature = "shadowsocks")]
+    ShadowsocksOutboundAdded {
+        /// The tag of the created outbound
+        tag: String,
+    },
+
+    /// Shadowsocks outbound info response
+    #[cfg(feature = "shadowsocks")]
+    ShadowsocksOutboundInfo(ShadowsocksOutboundInfoResponse),
+
+    /// Shadowsocks outbound list response
+    #[cfg(feature = "shadowsocks")]
+    ShadowsocksOutboundList {
+        outbounds: Vec<ShadowsocksOutboundInfoResponse>,
+    },
+
+    /// Shadowsocks inbound status response
+    #[cfg(feature = "shadowsocks")]
+    ShadowsocksInboundStatus(ShadowsocksInboundStatusResponse),
+
+    // ========================================================================
+    // TCP Connection Statistics Response
+    // ========================================================================
+    /// TCP connection statistics response
+    TcpStats(TcpStatsResponse),
+
+    // ========================================================================
+    // WireGuard SNI Routing Configuration Responses
+    // ========================================================================
+    /// WireGuard SNI routing updated response
+    WgSniRoutingUpdated(WgSniRoutingUpdatedResponse),
+
+    /// WireGuard SNI routing configuration response
+    WgSniRoutingConfig(WgSniRoutingConfigResponse),
+
+    /// Global WireGuard SNI routing updated response
+    GlobalWgSniRoutingUpdated(GlobalWgSniRoutingUpdatedResponse),
+
+    // ========================================================================
+    // Sharded VLESS-WG Bridge Responses (feature: sharded-vless-wg-bridge)
+    // ========================================================================
+    /// Sharded bridge statistics response
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    ShardedBridgeStats(ShardedBridgeStatsResponse),
+
+    /// Shard health response
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    ShardHealth(ShardHealthResponse),
+
+    /// Supervisor statistics response
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    SupervisorStats(SupervisorStatsResponse),
+
+    /// Success response (for commands that don't return data)
+    Success {
+        /// Optional message
+        message: Option<String>,
+    },
+
+    /// Error response
+    Error(IpcError),
+}
+
+impl IpcResponse {
+    /// Create a success response with no message
+    pub fn success() -> Self {
+        Self::Success { message: None }
+    }
+
+    /// Create a success response with a message
+    pub fn success_with_message(msg: impl Into<String>) -> Self {
+        Self::Success {
+            message: Some(msg.into()),
+        }
+    }
+
+    /// Create an error response
+    pub fn error(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::Error(IpcError {
+            code,
+            message: message.into(),
+        })
+    }
+
+    /// Check if this is an error response
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
+        matches!(self, Self::Error(_))
+    }
+}
+
+/// Server status information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerStatus {
+    /// Server version
+    pub version: String,
+    /// Uptime in seconds
+    pub uptime_secs: u64,
+    /// Active connections
+    pub active_connections: u64,
+    /// Total connections handled
+    pub total_connections: u64,
+    /// Number of configured outbounds
+    pub outbound_count: usize,
+    /// Whether the server is accepting new connections
+    pub accepting: bool,
+    /// Whether shutdown is in progress
+    pub shutting_down: bool,
+}
+
+/// Server capabilities
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerCapabilities {
+    /// Supported outbound types
+    pub outbound_types: Vec<String>,
+    /// Whether hot reload is supported
+    pub hot_reload: bool,
+    /// Whether TLS sniffing is supported
+    pub tls_sniffing: bool,
+    /// Whether UDP is supported
+    pub udp_support: bool,
+    /// Maximum connections
+    pub max_connections: usize,
+    /// Protocol version
+    pub protocol_version: u32,
+}
+
+impl Default for ServerCapabilities {
+    fn default() -> Self {
+        Self {
+            outbound_types: vec![
+                "direct".into(),
+                "block".into(),
+                "socks5".into(),
+                "wireguard".into(), // WireGuard via DirectOutbound
+            ],
+            hot_reload: true,
+            tls_sniffing: true,
+            udp_support: false, // TCP only
+            max_connections: 65536,
+            protocol_version: 4, // IPC ingress stats
+        }
+    }
+}
+
+/// Per-outbound statistics response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundStatsResponse {
+    /// Statistics per outbound tag
+    pub outbounds: std::collections::HashMap<String, crate::connection::OutboundStatsSnapshot>,
+}
+
+/// Information about a single outbound
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundInfo {
+    /// Outbound tag
+    pub tag: String,
+    /// Outbound type
+    pub outbound_type: String,
+    /// Whether enabled
+    pub enabled: bool,
+    /// Health status
+    pub health: String,
+    /// Active connections
+    pub active_connections: u64,
+    /// Total connections
+    pub total_connections: u64,
+    /// Bind interface (if any)
+    pub bind_interface: Option<String>,
+    /// Routing mark (if any)
+    pub routing_mark: Option<u32>,
+}
+
+/// Result of a test match operation
+///
+/// Used for debugging and parity testing to verify the rule engine
+/// produces the same results as the reference implementation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestMatchResult {
+    /// The matched outbound tag
+    pub outbound: String,
+    /// The type of match that occurred (domain, geoip, port, protocol, or null for default)
+    pub match_type: Option<String>,
+    /// The routing mark to apply (if any)
+    pub routing_mark: Option<u32>,
+    /// Whether the outbound is a chain
+    pub is_chain: bool,
+    /// Time taken for matching in microseconds
+    pub match_time_us: u64,
+}
+
+/// Rule engine statistics response
+///
+/// Contains statistics about the current routing configuration,
+/// including counts of different rule types and configuration version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleStatsResponse {
+    /// Number of domain rules (exact, suffix, keyword, regex)
+    pub domain_rules: u64,
+    /// Number of GeoIP/CIDR rules
+    pub geoip_rules: u64,
+    /// Number of port rules
+    pub port_rules: u64,
+    /// Number of protocol rules
+    pub protocol_rules: u64,
+    /// Number of registered chains for multi-hop routing
+    pub chain_count: u64,
+    /// Configuration version (incremented on each reload)
+    pub config_version: u64,
+    /// ISO 8601 timestamp of last configuration reload (or None if never reloaded)
+    pub last_reload: Option<String>,
+    /// Default outbound tag
+    pub default_outbound: String,
+}
+
+/// Connection pool statistics for a single SOCKS5 outbound
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Socks5PoolStats {
+    /// Outbound tag
+    pub tag: String,
+    /// Current pool size (all connections)
+    pub size: usize,
+    /// Available connections in pool
+    pub available: usize,
+    /// Number of waiters for connections
+    pub waiting: usize,
+    /// Server address
+    pub server_addr: String,
+    /// Whether the outbound is enabled
+    pub enabled: bool,
+    /// Health status
+    pub health: String,
+}
+
+/// Connection pool statistics response
+///
+/// Contains pool statistics for one or more SOCKS5 outbounds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolStatsResponse {
+    /// Pool statistics per outbound
+    pub pools: Vec<Socks5PoolStats>,
+}
+
+// ============================================================================
+// IPC Protocol v2.1 Response Structs
+// ============================================================================
+
+/// Health status for a single outbound
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundHealthInfo {
+    /// Outbound tag
+    pub tag: String,
+    /// Outbound type (direct, socks5, block)
+    pub outbound_type: String,
+    /// Health status (healthy, degraded, unhealthy, unknown)
+    pub health: String,
+    /// Whether the outbound is enabled
+    pub enabled: bool,
+    /// Active connection count
+    pub active_connections: u64,
+    /// Last health check time (ISO 8601)
+    pub last_check: Option<String>,
+    /// Error message if unhealthy
+    pub error: Option<String>,
+}
+
+/// Response for `GetOutboundHealth` command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundHealthResponse {
+    /// Health status for each outbound
+    pub outbounds: Vec<OutboundHealthInfo>,
+    /// Overall system health (all healthy = healthy)
+    pub overall_health: String,
+}
+
+/// Response for `UpdateRouting` command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateRoutingResponse {
+    /// Whether the update was successful
+    pub success: bool,
+    /// New configuration version
+    pub version: u64,
+    /// Number of rules applied
+    pub rule_count: usize,
+    /// New default outbound
+    pub default_outbound: String,
+}
+
+/// Response for `DrainOutbound` command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainResponse {
+    /// Whether drain completed successfully
+    pub success: bool,
+    /// Number of connections that were drained
+    pub drained_count: u64,
+    /// Number of connections that were forcefully closed
+    pub force_closed_count: u64,
+    /// Time taken to drain in milliseconds
+    pub drain_time_ms: u64,
+}
+
+/// Response for `GetPrometheusMetrics` command
+///
+/// Contains metrics in Prometheus text exposition format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrometheusMetricsResponse {
+    /// Prometheus text format metrics
+    pub metrics_text: String,
+    /// Timestamp of metrics collection (Unix epoch milliseconds)
+    pub timestamp_ms: u64,
+}
+
+// ============================================================================
+// UDP IPC Response Structs
+// ============================================================================
+
+/// Comprehensive UDP statistics response
+///
+/// Combines session manager stats, worker pool stats, and buffer pool stats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpStatsResponse {
+    /// Whether UDP is enabled
+    pub udp_enabled: bool,
+    /// Session manager statistics
+    pub session_stats: UdpSessionStatsInfo,
+    /// Worker pool statistics (None if UDP not enabled)
+    pub worker_stats: Option<UdpWorkerPoolInfo>,
+    /// Buffer pool statistics (None if UDP not enabled)
+    pub buffer_pool_stats: Option<BufferPoolInfo>,
+    /// Processor statistics (None if UDP not enabled)
+    pub processor_stats: Option<UdpProcessorInfo>,
+}
+
+/// UDP session manager statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpSessionStatsInfo {
+    /// Current number of active sessions
+    pub session_count: u64,
+    /// Maximum allowed sessions
+    pub max_sessions: u64,
+    /// Total sessions created
+    pub total_created: u64,
+    /// Total sessions evicted
+    pub total_evicted: u64,
+    /// Cache utilization percentage
+    pub utilization_percent: f64,
+    /// Idle timeout in seconds
+    pub idle_timeout_secs: u64,
+    /// TTL in seconds
+    pub ttl_secs: u64,
+}
+
+/// UDP worker pool statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpWorkerPoolInfo {
+    /// Total packets processed
+    pub packets_processed: u64,
+    /// Total bytes received
+    pub bytes_received: u64,
+    /// Number of active workers
+    pub workers_active: u32,
+    /// Total workers spawned
+    pub workers_total: u32,
+    /// Number of worker errors
+    pub worker_errors: u64,
+}
+
+/// UDP buffer pool statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferPoolInfo {
+    /// Pool capacity
+    pub capacity: usize,
+    /// Buffer size in bytes
+    pub buffer_size: usize,
+    /// Currently available buffers
+    pub available: usize,
+    /// Number of new buffer allocations
+    pub allocations: u64,
+    /// Number of buffer reuses from pool
+    pub reuses: u64,
+    /// Number of buffers returned to pool
+    pub returns: u64,
+    /// Number of buffers dropped (pool was full)
+    pub drops: u64,
+    /// Pool efficiency (reuses / (reuses + allocations))
+    pub efficiency: f64,
+}
+
+/// UDP packet processor statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpProcessorInfo {
+    /// Packets processed
+    pub packets_processed: u64,
+    /// Packets forwarded successfully
+    pub packets_forwarded: u64,
+    /// Packets that failed processing
+    pub packets_failed: u64,
+    /// Sessions created
+    pub sessions_created: u64,
+    /// Sessions reused
+    pub sessions_reused: u64,
+    /// Total bytes sent
+    pub bytes_sent: u64,
+    /// QUIC packets detected
+    pub quic_packets: u64,
+    /// QUIC SNI successfully extracted
+    pub quic_sni_extracted: u64,
+    /// Rule matches
+    pub rule_matches: u64,
+    /// Currently active sessions in the processor cache
+    pub active_sessions: u64,
+}
+
+/// UDP sessions list response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpSessionsResponse {
+    /// List of session snapshots
+    pub sessions: Vec<UdpSessionInfo>,
+    /// Total session count (may differ from len if limit applied)
+    pub total_count: u64,
+    /// Whether the list was truncated due to limit
+    pub truncated: bool,
+}
+
+/// Individual UDP session information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpSessionInfo {
+    /// Client address
+    pub client_addr: String,
+    /// Destination address
+    pub dest_addr: String,
+    /// Outbound tag
+    pub outbound: String,
+    /// Routing mark (for chain routing / DSCP)
+    pub routing_mark: Option<u32>,
+    /// Sniffed domain (from QUIC SNI)
+    pub sniffed_domain: Option<String>,
+    /// Bytes sent (client -> upstream)
+    pub bytes_sent: u64,
+    /// Bytes received (upstream -> client)
+    pub bytes_recv: u64,
+    /// Packets sent
+    pub packets_sent: u64,
+    /// Packets received
+    pub packets_recv: u64,
+    /// Session age in seconds
+    pub age_secs: u64,
+}
+
+/// Single UDP session response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpSessionResponse {
+    /// Whether the session was found
+    pub found: bool,
+    /// Session information (None if not found)
+    pub session: Option<UdpSessionInfo>,
+}
+
+/// UDP worker pool statistics response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpWorkerStatsResponse {
+    /// Whether UDP workers are running
+    pub running: bool,
+    /// Number of workers
+    pub num_workers: usize,
+    /// Worker pool statistics
+    pub stats: Option<UdpWorkerPoolInfo>,
+}
+
+/// UDP buffer pool statistics response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferPoolStatsResponse {
+    /// Whether buffer pool is available
+    pub available: bool,
+    /// Buffer pool statistics
+    pub stats: Option<BufferPoolInfo>,
+}
+
+// ============================================================================
+// TCP Connection Statistics Types
+// ============================================================================
+
+/// TCP connection statistics response
+///
+/// Provides detailed TCP connection statistics for debugging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TcpStatsResponse {
+    /// Number of active TCP write halves (outbound connections)
+    ///
+    /// This represents TCP connections where data can be forwarded to the server.
+    pub tcp_write_halves: usize,
+
+    /// Number of pending TCP streams
+    ///
+    /// These are TCP connections waiting for first client data,
+    /// used by Shadowsocks and other write-before-read protocols.
+    pub tcp_pending_streams: usize,
+
+    /// Number of active TCP reader tasks
+    ///
+    /// This represents spawned tasks that read responses from outbound
+    /// connections and forward them back to clients.
+    pub tcp_active_readers: u64,
+
+    /// Number of active UDP sessions (QUIC and other UDP traffic)
+    pub udp_sessions: usize,
+
+    /// Number of active proxy UDP sessions (Shadowsocks, SOCKS5)
+    pub proxy_udp_sessions: usize,
+
+    /// Number of active ingress sessions (from session tracker)
+    ///
+    /// None if the ingress session tracker is not available.
+    pub ingress_sessions: Option<usize>,
+}
+
+// ============================================================================
+// IPC Protocol v3.2 Types
+// ============================================================================
+
+/// Tunnel type for peer connections
+///
+/// Defines the type of tunnel used for peer-to-peer connections.
+/// Use explicit renames for API compatibility with Python REST API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TunnelType {
+    /// `WireGuard` tunnel (userspace via boringtun)
+    /// Serializes as "wireguard" (not "`wire_guard`") for REST API compatibility
+    #[serde(rename = "wireguard")]
+    #[default]
+    WireGuard,
+    /// Xray tunnel (via SOCKS5 bridge)
+    #[serde(rename = "xray")]
+    Xray,
+}
+
+impl std::fmt::Display for TunnelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WireGuard => write!(f, "wireguard"),
+            Self::Xray => write!(f, "xray"),
+        }
+    }
+}
+
+/// `WireGuard` tunnel configuration
+///
+/// Configuration for creating a userspace `WireGuard` tunnel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgTunnelConfig {
+    /// `WireGuard` private key (Base64 encoded)
+    pub private_key: String,
+    /// Peer public key (Base64 encoded)
+    pub peer_public_key: String,
+    /// Peer endpoint (IP:port)
+    pub peer_endpoint: String,
+    /// Allowed IPs for this tunnel
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    /// Local tunnel IP (e.g., "10.200.200.1/32")
+    #[serde(default)]
+    pub local_ip: Option<String>,
+    /// Listen port for incoming connections
+    #[serde(default)]
+    pub listen_port: Option<u16>,
+    /// Persistent keepalive interval in seconds
+    #[serde(default)]
+    pub persistent_keepalive: Option<u16>,
+    /// MTU for the tunnel
+    #[serde(default)]
+    pub mtu: Option<u16>,
+}
+
+/// `WireGuard` tunnel status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgTunnelStatus {
+    /// Tunnel tag
+    pub tag: String,
+    /// Whether the tunnel is active
+    pub active: bool,
+    /// Local tunnel IP
+    pub local_ip: Option<String>,
+    /// Peer endpoint
+    pub peer_endpoint: String,
+    /// Last handshake timestamp (Unix epoch seconds)
+    pub last_handshake: Option<u64>,
+    /// Bytes transmitted
+    pub tx_bytes: u64,
+    /// Bytes received
+    pub rx_bytes: u64,
+    /// Active connections using this tunnel
+    pub active_connections: u64,
+    /// Error message if any
+    pub error: Option<String>,
+}
+
+/// ECMP (Equal-Cost Multi-Path) load balancing algorithm
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum EcmpAlgorithm {
+    /// Round-robin distribution
+    #[default]
+    RoundRobin,
+    /// Random selection
+    Random,
+    /// Hash-based (consistent hashing by source IP/port - five-tuple)
+    SourceHash,
+    /// Destination hash (consistent hashing by domain or destination IP)
+    /// Useful for video streaming where multiple connections to same service
+    /// should use the same exit
+    DestHash,
+    /// Destination hash with least-load selection for new sessions
+    /// Combines session affinity with intelligent load balancing:
+    /// - New sessions: select the exit with lowest active connections
+    /// - Existing sessions: maintain affinity with cached selection
+    DestHashLeastLoad,
+    /// Ketama consistent hashing (from Pingora)
+    /// Better than SourceHash when members change frequently as it minimizes
+    /// key remapping when nodes are added or removed
+    Ketama,
+    /// Weighted random selection
+    Weighted,
+    /// Least connections
+    LeastConnections,
+}
+
+/// ECMP group member configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcmpMemberConfig {
+    /// Outbound tag
+    pub outbound: String,
+    /// Weight for weighted algorithms (default: 1)
+    #[serde(default = "default_ecmp_weight")]
+    pub weight: u32,
+    /// Whether this member is enabled
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_ecmp_weight() -> u32 {
+    1
+}
+
+/// ECMP group configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcmpGroupConfig {
+    /// Group description (optional)
+    #[serde(default)]
+    pub description: String,
+    /// Load balancing algorithm
+    #[serde(default)]
+    pub algorithm: EcmpAlgorithm,
+    /// Group members (outbounds)
+    pub members: Vec<EcmpMemberConfig>,
+    /// Whether to skip unhealthy members
+    #[serde(default = "default_enabled")]
+    pub skip_unhealthy: bool,
+    /// Health check interval in seconds
+    #[serde(default = "default_health_interval")]
+    pub health_check_interval_secs: u32,
+    /// Routing mark for Linux policy routing (200-299)
+    #[serde(default)]
+    pub routing_mark: Option<u32>,
+    /// Routing table for policy routing
+    #[serde(default)]
+    pub routing_table: Option<u32>,
+}
+
+fn default_health_interval() -> u32 {
+    30
+}
+
+/// ECMP group status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcmpGroupStatus {
+    /// Group tag
+    pub tag: String,
+    /// Group description
+    #[serde(default)]
+    pub description: String,
+    /// Load balancing algorithm
+    pub algorithm: EcmpAlgorithm,
+    /// Member status
+    pub members: Vec<EcmpMemberStatus>,
+    /// Number of members (for Python client compatibility)
+    #[serde(default)]
+    pub member_count: usize,
+    /// Number of healthy members (for Python client compatibility)
+    #[serde(default)]
+    pub healthy_count: usize,
+    /// Routing mark
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_mark: Option<u32>,
+    /// Routing table
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_table: Option<u32>,
+    /// Whether health check is enabled
+    #[serde(default)]
+    pub health_check: bool,
+    /// Total active connections
+    pub active_connections: u64,
+    /// Total connections handled
+    pub total_connections: u64,
+}
+
+/// ECMP member status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcmpMemberStatus {
+    /// Outbound tag
+    pub outbound: String,
+    /// Weight
+    pub weight: u32,
+    /// Whether enabled
+    pub enabled: bool,
+    /// Health status
+    pub health: String,
+    /// Active connections
+    pub active_connections: u64,
+    /// Total connections
+    pub total_connections: u64,
+}
+
+// ============================================================================
+// Peer Management Types
+// ============================================================================
+
+/// Peer node configuration
+///
+/// Configuration for a peer node in a multi-node setup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConfig {
+    /// Unique peer tag
+    pub tag: String,
+    /// Human-readable description
+    pub description: String,
+    /// Peer endpoint (IP:port or hostname:port)
+    pub endpoint: String,
+    /// Tunnel type (`WireGuard` or Xray)
+    pub tunnel_type: TunnelType,
+    /// Web API port on the peer (default: 36000)
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
+
+    // WireGuard-specific fields
+    /// Peer's `WireGuard` public key
+    #[serde(default)]
+    pub wg_public_key: Option<String>,
+    /// Local `WireGuard` private key for this peer
+    #[serde(default)]
+    pub wg_local_private_key: Option<String>,
+    /// Local tunnel IP
+    #[serde(default)]
+    pub tunnel_local_ip: Option<String>,
+    /// Remote tunnel IP
+    #[serde(default)]
+    pub tunnel_remote_ip: Option<String>,
+    /// Tunnel port
+    #[serde(default)]
+    pub tunnel_port: Option<u16>,
+    /// Persistent keepalive interval
+    #[serde(default)]
+    pub persistent_keepalive: Option<u16>,
+
+    // Xray-specific fields
+    /// Xray user UUID
+    #[serde(default)]
+    pub xray_uuid: Option<String>,
+    /// Xray server name for TLS
+    #[serde(default)]
+    pub xray_server_name: Option<String>,
+    /// Xray public key for REALITY
+    #[serde(default)]
+    pub xray_public_key: Option<String>,
+    /// Xray short ID
+    #[serde(default)]
+    pub xray_short_id: Option<String>,
+    /// Local SOCKS5 port for Xray
+    #[serde(default)]
+    pub xray_local_socks_port: Option<u16>,
+}
+
+fn default_api_port() -> u16 {
+    36000
+}
+
+/// Peer connection state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum PeerState {
+    /// Not connected
+    #[default]
+    Disconnected,
+    /// Connection in progress
+    Connecting,
+    /// Successfully connected
+    Connected,
+    /// Connection failed
+    Failed,
+}
+
+impl std::fmt::Display for PeerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => write!(f, "disconnected"),
+            Self::Connecting => write!(f, "connecting"),
+            Self::Connected => write!(f, "connected"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+/// Peer node status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerStatus {
+    /// Peer tag
+    pub tag: String,
+    /// Current connection state
+    pub state: PeerState,
+    /// Tunnel type
+    pub tunnel_type: TunnelType,
+    /// Peer endpoint (host:port)
+    pub endpoint: String,
+    /// Local tunnel IP
+    pub tunnel_local_ip: Option<String>,
+    /// Remote tunnel IP
+    pub tunnel_remote_ip: Option<String>,
+    /// Web API port
+    pub api_port: u16,
+    /// Last `WireGuard` handshake (Unix epoch seconds)
+    pub last_handshake: Option<u64>,
+    /// Bytes transmitted
+    pub tx_bytes: u64,
+    /// Bytes received
+    pub rx_bytes: u64,
+    /// Number of reconnection attempts
+    pub reconnect_attempts: u32,
+    /// Consecutive health check failures (for hysteresis)
+    pub consecutive_failures: u32,
+    /// Last error message
+    pub last_error: Option<String>,
+}
+
+// ============================================================================
+// Chain Management Types
+// ============================================================================
+
+/// Chain node role
+///
+/// Defines the role of a node in a multi-hop chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainRole {
+    /// Entry node: Receives traffic and marks with DSCP
+    Entry,
+    /// Relay node: Forwards traffic based on DSCP
+    Relay,
+    /// Terminal node: Final destination, removes DSCP and exits
+    Terminal,
+}
+
+impl std::fmt::Display for ChainRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Entry => write!(f, "entry"),
+            Self::Relay => write!(f, "relay"),
+            Self::Terminal => write!(f, "terminal"),
+        }
+    }
+}
+
+/// Chain activation state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum ChainState {
+    /// Chain is not active
+    #[default]
+    Inactive,
+    /// Chain activation is in progress (2PC)
+    Activating,
+    /// Chain is active and routing traffic
+    Active,
+    /// Chain is in error state
+    Error,
+}
+
+impl std::fmt::Display for ChainState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inactive => write!(f, "inactive"),
+            Self::Activating => write!(f, "activating"),
+            Self::Active => write!(f, "active"),
+            Self::Error => write!(f, "error"),
+        }
+    }
+}
+
+/// Chain hop configuration
+///
+/// Configuration for a single hop in a multi-hop chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainHop {
+    /// Node tag (must be a configured peer or local node)
+    pub node_tag: String,
+    /// Role of this node in the chain
+    pub role: ChainRole,
+    /// Tunnel type to use for this hop
+    pub tunnel_type: TunnelType,
+}
+
+/// Chain configuration
+///
+/// Configuration for a multi-node routing chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainConfig {
+    /// Unique chain tag
+    pub tag: String,
+    /// Human-readable description
+    pub description: String,
+    /// DSCP value for marking (1-63)
+    pub dscp_value: u8,
+    /// Ordered list of hops in the chain
+    pub hops: Vec<ChainHop>,
+    /// Routing rules that use this chain
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Exit egress on the terminal node
+    pub exit_egress: String,
+    /// Allow transitive routing (skip remote egress validation)
+    #[serde(default)]
+    pub allow_transitive: bool,
+}
+
+/// Two-Phase Commit prepare status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum PrepareStatus {
+    /// Not yet prepared
+    #[default]
+    Pending,
+    /// Successfully prepared (validated)
+    Prepared,
+    /// Successfully committed (rules applied)
+    Committed,
+    /// Aborted (rolled back)
+    Aborted,
+}
+
+/// Hop status in a chain
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HopStatus {
+    /// Node tag
+    pub node_tag: String,
+    /// Node role
+    pub role: ChainRole,
+    /// Tunnel type
+    pub tunnel_type: TunnelType,
+    /// Whether the peer is connected
+    pub peer_connected: bool,
+    /// Two-Phase Commit status
+    #[serde(default)]
+    pub prepare_status: Option<PrepareStatus>,
+}
+
+/// Chain status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainStatus {
+    /// Chain tag
+    pub tag: String,
+    /// Current chain state
+    pub state: ChainState,
+    /// DSCP value
+    pub dscp_value: u8,
+    /// Local node's role (None if not in chain)
+    pub my_role: Option<ChainRole>,
+    /// Status of each hop
+    pub hop_status: Vec<HopStatus>,
+    /// Terminal egress outbound tag
+    #[serde(default)]
+    pub exit_egress: String,
+    /// Active connections using this chain
+    pub active_connections: u64,
+    /// Last error message
+    pub last_error: Option<String>,
+}
+
+// ============================================================================
+// Pairing Types
+// ============================================================================
+
+/// Default value for `pair_request` message type
+fn default_pair_request_type() -> String {
+    "pair_request".to_string()
+}
+
+/// Default value for `pair_response` message type
+fn default_pair_response_type() -> String {
+    "pair_response".to_string()
+}
+
+/// Offline pairing request
+///
+/// Contains all information needed for offline node pairing.
+/// Encoded as Base64 JSON for exchange via QR code or text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairRequest {
+    /// Message type discriminator for protocol compatibility with Python
+    /// Uses serde rename to "type" (Rust keyword) and default for backward compatibility
+    #[serde(rename = "type", default = "default_pair_request_type")]
+    pub message_type: String,
+    /// Protocol version (2 for v3.2)
+    pub version: u8,
+    /// Node tag
+    pub node_tag: String,
+    /// Node description
+    pub node_description: String,
+    /// Endpoint (IP:port with tunnel port)
+    pub endpoint: String,
+    /// Web API port
+    pub api_port: u16,
+    /// Tunnel type
+    pub tunnel_type: TunnelType,
+    /// Creation timestamp (Unix epoch seconds)
+    pub timestamp: u64,
+    /// Whether bidirectional auto-connect is requested
+    pub bidirectional: bool,
+
+    // WireGuard fields
+    /// Local `WireGuard` public key
+    #[serde(default)]
+    pub wg_public_key: Option<String>,
+    /// Tunnel IP assigned to this node
+    #[serde(default)]
+    pub tunnel_ip: Option<String>,
+
+    // Bidirectional: Pre-generated keys for remote node
+    /// Pre-generated remote `WireGuard` private key (for bidirectional)
+    #[serde(default)]
+    pub remote_wg_private_key: Option<String>,
+    /// Pre-generated remote `WireGuard` public key (for bidirectional)
+    #[serde(default)]
+    pub remote_wg_public_key: Option<String>,
+
+    // Xray fields
+    /// Xray user UUID
+    #[serde(default)]
+    pub xray_uuid: Option<String>,
+    /// Xray server name
+    #[serde(default)]
+    pub xray_server_name: Option<String>,
+    /// Xray public key
+    #[serde(default)]
+    pub xray_public_key: Option<String>,
+    /// Xray short ID
+    #[serde(default)]
+    pub xray_short_id: Option<String>,
+}
+
+/// Offline pairing response
+///
+/// Response to a pairing request, completing the handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairResponse {
+    /// Message type discriminator for protocol compatibility with Python
+    /// Uses serde rename to "type" (Rust keyword) and default for backward compatibility
+    #[serde(rename = "type", default = "default_pair_response_type")]
+    pub message_type: String,
+    /// Protocol version
+    pub version: u8,
+    /// Original request node tag
+    pub request_node_tag: String,
+    /// Responding node tag
+    pub node_tag: String,
+    /// Responding node description
+    pub node_description: String,
+    /// Responding node endpoint
+    pub endpoint: String,
+    /// Web API port
+    pub api_port: u16,
+    /// Tunnel type
+    pub tunnel_type: TunnelType,
+    /// Response timestamp
+    pub timestamp: u64,
+
+    // WireGuard fields
+    /// Responding node's `WireGuard` public key
+    #[serde(default)]
+    pub wg_public_key: Option<String>,
+    /// Local tunnel IP (assigned to responding node)
+    #[serde(default)]
+    pub tunnel_local_ip: Option<String>,
+    /// Remote tunnel IP (assigned to requesting node)
+    #[serde(default)]
+    pub tunnel_remote_ip: Option<String>,
+
+    // Tunnel API endpoint for post-tunnel communication
+    /// API endpoint accessible via tunnel
+    #[serde(default)]
+    pub tunnel_api_endpoint: Option<String>,
+
+    // Xray fields
+    /// Xray user UUID for authentication
+    #[serde(default)]
+    pub xray_uuid: Option<String>,
+}
+
+// ============================================================================
+// IPC Response Types
+// ============================================================================
+
+/// Response containing a `WireGuard` tunnel list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgTunnelListResponse {
+    /// List of tunnel statuses
+    pub tunnels: Vec<WgTunnelStatus>,
+}
+
+// ============================================================================
+// Ingress Peer Types
+// ============================================================================
+
+/// Information about an ingress peer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressPeerInfo {
+    /// Peer public key (Base64)
+    pub public_key: String,
+    /// Allowed IPs
+    pub allowed_ips: String,
+    /// Optional peer name
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Bytes received from this peer
+    pub rx_bytes: u64,
+    /// Bytes sent to this peer
+    pub tx_bytes: u64,
+    /// Last handshake timestamp (Unix epoch seconds)
+    #[serde(default)]
+    pub last_handshake: Option<u64>,
+}
+
+/// Response containing ingress peer list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressPeerListResponse {
+    /// List of ingress peers
+    pub peers: Vec<IngressPeerInfo>,
+}
+
+/// Response containing ingress statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressStatsResponse {
+    /// Whether userspace `WireGuard` ingress is enabled
+    pub ingress_enabled: bool,
+    /// Current ingress manager state (if enabled)
+    pub ingress_state: Option<String>,
+    /// Ingress manager statistics (if enabled)
+    pub manager_stats: Option<WgIngressStats>,
+    /// Forwarding loop statistics (if available)
+    pub forwarding_stats: Option<ForwardingStatsSnapshot>,
+    /// Reply router statistics (if available)
+    pub reply_stats: Option<IngressReplyStatsSnapshot>,
+    /// Number of active sessions (connections) being tracked
+    #[serde(default)]
+    pub active_sessions: usize,
+}
+
+/// Response containing an ECMP group list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcmpGroupListResponse {
+    /// List of group statuses
+    pub groups: Vec<EcmpGroupStatus>,
+}
+
+/// Response containing a peer list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerListResponse {
+    /// List of peer statuses
+    pub peers: Vec<PeerStatus>,
+}
+
+/// Response containing a chain list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainListResponse {
+    /// List of chain statuses
+    pub chains: Vec<ChainStatus>,
+}
+
+/// Response for pairing operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingResponse {
+    /// Whether the operation succeeded
+    pub success: bool,
+    /// Base64-encoded code (for generate/import)
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Message
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Peer tag (for import/complete)
+    #[serde(default)]
+    pub peer_tag: Option<String>,
+    /// Local WireGuard private key (for import - needed for database persistence)
+    /// This is returned so the API can save it to the database for reconnection after restart.
+    #[serde(default)]
+    pub wg_local_private_key: Option<String>,
+    /// Local tunnel IP (for import)
+    #[serde(default)]
+    pub tunnel_local_ip: Option<String>,
+    /// Allocated tunnel port (for import)
+    #[serde(default)]
+    pub tunnel_port: Option<u16>,
+}
+
+/// Response for chain role query
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainRoleResponse {
+    /// Chain tag
+    pub chain_tag: String,
+    /// Local node's role (None if not in chain)
+    pub role: Option<ChainRole>,
+    /// Whether this node is in the chain
+    pub in_chain: bool,
+}
+
+/// Chain diagnostics response
+///
+/// Comprehensive diagnostics for troubleshooting chain routing issues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainDiagnosticsResponse {
+    /// Chain tag being diagnosed
+    pub tag: String,
+    /// Whether chain exists in ChainManager
+    pub chain_exists: bool,
+    /// Chain state in ChainManager (if exists)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_state: Option<ChainState>,
+    /// Local node's role in the chain (if exists)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub my_role: Option<ChainRole>,
+    /// Allocated DSCP value (if exists)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dscp_value: Option<u8>,
+    /// Whether chain is registered in FwmarkRouter
+    pub fwmark_registered: bool,
+    /// DSCP value in FwmarkRouter (if registered)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fwmark_dscp: Option<u8>,
+    /// Routing mark in FwmarkRouter (if registered)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fwmark_routing_mark: Option<u32>,
+    /// Next hop tunnel tag (for entry/relay nodes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_hop_tunnel: Option<String>,
+    /// Exit egress tag (for terminal nodes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_egress: Option<String>,
+    /// Last error message (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// List of detected issues (empty if healthy)
+    pub issues: Vec<String>,
+    /// Overall health status
+    pub healthy: bool,
+}
+
+/// Response for Two-Phase Commit prepare
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareResponse {
+    /// Whether prepare succeeded
+    pub success: bool,
+    /// Error message if failed
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Node that responded
+    pub node: String,
+}
+
+// ============================================================================
+// IPC Protocol v3.3 - DNS Types
+// ============================================================================
+
+/// DNS upstream configuration for IPC
+///
+/// Configuration for a DNS upstream server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsUpstreamConfig {
+    /// Upstream address (e.g., "8.8.8.8:53", "<https://dns.google/dns-query>")
+    pub address: String,
+    /// Protocol type: "udp", "tcp", "doh", "dot"
+    pub protocol: String,
+    /// Bootstrap DNS servers for resolving DoH/DoT hostnames
+    #[serde(default)]
+    pub bootstrap: Vec<String>,
+    /// Query timeout in seconds
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// DNS overall statistics response
+///
+/// Comprehensive DNS statistics including cache, blocking, and upstream metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsStatsResponse {
+    /// Whether DNS engine is enabled
+    pub enabled: bool,
+    /// Uptime in seconds since DNS engine started
+    pub uptime_secs: u64,
+    /// Total DNS queries processed
+    pub total_queries: u64,
+    /// Queries served from cache
+    pub cache_hits: u64,
+    /// Queries that required upstream resolution
+    pub cache_misses: u64,
+    /// Queries blocked by filter rules
+    pub blocked_queries: u64,
+    /// Queries sent to upstream servers
+    pub upstream_queries: u64,
+    /// Average query latency in microseconds
+    pub avg_latency_us: u64,
+}
+
+/// DNS cache statistics response
+///
+/// Detailed statistics about the DNS cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsCacheStatsResponse {
+    /// Whether caching is enabled
+    pub enabled: bool,
+    /// Maximum cache entries
+    pub max_entries: usize,
+    /// Current number of cached entries
+    pub current_entries: usize,
+    /// Cache hit count
+    pub hits: u64,
+    /// Cache miss count
+    pub misses: u64,
+    /// Cache hit rate (0.0 to 1.0)
+    pub hit_rate: f64,
+    /// Negative cache hits (NXDOMAIN/NODATA)
+    pub negative_hits: u64,
+    /// Total cache inserts
+    pub inserts: u64,
+    /// Total cache evictions
+    pub evictions: u64,
+}
+
+/// DNS blocking statistics response
+///
+/// Statistics about DNS blocking/filtering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsBlockStatsResponse {
+    /// Whether blocking is enabled
+    pub enabled: bool,
+    /// Number of blocking rules loaded
+    pub rule_count: usize,
+    /// Total blocked queries
+    pub blocked_queries: u64,
+    /// Total queries evaluated for blocking
+    pub total_queries: u64,
+    /// Block rate (0.0 to 1.0)
+    pub block_rate: f64,
+    /// ISO 8601 timestamp of last rule reload
+    pub last_reload: Option<String>,
+}
+
+/// DNS upstream status response
+///
+/// Status information for DNS upstream servers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsUpstreamStatusResponse {
+    /// Status of each upstream server
+    pub upstreams: Vec<DnsUpstreamInfo>,
+}
+
+/// DNS upstream information
+///
+/// Status and statistics for a single upstream DNS server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsUpstreamInfo {
+    /// Upstream tag
+    pub tag: String,
+    /// Upstream address
+    pub address: String,
+    /// Protocol type (udp, tcp, doh, dot)
+    pub protocol: String,
+    /// Whether the upstream is healthy
+    pub healthy: bool,
+    /// Total queries sent to this upstream
+    pub total_queries: u64,
+    /// Failed queries to this upstream
+    pub failed_queries: u64,
+    /// Average latency in microseconds
+    pub avg_latency_us: u64,
+    /// ISO 8601 timestamp of last successful query
+    pub last_success: Option<String>,
+    /// ISO 8601 timestamp of last failed query
+    pub last_failure: Option<String>,
+}
+
+/// DNS query log response
+///
+/// Response containing DNS query log entries with pagination info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsQueryLogResponse {
+    /// Query log entries
+    pub entries: Vec<DnsQueryLogEntry>,
+    /// Total entries available (may differ from `entries.len()` due to pagination)
+    pub total_available: usize,
+    /// Pagination offset used
+    pub offset: usize,
+    /// Pagination limit used
+    pub limit: usize,
+}
+
+/// DNS query log entry
+///
+/// A single DNS query log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsQueryLogEntry {
+    /// Unix timestamp in milliseconds
+    pub timestamp: u64,
+    /// Queried domain name
+    pub domain: String,
+    /// Query type (e.g., 1 for A, 28 for AAAA)
+    pub qtype: u16,
+    /// Query type as string (e.g., "A", "AAAA")
+    pub qtype_str: String,
+    /// Upstream server used
+    pub upstream: String,
+    /// DNS response code (e.g., 0 for NOERROR, 3 for NXDOMAIN)
+    pub response_code: u8,
+    /// Response code as string (e.g., "NOERROR", "NXDOMAIN")
+    pub rcode_str: String,
+    /// Query latency in microseconds
+    pub latency_us: u32,
+    /// Whether the query was blocked
+    pub blocked: bool,
+    /// Whether the response was served from cache
+    pub cached: bool,
+}
+
+/// DNS query result response
+///
+/// Result of a test DNS query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsQueryResponse {
+    /// Whether the query succeeded
+    pub success: bool,
+    /// Queried domain name
+    pub domain: String,
+    /// Query type used
+    pub qtype: u16,
+    /// DNS response code
+    pub response_code: u8,
+    /// Answer records (IP addresses or CNAME targets as strings)
+    pub answers: Vec<String>,
+    /// Query latency in microseconds
+    pub latency_us: u64,
+    /// Whether the response was cached
+    pub cached: bool,
+    /// Whether the query was blocked
+    pub blocked: bool,
+    /// Upstream server used (None if cached or blocked)
+    pub upstream_used: Option<String>,
+}
+
+/// DNS configuration response
+///
+/// Current DNS engine configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsConfigResponse {
+    /// Whether DNS engine is enabled
+    pub enabled: bool,
+    /// UDP listen address
+    pub listen_udp: String,
+    /// TCP listen address
+    pub listen_tcp: String,
+    /// Configured upstream servers
+    pub upstreams: Vec<DnsUpstreamInfo>,
+    /// Whether caching is enabled
+    pub cache_enabled: bool,
+    /// Maximum cache entries
+    pub cache_max_entries: usize,
+    /// Whether blocking is enabled
+    pub blocking_enabled: bool,
+    /// Blocking response type (e.g., "`zero_ip`", "nxdomain", "refused")
+    pub blocking_response_type: String,
+    /// Whether query logging is enabled
+    pub logging_enabled: bool,
+    /// Logging format (e.g., "json", "tsv", "binary")
+    pub logging_format: String,
+    /// Available features and their implementation status
+    ///
+    /// Keys are feature names, values indicate implementation status:
+    /// - "available": Feature is fully implemented
+    /// - "partial": Feature is partially implemented
+    /// - "`not_implemented"`: Feature is reserved for future use
+    #[serde(default)]
+    pub available_features: std::collections::HashMap<String, String>,
+}
+
+/// WARP registration response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarpRegistrationResponse {
+    /// User-defined tag
+    pub tag: String,
+    /// Cloudflare account ID
+    pub account_id: String,
+    /// Account license key (for WARP+ upgrade)
+    pub license_key: String,
+    /// WireGuard private key (base64)
+    pub private_key: String,
+    /// Peer public key (Cloudflare server)
+    pub peer_public_key: String,
+    /// WireGuard endpoint (host:port)
+    pub endpoint: String,
+    /// Reserved bytes (3-byte client identifier)
+    pub reserved: [u8; 3],
+    /// Interface IPv4 address
+    pub ipv4_address: String,
+    /// Interface IPv6 address
+    pub ipv6_address: String,
+    /// Account type (free or plus)
+    pub account_type: String,
+}
+
+// ============================================================================
+// Speed Test Response
+// ============================================================================
+
+/// Speed test result response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedTestResponse {
+    /// Whether the test was successful
+    pub success: bool,
+    /// Download speed in Mbps
+    pub speed_mbps: f64,
+    /// Bytes downloaded
+    pub bytes_downloaded: u64,
+    /// Test duration in milliseconds
+    pub duration_ms: u64,
+    /// Outbound/tunnel used for the test
+    pub outbound: String,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+/// Peer API request result response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerRequestResponse {
+    /// Whether the request was successful
+    pub success: bool,
+    /// HTTP status code from the peer
+    pub status_code: u16,
+    /// Response body (JSON string)
+    pub body: String,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+// ============================================================================
+// VLESS Protocol Types (v3.3)
+// ============================================================================
+
+/// VLESS user configuration for IPC
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VlessUserConfig {
+    /// User UUID for authentication
+    pub uuid: String,
+    /// User email (optional, for logging)
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Flow control type (e.g., "xtls-rprx-vision")
+    #[serde(default)]
+    pub flow: Option<String>,
+}
+
+/// VLESS outbound info response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VlessOutboundInfoResponse {
+    /// Outbound tag
+    pub tag: String,
+    /// VLESS server address
+    pub server_address: String,
+    /// VLESS server port
+    pub server_port: u16,
+    /// User UUID (partially masked for security)
+    pub uuid: String,
+    /// Flow control setting
+    pub flow: String,
+    /// Transport type (tcp, tls, websocket, websocket_tls)
+    pub transport: String,
+    /// Whether the outbound is enabled
+    pub enabled: bool,
+    /// Health status (healthy, unhealthy, unknown)
+    pub health_status: String,
+    /// Number of active connections
+    pub active_connections: u64,
+}
+
+/// VLESS inbound status response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VlessInboundStatusResponse {
+    /// Whether the inbound listener is running
+    pub running: bool,
+    /// Listen address (e.g., "0.0.0.0:443")
+    pub listen_address: Option<String>,
+    /// Number of configured users
+    pub user_count: usize,
+    /// Whether TLS is enabled (standard TLS, not REALITY)
+    pub tls_enabled: bool,
+    /// Whether REALITY is enabled
+    pub reality_enabled: bool,
+    /// Whether UDP support is enabled
+    pub udp_enabled: bool,
+    /// Total connections since start
+    pub total_connections: u64,
+    /// Currently active connections
+    pub active_connections: u64,
+    /// REALITY statistics (when REALITY is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reality_stats: Option<RealityInboundStats>,
+    /// VLESS-WG bridge statistics (when routing through WireGuard)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge_stats: Option<VlessWgBridgeStats>,
+}
+
+/// REALITY inbound statistics
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RealityInboundStats {
+    /// Total REALITY authentication attempts
+    pub auth_attempts: u64,
+    /// Successful REALITY authentications
+    pub auth_success: u64,
+    /// Failed REALITY authentications (proxied to fallback)
+    pub auth_failures: u64,
+    /// Connections currently being proxied to fallback
+    pub fallback_active: u64,
+    /// Total bytes proxied to fallback
+    pub fallback_bytes: u64,
+    /// Fallback destination
+    pub fallback_dest: String,
+    /// Allowed server names
+    pub server_names: Vec<String>,
+}
+
+/// VLESS-WG bridge statistics
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VlessWgBridgeStats {
+    /// Active sessions in the reply registry
+    pub active_sessions: usize,
+    /// Total sessions registered
+    pub sessions_registered: u64,
+    /// Total sessions unregistered
+    pub sessions_unregistered: u64,
+    /// Packets successfully routed to VLESS sessions
+    pub packets_routed: u64,
+    /// Packets dropped (no session found)
+    pub packets_dropped: u64,
+    /// Packets dropped due to channel full
+    pub channel_full: u64,
+}
+
+/// VLESS user info
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VlessUserInfo {
+    /// User UUID
+    pub uuid: String,
+    /// User email (optional)
+    pub email: Option<String>,
+    /// Flow control type
+    pub flow: Option<String>,
+}
+
+// ============================================================================
+// Shadowsocks Protocol Types
+// ============================================================================
+
+/// Shadowsocks outbound info response
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowsocksOutboundInfoResponse {
+    /// Outbound tag
+    pub tag: String,
+    /// Server address
+    pub server: String,
+    /// Server port
+    pub server_port: u16,
+    /// Encryption method
+    pub method: String,
+    /// Whether UDP is enabled
+    pub udp: bool,
+    /// Whether the outbound is enabled
+    pub enabled: bool,
+    /// Health status (healthy, unhealthy, unknown)
+    pub health_status: String,
+    /// Number of active connections
+    pub active_connections: u64,
+}
+
+/// Shadowsocks inbound status response
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowsocksInboundStatusResponse {
+    /// Whether the listener is active
+    pub active: bool,
+    /// Listen address
+    pub listen: String,
+    /// Encryption method
+    pub method: String,
+    /// Whether UDP is enabled
+    pub udp_enabled: bool,
+    /// Total connections accepted
+    pub connections_accepted: u64,
+    /// Active connections
+    pub active_connections: u64,
+    /// Total protocol errors
+    pub protocol_errors: u64,
+    /// Total bytes received
+    pub bytes_received: u64,
+    /// Total bytes sent
+    pub bytes_sent: u64,
+}
+
+// ============================================================================
+// WireGuard SNI Routing Configuration Response Types
+// ============================================================================
+
+/// Response for `SetWgSniRouting` command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgSniRoutingUpdatedResponse {
+    /// WireGuard tunnel tag that was updated
+    pub tunnel_tag: String,
+    /// New enabled state for SNI routing
+    pub enabled: bool,
+    /// Whether the operation was successful
+    pub success: bool,
+}
+
+/// Response for `GetWgSniRoutingConfig` command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgSniRoutingConfigResponse {
+    /// Whether global SNI routing is enabled
+    pub global_enabled: bool,
+    /// List of tunnels with SNI routing enabled
+    pub enabled_tunnels: Vec<String>,
+}
+
+/// Response for `SetGlobalWgSniRouting` command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalWgSniRoutingUpdatedResponse {
+    /// New global enabled state
+    pub enabled: bool,
+    /// Whether the operation was successful
+    pub success: bool,
+}
+
+// ============================================================================
+// Sharded VLESS-WG Bridge Response Types (feature: sharded-vless-wg-bridge)
+// ============================================================================
+
+/// Per-shard statistics snapshot
+#[cfg(feature = "sharded-vless-wg-bridge")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShardStatsSnapshot {
+    /// Total events processed
+    pub events_processed: u64,
+    /// WireGuard packets received
+    pub wg_packets_received: u64,
+    /// WireGuard packets sent
+    pub wg_packets_sent: u64,
+    /// WireGuard bytes received
+    pub wg_bytes_received: u64,
+    /// WireGuard bytes sent
+    pub wg_bytes_sent: u64,
+    /// WireGuard packets dropped
+    pub wg_packets_dropped: u64,
+    /// TCP sessions created
+    pub tcp_sessions_created: u64,
+    /// TCP sessions closed
+    pub tcp_sessions_closed: u64,
+    /// UDP sessions created
+    pub udp_sessions_created: u64,
+    /// UDP sessions closed
+    pub udp_sessions_closed: u64,
+    /// UDP datagrams sent
+    pub udp_datagrams_sent: u64,
+    /// UDP datagrams received
+    pub udp_datagrams_received: u64,
+    /// smoltcp poll count
+    pub poll_count: u64,
+}
+
+/// Aggregated statistics across all shards
+#[cfg(feature = "sharded-vless-wg-bridge")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardedBridgeStatsResponse {
+    /// Number of shards
+    pub num_shards: usize,
+    /// Per-shard statistics
+    pub per_shard_stats: Vec<ShardStatsSnapshot>,
+    /// Total events processed across all shards
+    pub total_events_processed: u64,
+    /// Total WG packets received
+    pub total_wg_packets_received: u64,
+    /// Total WG packets sent
+    pub total_wg_packets_sent: u64,
+    /// Total WG bytes received
+    pub total_wg_bytes_received: u64,
+    /// Total WG bytes sent
+    pub total_wg_bytes_sent: u64,
+    /// Total WG packets dropped
+    pub total_wg_packets_dropped: u64,
+    /// Total TCP sessions created
+    pub total_tcp_sessions_created: u64,
+    /// Total TCP sessions closed
+    pub total_tcp_sessions_closed: u64,
+    /// Total UDP sessions created
+    pub total_udp_sessions_created: u64,
+    /// Total UDP sessions closed
+    pub total_udp_sessions_closed: u64,
+    /// Total UDP datagrams sent
+    pub total_udp_datagrams_sent: u64,
+    /// Total UDP datagrams received
+    pub total_udp_datagrams_received: u64,
+    /// Total smoltcp polls
+    pub total_poll_count: u64,
+    /// Active TCP sessions (created - closed)
+    pub active_tcp_sessions: u64,
+    /// Active UDP sessions (created - closed)
+    pub active_udp_sessions: u64,
+    /// Distribution skew (standard deviation of events per shard)
+    pub distribution_skew: f64,
+}
+
+/// Response for `GetShardHealth` command
+#[cfg(feature = "sharded-vless-wg-bridge")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardHealthResponse {
+    /// Shard index
+    pub shard_index: usize,
+    /// Whether the shard is healthy (running)
+    pub healthy: bool,
+    /// Current shard statistics
+    pub stats: ShardStatsSnapshot,
+    /// Circuit breaker state (if supervised)
+    pub circuit_breaker_open: bool,
+    /// Consecutive failure count
+    pub failure_count: u32,
+    /// Total restarts for this shard
+    pub total_restarts: u64,
+}
+
+/// Response for `GetSupervisorStats` command
+#[cfg(feature = "sharded-vless-wg-bridge")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorStatsResponse {
+    /// Number of shards being supervised
+    pub num_shards: usize,
+    /// Restart counts per shard
+    pub restarts_per_shard: Vec<u64>,
+    /// Total restarts across all shards
+    pub total_restarts: u64,
+    /// Total circuit breaker trips
+    pub circuit_breaker_trips: u64,
+    /// Total panics detected
+    pub total_panics: u64,
+    /// Total crashes (non-panic errors)
+    pub total_crashes: u64,
+    /// Health check count
+    pub health_checks: u64,
+    /// Number of shards with circuit breaker open
+    pub shards_circuit_open: usize,
+}
+
+/// IPC error
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcError {
+    /// Error code
+    pub code: ErrorCode,
+    /// Error message
+    pub message: String,
+}
+
+impl std::fmt::Display for IpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for IpcError {}
+
+/// Error codes for IPC responses
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCode {
+    /// Unknown error
+    Unknown,
+    /// Invalid command
+    InvalidCommand,
+    /// Invalid parameters
+    InvalidParameters,
+    /// Resource not found
+    NotFound,
+    /// Resource already exists
+    AlreadyExists,
+    /// Operation failed
+    OperationFailed,
+    /// Server is shutting down
+    ShuttingDown,
+    /// Permission denied
+    PermissionDenied,
+    /// Internal error
+    InternalError,
+}
+
+/// Message framing for IPC
+///
+/// Messages are length-prefixed:
+/// - 4 bytes: message length (big-endian u32)
+/// - N bytes: JSON message
+pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1 MB
+pub const LENGTH_PREFIX_SIZE: usize = 4;
+
+/// Encode a message with length prefix
+pub fn encode_message<T: Serialize>(msg: &T) -> Result<Vec<u8>, serde_json::Error> {
+    let json = serde_json::to_vec(msg)?;
+    let len = json.len() as u32;
+
+    let mut buf = Vec::with_capacity(LENGTH_PREFIX_SIZE + json.len());
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(&json);
+
+    Ok(buf)
+}
+
+/// Decode a length-prefixed message
+pub fn decode_message<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T, serde_json::Error> {
+    serde_json::from_slice(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_command_serialization() {
+        let cmd = IpcCommand::Ping;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"ping\""));
+
+        let cmd = IpcCommand::Reload {
+            config_path: "/etc/router.json".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"reload\""));
+        assert!(json.contains("config_path"));
+    }
+
+    #[test]
+    fn test_response_serialization() {
+        let resp = IpcResponse::Pong;
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"pong\""));
+
+        let resp = IpcResponse::error(ErrorCode::NotFound, "Outbound not found");
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"error\""));
+        assert!(json.contains("NOT_FOUND"));
+    }
+
+    #[test]
+    fn test_encode_decode() {
+        let cmd = IpcCommand::Status;
+        let encoded = encode_message(&cmd).unwrap();
+
+        // First 4 bytes are length
+        let len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+        assert_eq!(len, encoded.len() - 4);
+
+        // Decode the JSON part
+        let decoded: IpcCommand = decode_message(&encoded[4..]).unwrap();
+        assert!(matches!(decoded, IpcCommand::Status));
+    }
+
+    #[test]
+    fn test_capabilities_default() {
+        let caps = ServerCapabilities::default();
+        assert!(caps.outbound_types.contains(&"direct".to_string()));
+        assert!(caps.hot_reload);
+        assert!(!caps.udp_support); // TCP only
+    }
+
+    #[test]
+    fn test_response_helpers() {
+        let success = IpcResponse::success();
+        assert!(!success.is_error());
+
+        let error = IpcResponse::error(ErrorCode::NotFound, "test");
+        assert!(error.is_error());
+    }
+
+    #[test]
+    fn test_test_match_command_serialization() {
+        let cmd = IpcCommand::TestMatch {
+            domain: Some("google.com".into()),
+            dest_ip: Some("8.8.8.8".into()),
+            dest_port: 443,
+            protocol: "tcp".into(),
+            sniffed_protocol: Some("tls".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"test_match\""));
+        assert!(json.contains("google.com"));
+        assert!(json.contains("8.8.8.8"));
+        assert!(json.contains("443"));
+        assert!(json.contains("tcp"));
+        assert!(json.contains("tls"));
+
+        // Deserialize back
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::TestMatch {
+                domain,
+                dest_ip,
+                dest_port,
+                protocol,
+                sniffed_protocol,
+            } => {
+                assert_eq!(domain, Some("google.com".into()));
+                assert_eq!(dest_ip, Some("8.8.8.8".into()));
+                assert_eq!(dest_port, 443);
+                assert_eq!(protocol, "tcp");
+                assert_eq!(sniffed_protocol, Some("tls".into()));
+            }
+            _ => panic!("Expected TestMatch command"),
+        }
+    }
+
+    #[test]
+    fn test_test_match_result_serialization() {
+        let result = TestMatchResult {
+            outbound: "proxy".into(),
+            match_type: Some("domain".into()),
+            routing_mark: Some(773),
+            is_chain: true,
+            match_time_us: 42,
+        };
+        let resp = IpcResponse::TestMatchResult(result);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"test_match_result\""));
+        assert!(json.contains("\"outbound\":\"proxy\""));
+        assert!(json.contains("\"match_type\":\"domain\""));
+        assert!(json.contains("\"routing_mark\":773"));
+        assert!(json.contains("\"is_chain\":true"));
+    }
+
+    #[test]
+    fn test_get_rule_stats_command_serialization() {
+        let cmd = IpcCommand::GetRuleStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_rule_stats\""));
+
+        // Deserialize back
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetRuleStats));
+    }
+
+    #[test]
+    fn test_reload_rules_command_serialization() {
+        // With config path
+        let cmd = IpcCommand::ReloadRules {
+            config_path: Some("/etc/rust-router/rules.json".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"reload_rules\""));
+        assert!(json.contains("config_path"));
+
+        // Without config path
+        let cmd = IpcCommand::ReloadRules { config_path: None };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::ReloadRules { config_path } => {
+                assert!(config_path.is_none());
+            }
+            _ => panic!("Expected ReloadRules command"),
+        }
+    }
+
+    #[test]
+    fn test_rule_stats_response_serialization() {
+        let stats = RuleStatsResponse {
+            domain_rules: 1000,
+            geoip_rules: 250,
+            port_rules: 15,
+            protocol_rules: 2,
+            chain_count: 5,
+            config_version: 42,
+            last_reload: Some("2026-01-05T12:00:00Z".into()),
+            default_outbound: "direct".into(),
+        };
+        let resp = IpcResponse::RuleStats(stats);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"rule_stats\""));
+        assert!(json.contains("\"domain_rules\":1000"));
+        assert!(json.contains("\"geoip_rules\":250"));
+        assert!(json.contains("\"chain_count\":5"));
+        assert!(json.contains("\"config_version\":42"));
+        assert!(json.contains("\"default_outbound\":\"direct\""));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::RuleStats(s) = parsed {
+            assert_eq!(s.domain_rules, 1000);
+            assert_eq!(s.config_version, 42);
+        } else {
+            panic!("Expected RuleStats response");
+        }
+    }
+
+    // =========================================================================
+    // P0 Serialization Tests - IPC Protocol v2.1
+    // =========================================================================
+
+    #[test]
+    fn test_egress_action_serialization() {
+        // Test Added variant
+        let action = EgressAction::Added;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, "\"added\"");
+        let parsed: EgressAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, EgressAction::Added);
+
+        // Test Removed variant
+        let action = EgressAction::Removed;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, "\"removed\"");
+        let parsed: EgressAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, EgressAction::Removed);
+
+        // Test Updated variant
+        let action = EgressAction::Updated;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, "\"updated\"");
+        let parsed: EgressAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, EgressAction::Updated);
+    }
+
+    #[test]
+    fn test_rule_config_serialization() {
+        // Test with all fields
+        let rule = RuleConfig {
+            rule_type: "domain_suffix".into(),
+            target: "google.com".into(),
+            outbound: "proxy".into(),
+            priority: 10,
+            enabled: true,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert!(json.contains("\"rule_type\":\"domain_suffix\""));
+        assert!(json.contains("\"target\":\"google.com\""));
+        assert!(json.contains("\"outbound\":\"proxy\""));
+        assert!(json.contains("\"priority\":10"));
+        assert!(json.contains("\"enabled\":true"));
+
+        // Deserialize back
+        let parsed: RuleConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rule_type, "domain_suffix");
+        assert_eq!(parsed.target, "google.com");
+        assert_eq!(parsed.outbound, "proxy");
+        assert_eq!(parsed.priority, 10);
+        assert!(parsed.enabled);
+
+        // Test default values
+        let json_minimal = r#"{"rule_type":"geoip","target":"CN","outbound":"cn-proxy"}"#;
+        let parsed: RuleConfig = serde_json::from_str(json_minimal).unwrap();
+        assert_eq!(parsed.priority, 0); // default
+        assert!(parsed.enabled); // default_enabled()
+    }
+
+    #[test]
+    fn test_drain_response_serialization() {
+        let resp = DrainResponse {
+            success: true,
+            drained_count: 15,
+            force_closed_count: 2,
+            drain_time_ms: 1500,
+        };
+        let ipc_resp = IpcResponse::DrainResult(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"drain_result\""));
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"drained_count\":15"));
+        assert!(json.contains("\"force_closed_count\":2"));
+        assert!(json.contains("\"drain_time_ms\":1500"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DrainResult(dr) = parsed {
+            assert!(dr.success);
+            assert_eq!(dr.drained_count, 15);
+            assert_eq!(dr.force_closed_count, 2);
+            assert_eq!(dr.drain_time_ms, 1500);
+        } else {
+            panic!("Expected DrainResult response");
+        }
+    }
+
+    #[test]
+    fn test_update_routing_response_serialization() {
+        let resp = UpdateRoutingResponse {
+            success: true,
+            version: 42,
+            rule_count: 100,
+            default_outbound: "direct".into(),
+        };
+        let ipc_resp = IpcResponse::UpdateRoutingResult(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"update_routing_result\""));
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"version\":42"));
+        assert!(json.contains("\"rule_count\":100"));
+        assert!(json.contains("\"default_outbound\":\"direct\""));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::UpdateRoutingResult(ur) = parsed {
+            assert!(ur.success);
+            assert_eq!(ur.version, 42);
+            assert_eq!(ur.rule_count, 100);
+            assert_eq!(ur.default_outbound, "direct");
+        } else {
+            panic!("Expected UpdateRoutingResult response");
+        }
+    }
+
+    #[test]
+    fn test_outbound_health_response_serialization() {
+        let health = OutboundHealthResponse {
+            outbounds: vec![
+                OutboundHealthInfo {
+                    tag: "direct".into(),
+                    outbound_type: "direct".into(),
+                    health: "healthy".into(),
+                    enabled: true,
+                    active_connections: 10,
+                    last_check: Some("2026-01-06T12:00:00Z".into()),
+                    error: None,
+                },
+                OutboundHealthInfo {
+                    tag: "proxy".into(),
+                    outbound_type: "socks5".into(),
+                    health: "degraded".into(),
+                    enabled: true,
+                    active_connections: 5,
+                    last_check: Some("2026-01-06T12:00:00Z".into()),
+                    error: Some("Connection timeout".into()),
+                },
+            ],
+            overall_health: "degraded".into(),
+        };
+        let ipc_resp = IpcResponse::OutboundHealth(health);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"outbound_health\""));
+        assert!(json.contains("\"overall_health\":\"degraded\""));
+        assert!(json.contains("\"tag\":\"direct\""));
+        assert!(json.contains("\"tag\":\"proxy\""));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::OutboundHealth(oh) = parsed {
+            assert_eq!(oh.outbounds.len(), 2);
+            assert_eq!(oh.overall_health, "degraded");
+            assert_eq!(oh.outbounds[0].tag, "direct");
+            assert_eq!(oh.outbounds[1].error, Some("Connection timeout".into()));
+        } else {
+            panic!("Expected OutboundHealth response");
+        }
+    }
+
+    #[test]
+    fn test_get_prometheus_metrics_command_serialization() {
+        let cmd = IpcCommand::GetPrometheusMetrics;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_prometheus_metrics\""));
+
+        // Deserialize back
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetPrometheusMetrics));
+    }
+
+    #[test]
+    fn test_prometheus_metrics_response_serialization() {
+        let metrics_text = r#"# HELP rust_router_connections_total Total connections
+# TYPE rust_router_connections_total counter
+rust_router_connections_total 12345
+"#;
+        let resp = PrometheusMetricsResponse {
+            metrics_text: metrics_text.to_string(),
+            timestamp_ms: 1704499200000,
+        };
+        let ipc_resp = IpcResponse::PrometheusMetrics(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"prometheus_metrics\""));
+        assert!(json.contains("\"timestamp_ms\":1704499200000"));
+        assert!(json.contains("rust_router_connections_total"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::PrometheusMetrics(pm) = parsed {
+            assert_eq!(pm.timestamp_ms, 1704499200000);
+            assert!(pm.metrics_text.contains("rust_router_connections_total"));
+        } else {
+            panic!("Expected PrometheusMetrics response");
+        }
+    }
+
+    // =========================================================================
+    // UDP IPC Protocol Tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_udp_stats_command_serialization() {
+        let cmd = IpcCommand::GetUdpStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_udp_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetUdpStats));
+    }
+
+    #[test]
+    fn test_list_udp_sessions_command_serialization() {
+        // With explicit limit
+        let cmd = IpcCommand::ListUdpSessions { limit: 50 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"list_udp_sessions\""));
+        assert!(json.contains("\"limit\":50"));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::ListUdpSessions { limit } = parsed {
+            assert_eq!(limit, 50);
+        } else {
+            panic!("Expected ListUdpSessions command");
+        }
+
+        // With default limit
+        let json_default = r#"{"type":"list_udp_sessions"}"#;
+        let parsed: IpcCommand = serde_json::from_str(json_default).unwrap();
+        if let IpcCommand::ListUdpSessions { limit } = parsed {
+            assert_eq!(limit, 100); // default_udp_session_limit()
+        } else {
+            panic!("Expected ListUdpSessions command");
+        }
+    }
+
+    #[test]
+    fn test_get_udp_session_command_serialization() {
+        let cmd = IpcCommand::GetUdpSession {
+            client_addr: "192.168.1.100:12345".into(),
+            dest_addr: "8.8.8.8:443".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_udp_session\""));
+        assert!(json.contains("192.168.1.100:12345"));
+        assert!(json.contains("8.8.8.8:443"));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::GetUdpSession {
+            client_addr,
+            dest_addr,
+        } = parsed
+        {
+            assert_eq!(client_addr, "192.168.1.100:12345");
+            assert_eq!(dest_addr, "8.8.8.8:443");
+        } else {
+            panic!("Expected GetUdpSession command");
+        }
+    }
+
+    #[test]
+    fn test_get_udp_worker_stats_command_serialization() {
+        let cmd = IpcCommand::GetUdpWorkerStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_udp_worker_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetUdpWorkerStats));
+    }
+
+    #[test]
+    fn test_get_buffer_pool_stats_command_serialization() {
+        let cmd = IpcCommand::GetBufferPoolStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_buffer_pool_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetBufferPoolStats));
+    }
+
+    #[test]
+    fn test_udp_stats_response_serialization() {
+        let resp = UdpStatsResponse {
+            udp_enabled: true,
+            session_stats: UdpSessionStatsInfo {
+                session_count: 100,
+                max_sessions: 65536,
+                total_created: 500,
+                total_evicted: 400,
+                utilization_percent: 0.15,
+                idle_timeout_secs: 300,
+                ttl_secs: 600,
+            },
+            worker_stats: Some(UdpWorkerPoolInfo {
+                packets_processed: 10000,
+                bytes_received: 1_500_000,
+                workers_active: 4,
+                workers_total: 4,
+                worker_errors: 5,
+            }),
+            buffer_pool_stats: Some(BufferPoolInfo {
+                capacity: 1024,
+                buffer_size: 65535,
+                available: 800,
+                allocations: 224,
+                reuses: 9776,
+                returns: 9800,
+                drops: 0,
+                efficiency: 0.9776,
+            }),
+            processor_stats: Some(UdpProcessorInfo {
+                packets_processed: 10000,
+                packets_forwarded: 9995,
+                packets_failed: 5,
+                sessions_created: 500,
+                sessions_reused: 9500,
+                bytes_sent: 1_200_000,
+                quic_packets: 8000,
+                quic_sni_extracted: 7500,
+                rule_matches: 6000,
+                active_sessions: 450,
+            }),
+        };
+        let ipc_resp = IpcResponse::UdpStats(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"udp_stats\""));
+        assert!(json.contains("\"udp_enabled\":true"));
+        assert!(json.contains("\"session_count\":100"));
+        assert!(json.contains("\"packets_processed\":10000"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::UdpStats(stats) = parsed {
+            assert!(stats.udp_enabled);
+            assert_eq!(stats.session_stats.session_count, 100);
+            assert!(stats.worker_stats.is_some());
+            assert_eq!(
+                stats.worker_stats.as_ref().unwrap().packets_processed,
+                10000
+            );
+        } else {
+            panic!("Expected UdpStats response");
+        }
+    }
+
+    #[test]
+    fn test_udp_sessions_response_serialization() {
+        let resp = UdpSessionsResponse {
+            sessions: vec![UdpSessionInfo {
+                client_addr: "192.168.1.100:12345".into(),
+                dest_addr: "8.8.8.8:443".into(),
+                outbound: "direct".into(),
+                routing_mark: None,
+                sniffed_domain: Some("example.com".into()),
+                bytes_sent: 1000,
+                bytes_recv: 5000,
+                packets_sent: 10,
+                packets_recv: 50,
+                age_secs: 30,
+            }],
+            total_count: 100,
+            truncated: true,
+        };
+        let ipc_resp = IpcResponse::UdpSessions(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"udp_sessions\""));
+        assert!(json.contains("\"total_count\":100"));
+        assert!(json.contains("\"truncated\":true"));
+        assert!(json.contains("example.com"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::UdpSessions(sessions) = parsed {
+            assert_eq!(sessions.sessions.len(), 1);
+            assert_eq!(sessions.total_count, 100);
+            assert!(sessions.truncated);
+            assert_eq!(
+                sessions.sessions[0].sniffed_domain,
+                Some("example.com".into())
+            );
+        } else {
+            panic!("Expected UdpSessions response");
+        }
+    }
+
+    #[test]
+    fn test_udp_session_response_serialization() {
+        // Found case
+        let resp = UdpSessionResponse {
+            found: true,
+            session: Some(UdpSessionInfo {
+                client_addr: "192.168.1.100:12345".into(),
+                dest_addr: "8.8.8.8:443".into(),
+                outbound: "proxy".into(),
+                routing_mark: Some(200),
+                sniffed_domain: None,
+                bytes_sent: 500,
+                bytes_recv: 2000,
+                packets_sent: 5,
+                packets_recv: 20,
+                age_secs: 15,
+            }),
+        };
+        let ipc_resp = IpcResponse::UdpSession(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"udp_session\""));
+        assert!(json.contains("\"found\":true"));
+        assert!(json.contains("\"routing_mark\":200"));
+
+        // Not found case
+        let resp_not_found = UdpSessionResponse {
+            found: false,
+            session: None,
+        };
+        let ipc_resp_not_found = IpcResponse::UdpSession(resp_not_found);
+        let json_not_found = serde_json::to_string(&ipc_resp_not_found).unwrap();
+        assert!(json_not_found.contains("\"found\":false"));
+        assert!(json_not_found.contains("\"session\":null"));
+    }
+
+    #[test]
+    fn test_udp_worker_stats_response_serialization() {
+        let resp = UdpWorkerStatsResponse {
+            running: true,
+            num_workers: 4,
+            stats: Some(UdpWorkerPoolInfo {
+                packets_processed: 50000,
+                bytes_received: 10_000_000,
+                workers_active: 4,
+                workers_total: 4,
+                worker_errors: 2,
+            }),
+        };
+        let ipc_resp = IpcResponse::UdpWorkerStats(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"udp_worker_stats\""));
+        assert!(json.contains("\"running\":true"));
+        assert!(json.contains("\"num_workers\":4"));
+        assert!(json.contains("\"packets_processed\":50000"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::UdpWorkerStats(stats) = parsed {
+            assert!(stats.running);
+            assert_eq!(stats.num_workers, 4);
+            assert_eq!(stats.stats.as_ref().unwrap().packets_processed, 50000);
+        } else {
+            panic!("Expected UdpWorkerStats response");
+        }
+    }
+
+    #[test]
+    fn test_buffer_pool_stats_response_serialization() {
+        let resp = BufferPoolStatsResponse {
+            available: true,
+            stats: Some(BufferPoolInfo {
+                capacity: 2048,
+                buffer_size: 65535,
+                available: 1500,
+                allocations: 548,
+                reuses: 99452,
+                returns: 100000,
+                drops: 0,
+                efficiency: 0.9945,
+            }),
+        };
+        let ipc_resp = IpcResponse::BufferPoolStats(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"buffer_pool_stats\""));
+        assert!(json.contains("\"available\":true"));
+        assert!(json.contains("\"capacity\":2048"));
+        assert!(json.contains("\"efficiency\":0.9945"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::BufferPoolStats(stats) = parsed {
+            assert!(stats.available);
+            assert_eq!(stats.stats.as_ref().unwrap().capacity, 2048);
+            assert!((stats.stats.as_ref().unwrap().efficiency - 0.9945).abs() < 0.0001);
+        } else {
+            panic!("Expected BufferPoolStats response");
+        }
+    }
+
+    #[test]
+    fn test_udp_stats_disabled_serialization() {
+        // Test UDP disabled case
+        let resp = UdpStatsResponse {
+            udp_enabled: false,
+            session_stats: UdpSessionStatsInfo {
+                session_count: 0,
+                max_sessions: 65536,
+                total_created: 0,
+                total_evicted: 0,
+                utilization_percent: 0.0,
+                idle_timeout_secs: 300,
+                ttl_secs: 600,
+            },
+            worker_stats: None,
+            buffer_pool_stats: None,
+            processor_stats: None,
+        };
+        let ipc_resp = IpcResponse::UdpStats(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"udp_enabled\":false"));
+        assert!(json.contains("\"worker_stats\":null"));
+        assert!(json.contains("\"buffer_pool_stats\":null"));
+        assert!(json.contains("\"processor_stats\":null"));
+    }
+
+    // =========================================================================
+    // Serialization Tests - IPC Protocol v3.2
+    // =========================================================================
+
+    #[test]
+    fn test_tunnel_type_serialization() {
+        // TunnelType uses "wireguard" (not "wire_guard") for REST API compatibility
+        let wg = TunnelType::WireGuard;
+        let json = serde_json::to_string(&wg).unwrap();
+        assert_eq!(json, "\"wireguard\"");
+
+        let xray = TunnelType::Xray;
+        let json = serde_json::to_string(&xray).unwrap();
+        assert_eq!(json, "\"xray\"");
+
+        // Deserialize back
+        let parsed: TunnelType = serde_json::from_str("\"wireguard\"").unwrap();
+        assert_eq!(parsed, TunnelType::WireGuard);
+
+        let parsed: TunnelType = serde_json::from_str("\"xray\"").unwrap();
+        assert_eq!(parsed, TunnelType::Xray);
+
+        // Test default
+        assert_eq!(TunnelType::default(), TunnelType::WireGuard);
+    }
+
+    #[test]
+    fn test_peer_state_serialization() {
+        let state = PeerState::Connected;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"connected\"");
+
+        let state = PeerState::Disconnected;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"disconnected\"");
+
+        let state = PeerState::Connecting;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"connecting\"");
+
+        let state = PeerState::Failed;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"failed\"");
+
+        // Test default
+        assert_eq!(PeerState::default(), PeerState::Disconnected);
+    }
+
+    #[test]
+    fn test_chain_role_serialization() {
+        let role = ChainRole::Entry;
+        let json = serde_json::to_string(&role).unwrap();
+        assert_eq!(json, "\"entry\"");
+
+        let role = ChainRole::Relay;
+        let json = serde_json::to_string(&role).unwrap();
+        assert_eq!(json, "\"relay\"");
+
+        let role = ChainRole::Terminal;
+        let json = serde_json::to_string(&role).unwrap();
+        assert_eq!(json, "\"terminal\"");
+    }
+
+    #[test]
+    fn test_chain_state_serialization() {
+        let state = ChainState::Inactive;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"inactive\"");
+
+        let state = ChainState::Activating;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"activating\"");
+
+        let state = ChainState::Active;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"active\"");
+
+        let state = ChainState::Error;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"error\"");
+
+        // Test default
+        assert_eq!(ChainState::default(), ChainState::Inactive);
+    }
+
+    #[test]
+    fn test_ecmp_algorithm_serialization() {
+        let algo = EcmpAlgorithm::RoundRobin;
+        let json = serde_json::to_string(&algo).unwrap();
+        assert_eq!(json, "\"round_robin\"");
+
+        let algo = EcmpAlgorithm::Weighted;
+        let json = serde_json::to_string(&algo).unwrap();
+        assert_eq!(json, "\"weighted\"");
+
+        // Test default
+        assert_eq!(EcmpAlgorithm::default(), EcmpAlgorithm::RoundRobin);
+    }
+
+    #[test]
+    fn test_prepare_status_serialization() {
+        let status = PrepareStatus::Pending;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"pending\"");
+
+        let status = PrepareStatus::Prepared;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"prepared\"");
+
+        let status = PrepareStatus::Committed;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"committed\"");
+
+        let status = PrepareStatus::Aborted;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"aborted\"");
+
+        // Test default
+        assert_eq!(PrepareStatus::default(), PrepareStatus::Pending);
+    }
+
+    #[test]
+    fn test_wg_tunnel_config_serialization() {
+        let config = WgTunnelConfig {
+            private_key: "cGFzc3dvcmQ=".into(),
+            peer_public_key: "cGVlcmtleQ==".into(),
+            peer_endpoint: "10.0.0.1:51820".into(),
+            allowed_ips: vec!["10.200.200.0/24".into()],
+            local_ip: Some("10.200.200.1/32".into()),
+            listen_port: Some(36200),
+            persistent_keepalive: Some(25),
+            mtu: Some(1420),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"private_key\":\"cGFzc3dvcmQ=\""));
+        assert!(json.contains("\"peer_endpoint\":\"10.0.0.1:51820\""));
+        assert!(json.contains("\"listen_port\":36200"));
+        assert!(json.contains("\"mtu\":1420"));
+
+        let parsed: WgTunnelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.peer_endpoint, "10.0.0.1:51820");
+        assert_eq!(parsed.mtu, Some(1420));
+    }
+
+    #[test]
+    fn test_chain_config_serialization() {
+        let config = ChainConfig {
+            tag: "test-chain".into(),
+            description: "Test chain".into(),
+            dscp_value: 10,
+            hops: vec![
+                ChainHop {
+                    node_tag: "node-a".into(),
+                    role: ChainRole::Entry,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+                ChainHop {
+                    node_tag: "node-b".into(),
+                    role: ChainRole::Terminal,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+            ],
+            rules: vec!["rule1".into()],
+            exit_egress: "direct".into(),
+            allow_transitive: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"tag\":\"test-chain\""));
+        assert!(json.contains("\"dscp_value\":10"));
+        assert!(json.contains("\"exit_egress\":\"direct\""));
+        assert!(json.contains("\"role\":\"entry\""));
+        assert!(json.contains("\"role\":\"terminal\""));
+
+        let parsed: ChainConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tag, "test-chain");
+        assert_eq!(parsed.dscp_value, 10);
+        assert_eq!(parsed.hops.len(), 2);
+        assert_eq!(parsed.hops[0].role, ChainRole::Entry);
+    }
+
+    #[test]
+    fn test_pair_request_serialization() {
+        let request = PairRequest {
+            message_type: "pair_request".to_string(),
+            version: 2,
+            node_tag: "node-a".into(),
+            node_description: "Test node A".into(),
+            endpoint: "192.168.1.100:36200".into(),
+            api_port: 36000,
+            tunnel_type: TunnelType::WireGuard,
+            timestamp: 1704067200,
+            bidirectional: true,
+            wg_public_key: Some("cHVibGljX2tleQ==".into()),
+            tunnel_ip: Some("10.200.200.1".into()),
+            remote_wg_private_key: None,
+            remote_wg_public_key: None,
+            xray_uuid: None,
+            xray_server_name: None,
+            xray_public_key: None,
+            xray_short_id: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"version\":2"));
+        assert!(json.contains("\"node_tag\":\"node-a\""));
+        assert!(json.contains("\"bidirectional\":true"));
+        assert!(json.contains("\"api_port\":36000"));
+        // Verify type field is serialized as "type" (not "message_type")
+        assert!(json.contains("\"type\":\"pair_request\""));
+
+        let parsed: PairRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.api_port, 36000);
+        assert!(parsed.bidirectional);
+        assert_eq!(parsed.message_type, "pair_request");
+    }
+
+    #[test]
+    fn test_generate_pair_request_command_serialization() {
+        let cmd = IpcCommand::GeneratePairRequest {
+            local_tag: "local-node".into(),
+            local_description: "My local node".into(),
+            local_endpoint: "1.2.3.4:36200".into(),
+            local_api_port: 36000,
+            bidirectional: true,
+            tunnel_type: TunnelType::WireGuard,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"generate_pair_request\""));
+        assert!(json.contains("\"local_tag\":\"local-node\""));
+        assert!(json.contains("\"bidirectional\":true"));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::GeneratePairRequest {
+            local_tag,
+            bidirectional,
+            ..
+        } = parsed
+        {
+            assert_eq!(local_tag, "local-node");
+            assert!(bidirectional);
+        } else {
+            panic!("Expected GeneratePairRequest command");
+        }
+    }
+
+    #[test]
+    fn test_create_chain_command_serialization() {
+        let cmd = IpcCommand::CreateChain {
+            tag: "my-chain".into(),
+            config: ChainConfig {
+                tag: "my-chain".into(),
+                description: "My test chain".into(),
+                dscp_value: 5,
+                hops: vec![],
+                rules: vec![],
+                exit_egress: "proxy".into(),
+                allow_transitive: false,
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"create_chain\""));
+        assert!(json.contains("\"tag\":\"my-chain\""));
+        assert!(json.contains("\"dscp_value\":5"));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::CreateChain { tag, config } = parsed {
+            assert_eq!(tag, "my-chain");
+            assert_eq!(config.dscp_value, 5);
+        } else {
+            panic!("Expected CreateChain command");
+        }
+    }
+
+    #[test]
+    fn test_prepare_chain_route_command_serialization() {
+        let cmd = IpcCommand::PrepareChainRoute {
+            chain_tag: "chain-1".into(),
+            config: ChainConfig {
+                tag: "chain-1".into(),
+                description: "Chain 1".into(),
+                dscp_value: 10,
+                hops: vec![],
+                rules: vec![],
+                exit_egress: "direct".into(),
+                allow_transitive: false,
+            },
+            source_node: "entry-node".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"prepare_chain_route\""));
+        assert!(json.contains("\"chain_tag\":\"chain-1\""));
+        assert!(json.contains("\"source_node\":\"entry-node\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::PrepareChainRoute {
+            chain_tag,
+            source_node,
+            ..
+        } = parsed
+        {
+            assert_eq!(chain_tag, "chain-1");
+            assert_eq!(source_node, "entry-node");
+        } else {
+            panic!("Expected PrepareChainRoute command");
+        }
+    }
+
+    #[test]
+    fn test_chain_status_response_serialization() {
+        let status = ChainStatus {
+            tag: "my-chain".into(),
+            state: ChainState::Active,
+            dscp_value: 10,
+            my_role: Some(ChainRole::Entry),
+            hop_status: vec![
+                HopStatus {
+                    node_tag: "node-a".into(),
+                    role: ChainRole::Entry,
+                    tunnel_type: TunnelType::WireGuard,
+                    peer_connected: true,
+                    prepare_status: Some(PrepareStatus::Committed),
+                },
+                HopStatus {
+                    node_tag: "node-b".into(),
+                    role: ChainRole::Terminal,
+                    tunnel_type: TunnelType::WireGuard,
+                    peer_connected: true,
+                    prepare_status: Some(PrepareStatus::Committed),
+                },
+            ],
+            exit_egress: "pia-us-west".into(),
+            active_connections: 5,
+            last_error: None,
+        };
+        let ipc_resp = IpcResponse::ChainStatus(status);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"chain_status\""));
+        assert!(json.contains("\"state\":\"active\""));
+        assert!(json.contains("\"my_role\":\"entry\""));
+        assert!(json.contains("\"peer_connected\":true"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::ChainStatus(s) = parsed {
+            assert_eq!(s.tag, "my-chain");
+            assert_eq!(s.state, ChainState::Active);
+            assert_eq!(s.hop_status.len(), 2);
+        } else {
+            panic!("Expected ChainStatus response");
+        }
+    }
+
+    #[test]
+    fn test_peer_status_response_serialization() {
+        let status = PeerStatus {
+            tag: "peer-1".into(),
+            state: PeerState::Connected,
+            tunnel_type: TunnelType::WireGuard,
+            endpoint: "192.168.1.100:36200".into(),
+            tunnel_local_ip: Some("10.200.200.1".into()),
+            tunnel_remote_ip: Some("10.200.200.2".into()),
+            api_port: 36000,
+            last_handshake: Some(1704067200),
+            tx_bytes: 1000,
+            rx_bytes: 2000,
+            reconnect_attempts: 0,
+            consecutive_failures: 0,
+            last_error: None,
+        };
+        let ipc_resp = IpcResponse::PeerStatus(status);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"peer_status\""));
+        assert!(json.contains("\"state\":\"connected\""));
+        assert!(json.contains("\"api_port\":36000"));
+        assert!(json.contains("\"tx_bytes\":1000"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::PeerStatus(s) = parsed {
+            assert_eq!(s.tag, "peer-1");
+            assert_eq!(s.state, PeerState::Connected);
+            assert_eq!(s.api_port, 36000);
+        } else {
+            panic!("Expected PeerStatus response");
+        }
+    }
+
+    #[test]
+    fn test_ecmp_group_config_serialization() {
+        let config = EcmpGroupConfig {
+            description: "Test ECMP group".into(),
+            algorithm: EcmpAlgorithm::Weighted,
+            members: vec![
+                EcmpMemberConfig {
+                    outbound: "proxy-1".into(),
+                    weight: 2,
+                    enabled: true,
+                },
+                EcmpMemberConfig {
+                    outbound: "proxy-2".into(),
+                    weight: 1,
+                    enabled: true,
+                },
+            ],
+            skip_unhealthy: true,
+            health_check_interval_secs: 30,
+            routing_mark: Some(200),
+            routing_table: Some(200),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"algorithm\":\"weighted\""));
+        assert!(json.contains("\"weight\":2"));
+        assert!(json.contains("\"skip_unhealthy\":true"));
+
+        let parsed: EcmpGroupConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.algorithm, EcmpAlgorithm::Weighted);
+        assert_eq!(parsed.members.len(), 2);
+        assert_eq!(parsed.members[0].weight, 2);
+    }
+
+    #[test]
+    fn test_wg_tunnel_commands_serialization() {
+        // CreateWgTunnel
+        let cmd = IpcCommand::CreateWgTunnel {
+            tag: "wg-test".into(),
+            config: WgTunnelConfig {
+                private_key: "key".into(),
+                peer_public_key: "peer".into(),
+                peer_endpoint: "1.2.3.4:51820".into(),
+                allowed_ips: vec![],
+                local_ip: None,
+                listen_port: None,
+                persistent_keepalive: None,
+                mtu: None,
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"create_wg_tunnel\""));
+
+        // RemoveWgTunnel
+        let cmd = IpcCommand::RemoveWgTunnel {
+            tag: "wg-test".into(),
+            drain_timeout_secs: Some(30),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"remove_wg_tunnel\""));
+        assert!(json.contains("\"drain_timeout_secs\":30"));
+
+        // GetWgTunnelStatus
+        let cmd = IpcCommand::GetWgTunnelStatus {
+            tag: "wg-test".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_wg_tunnel_status\""));
+
+        // ListWgTunnels
+        let cmd = IpcCommand::ListWgTunnels;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"list_wg_tunnels\""));
+    }
+
+    #[test]
+    fn test_peer_commands_serialization() {
+        // ConnectPeer
+        let cmd = IpcCommand::ConnectPeer {
+            tag: "peer-1".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"connect_peer\""));
+
+        // DisconnectPeer
+        let cmd = IpcCommand::DisconnectPeer {
+            tag: "peer-1".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"disconnect_peer\""));
+
+        // GetPeerStatus
+        let cmd = IpcCommand::GetPeerStatus {
+            tag: "peer-1".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_peer_status\""));
+
+        // ListPeers
+        let cmd = IpcCommand::ListPeers;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"list_peers\""));
+
+        // RemovePeer
+        let cmd = IpcCommand::RemovePeer {
+            tag: "peer-1".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"remove_peer\""));
+    }
+
+    #[test]
+    fn test_chain_commands_serialization() {
+        // ActivateChain
+        let cmd = IpcCommand::ActivateChain {
+            tag: "chain-1".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"activate_chain\""));
+
+        // DeactivateChain
+        let cmd = IpcCommand::DeactivateChain {
+            tag: "chain-1".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"deactivate_chain\""));
+
+        // GetChainStatus
+        let cmd = IpcCommand::GetChainStatus {
+            tag: "chain-1".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_chain_status\""));
+
+        // ListChains
+        let cmd = IpcCommand::ListChains;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"list_chains\""));
+
+        // GetChainRole
+        let cmd = IpcCommand::GetChainRole {
+            chain_tag: "chain-1".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_chain_role\""));
+
+        // UpdateChain
+        let cmd = IpcCommand::UpdateChain {
+            tag: "chain-1".into(),
+            hops: None,
+            exit_egress: Some("pia-uk".into()),
+            description: Some("Updated".into()),
+            allow_transitive: Some(true),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"update_chain\""));
+        assert!(json.contains("\"exit_egress\":\"pia-uk\""));
+        assert!(json.contains("\"allow_transitive\":true"));
+        // Skip serializing None fields
+        assert!(!json.contains("\"hops\""));
+
+        // UpdateChain with hops
+        let cmd = IpcCommand::UpdateChain {
+            tag: "chain-2".into(),
+            hops: Some(vec![ChainHop {
+                node_tag: "terminal".into(),
+                tunnel_type: TunnelType::WireGuard,
+                role: ChainRole::Terminal,
+            }]),
+            exit_egress: None,
+            description: None,
+            allow_transitive: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"update_chain\""));
+        assert!(json.contains("\"hops\":"));
+        assert!(json.contains("\"node_tag\":\"terminal\""));
+    }
+
+    #[test]
+    fn test_update_ecmp_group_members_serialization() {
+        let cmd = IpcCommand::UpdateEcmpGroupMembers {
+            tag: "group-1".into(),
+            members: vec![
+                EcmpMemberConfig {
+                    outbound: "proxy-1".into(),
+                    weight: 2,
+                    enabled: true,
+                },
+                EcmpMemberConfig {
+                    outbound: "proxy-2".into(),
+                    weight: 3,
+                    enabled: true,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"update_ecmp_group_members\""));
+        assert!(json.contains("\"tag\":\"group-1\""));
+        assert!(json.contains("\"outbound\":\"proxy-1\""));
+        assert!(json.contains("\"weight\":2"));
+    }
+
+    #[test]
+    fn test_two_phase_commit_commands_serialization() {
+        // CommitChainRoute
+        let cmd = IpcCommand::CommitChainRoute {
+            chain_tag: "chain-1".into(),
+            source_node: "entry".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"commit_chain_route\""));
+        assert!(json.contains("\"source_node\":\"entry\""));
+
+        // AbortChainRoute
+        let cmd = IpcCommand::AbortChainRoute {
+            chain_tag: "chain-1".into(),
+            source_node: "entry".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"abort_chain_route\""));
+    }
+
+    #[test]
+    fn test_pairing_response_serialization() {
+        let resp = PairingResponse {
+            success: true,
+            code: Some("YmFzZTY0Y29kZQ==".into()),
+            message: Some("Pairing code generated".into()),
+            peer_tag: None,
+            wg_local_private_key: None,
+            tunnel_local_ip: None,
+            tunnel_port: None,
+        };
+        let ipc_resp = IpcResponse::Pairing(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"pairing\""));
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"code\":\"YmFzZTY0Y29kZQ==\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::Pairing(p) = parsed {
+            assert!(p.success);
+            assert_eq!(p.code, Some("YmFzZTY0Y29kZQ==".into()));
+        } else {
+            panic!("Expected Pairing response");
+        }
+    }
+
+    #[test]
+    fn test_chain_role_response_serialization() {
+        let resp = ChainRoleResponse {
+            chain_tag: "chain-1".into(),
+            role: Some(ChainRole::Entry),
+            in_chain: true,
+        };
+        let ipc_resp = IpcResponse::ChainRole(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"chain_role\""));
+        assert!(json.contains("\"role\":\"entry\""));
+        assert!(json.contains("\"in_chain\":true"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::ChainRole(r) = parsed {
+            assert_eq!(r.role, Some(ChainRole::Entry));
+            assert!(r.in_chain);
+        } else {
+            panic!("Expected ChainRole response");
+        }
+    }
+
+    #[test]
+    fn test_prepare_response_serialization() {
+        let resp = PrepareResponse {
+            success: true,
+            message: None,
+            node: "relay-node".into(),
+        };
+        let ipc_resp = IpcResponse::PrepareResult(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"prepare_result\""));
+        assert!(json.contains("\"node\":\"relay-node\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::PrepareResult(p) = parsed {
+            assert!(p.success);
+            assert_eq!(p.node, "relay-node");
+        } else {
+            panic!("Expected PrepareResult response");
+        }
+    }
+
+    // =========================================================================
+    // DNS IPC Protocol Tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_dns_stats_command_serialization() {
+        let cmd = IpcCommand::GetDnsStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetDnsStats));
+    }
+
+    #[test]
+    fn test_get_dns_cache_stats_command_serialization() {
+        let cmd = IpcCommand::GetDnsCacheStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_cache_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetDnsCacheStats));
+    }
+
+    #[test]
+    fn test_flush_dns_cache_command_serialization() {
+        // Without pattern
+        let cmd = IpcCommand::FlushDnsCache { pattern: None };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"flush_dns_cache\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::FlushDnsCache { pattern } = parsed {
+            assert!(pattern.is_none());
+        } else {
+            panic!("Expected FlushDnsCache command");
+        }
+
+        // With pattern
+        let cmd = IpcCommand::FlushDnsCache {
+            pattern: Some("*.google.com".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"pattern\":\"*.google.com\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::FlushDnsCache { pattern } = parsed {
+            assert_eq!(pattern, Some("*.google.com".into()));
+        } else {
+            panic!("Expected FlushDnsCache command");
+        }
+    }
+
+    #[test]
+    fn test_get_dns_block_stats_command_serialization() {
+        let cmd = IpcCommand::GetDnsBlockStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_block_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetDnsBlockStats));
+    }
+
+    #[test]
+    fn test_reload_dns_blocklist_command_serialization() {
+        let cmd = IpcCommand::ReloadDnsBlocklist;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"reload_dns_blocklist\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::ReloadDnsBlocklist));
+    }
+
+    #[test]
+    fn test_add_dns_upstream_command_serialization() {
+        let config = DnsUpstreamConfig {
+            address: "8.8.8.8:53".into(),
+            protocol: "udp".into(),
+            bootstrap: vec![],
+            timeout_secs: Some(5),
+        };
+        let cmd = IpcCommand::AddDnsUpstream {
+            tag: "google".into(),
+            config,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"add_dns_upstream\""));
+        assert!(json.contains("\"tag\":\"google\""));
+        assert!(json.contains("\"address\":\"8.8.8.8:53\""));
+        assert!(json.contains("\"protocol\":\"udp\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::AddDnsUpstream { tag, config } = parsed {
+            assert_eq!(tag, "google");
+            assert_eq!(config.address, "8.8.8.8:53");
+            assert_eq!(config.protocol, "udp");
+            assert_eq!(config.timeout_secs, Some(5));
+        } else {
+            panic!("Expected AddDnsUpstream command");
+        }
+    }
+
+    #[test]
+    fn test_remove_dns_upstream_command_serialization() {
+        let cmd = IpcCommand::RemoveDnsUpstream {
+            tag: "google".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"remove_dns_upstream\""));
+        assert!(json.contains("\"tag\":\"google\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::RemoveDnsUpstream { tag } = parsed {
+            assert_eq!(tag, "google");
+        } else {
+            panic!("Expected RemoveDnsUpstream command");
+        }
+    }
+
+    #[test]
+    fn test_get_dns_upstream_status_command_serialization() {
+        // All upstreams
+        let cmd = IpcCommand::GetDnsUpstreamStatus { tag: None };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_upstream_status\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::GetDnsUpstreamStatus { tag } = parsed {
+            assert!(tag.is_none());
+        } else {
+            panic!("Expected GetDnsUpstreamStatus command");
+        }
+
+        // Specific upstream
+        let cmd = IpcCommand::GetDnsUpstreamStatus {
+            tag: Some("google".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"tag\":\"google\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::GetDnsUpstreamStatus { tag } = parsed {
+            assert_eq!(tag, Some("google".into()));
+        } else {
+            panic!("Expected GetDnsUpstreamStatus command");
+        }
+    }
+
+    #[test]
+    fn test_add_dns_route_command_serialization() {
+        let cmd = IpcCommand::AddDnsRoute {
+            pattern: "google.com".into(),
+            match_type: "suffix".into(),
+            upstream_tag: "google".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"add_dns_route\""));
+        assert!(json.contains("\"pattern\":\"google.com\""));
+        assert!(json.contains("\"match_type\":\"suffix\""));
+        assert!(json.contains("\"upstream_tag\":\"google\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::AddDnsRoute {
+            pattern,
+            match_type,
+            upstream_tag,
+        } = parsed
+        {
+            assert_eq!(pattern, "google.com");
+            assert_eq!(match_type, "suffix");
+            assert_eq!(upstream_tag, "google");
+        } else {
+            panic!("Expected AddDnsRoute command");
+        }
+    }
+
+    #[test]
+    fn test_remove_dns_route_command_serialization() {
+        let cmd = IpcCommand::RemoveDnsRoute {
+            pattern: "google.com".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"remove_dns_route\""));
+        assert!(json.contains("\"pattern\":\"google.com\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::RemoveDnsRoute { pattern } = parsed {
+            assert_eq!(pattern, "google.com");
+        } else {
+            panic!("Expected RemoveDnsRoute command");
+        }
+    }
+
+    #[test]
+    fn test_get_dns_query_log_command_serialization() {
+        let cmd = IpcCommand::GetDnsQueryLog {
+            limit: 50,
+            offset: 10,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_query_log\""));
+        assert!(json.contains("\"limit\":50"));
+        assert!(json.contains("\"offset\":10"));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::GetDnsQueryLog { limit, offset } = parsed {
+            assert_eq!(limit, 50);
+            assert_eq!(offset, 10);
+        } else {
+            panic!("Expected GetDnsQueryLog command");
+        }
+
+        // Test defaults
+        let json_default = r#"{"type":"get_dns_query_log"}"#;
+        let parsed: IpcCommand = serde_json::from_str(json_default).unwrap();
+        if let IpcCommand::GetDnsQueryLog { limit, offset } = parsed {
+            assert_eq!(limit, 100); // default
+            assert_eq!(offset, 0); // default
+        } else {
+            panic!("Expected GetDnsQueryLog command");
+        }
+    }
+
+    #[test]
+    fn test_dns_query_command_serialization() {
+        let cmd = IpcCommand::DnsQuery {
+            domain: "example.com".into(),
+            qtype: Some(1),
+            upstream: Some("google".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"dns_query\""));
+        assert!(json.contains("\"domain\":\"example.com\""));
+        assert!(json.contains("\"qtype\":1"));
+        assert!(json.contains("\"upstream\":\"google\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::DnsQuery {
+            domain,
+            qtype,
+            upstream,
+        } = parsed
+        {
+            assert_eq!(domain, "example.com");
+            assert_eq!(qtype, Some(1));
+            assert_eq!(upstream, Some("google".into()));
+        } else {
+            panic!("Expected DnsQuery command");
+        }
+
+        // With defaults
+        let cmd = IpcCommand::DnsQuery {
+            domain: "example.com".into(),
+            qtype: None,
+            upstream: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::DnsQuery {
+            domain,
+            qtype,
+            upstream,
+        } = parsed
+        {
+            assert_eq!(domain, "example.com");
+            assert!(qtype.is_none());
+            assert!(upstream.is_none());
+        } else {
+            panic!("Expected DnsQuery command");
+        }
+    }
+
+    #[test]
+    fn test_get_dns_config_command_serialization() {
+        let cmd = IpcCommand::GetDnsConfig;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_config\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetDnsConfig));
+    }
+
+    #[test]
+    fn test_dns_stats_response_serialization() {
+        let stats = DnsStatsResponse {
+            enabled: true,
+            uptime_secs: 3600,
+            total_queries: 10000,
+            cache_hits: 7000,
+            cache_misses: 3000,
+            blocked_queries: 500,
+            upstream_queries: 2500,
+            avg_latency_us: 1500,
+        };
+        let ipc_resp = IpcResponse::DnsStats(stats);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_stats\""));
+        assert!(json.contains("\"enabled\":true"));
+        assert!(json.contains("\"uptime_secs\":3600"));
+        assert!(json.contains("\"total_queries\":10000"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsStats(s) = parsed {
+            assert!(s.enabled);
+            assert_eq!(s.uptime_secs, 3600);
+            assert_eq!(s.cache_hits, 7000);
+        } else {
+            panic!("Expected DnsStats response");
+        }
+    }
+
+    #[test]
+    fn test_dns_cache_stats_response_serialization() {
+        let stats = DnsCacheStatsResponse {
+            enabled: true,
+            max_entries: 10000,
+            current_entries: 5000,
+            hits: 7000,
+            misses: 3000,
+            hit_rate: 0.7,
+            negative_hits: 100,
+            inserts: 8000,
+            evictions: 500,
+        };
+        let ipc_resp = IpcResponse::DnsCacheStats(stats);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_cache_stats\""));
+        assert!(json.contains("\"hit_rate\":0.7"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsCacheStats(s) = parsed {
+            assert_eq!(s.current_entries, 5000);
+            assert!((s.hit_rate - 0.7).abs() < 0.001);
+        } else {
+            panic!("Expected DnsCacheStats response");
+        }
+    }
+
+    #[test]
+    fn test_dns_block_stats_response_serialization() {
+        let stats = DnsBlockStatsResponse {
+            enabled: true,
+            rule_count: 50000,
+            blocked_queries: 500,
+            total_queries: 10000,
+            block_rate: 0.05,
+            last_reload: Some("2026-01-08T12:00:00Z".into()),
+        };
+        let ipc_resp = IpcResponse::DnsBlockStats(stats);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_block_stats\""));
+        assert!(json.contains("\"rule_count\":50000"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsBlockStats(s) = parsed {
+            assert_eq!(s.rule_count, 50000);
+            assert_eq!(s.blocked_queries, 500);
+        } else {
+            panic!("Expected DnsBlockStats response");
+        }
+    }
+
+    #[test]
+    fn test_dns_upstream_status_response_serialization() {
+        let status = DnsUpstreamStatusResponse {
+            upstreams: vec![
+                DnsUpstreamInfo {
+                    tag: "google".into(),
+                    address: "8.8.8.8:53".into(),
+                    protocol: "udp".into(),
+                    healthy: true,
+                    total_queries: 5000,
+                    failed_queries: 10,
+                    avg_latency_us: 1200,
+                    last_success: Some("2026-01-08T12:00:00Z".into()),
+                    last_failure: None,
+                },
+                DnsUpstreamInfo {
+                    tag: "cloudflare".into(),
+                    address: "1.1.1.1:53".into(),
+                    protocol: "doh".into(),
+                    healthy: false,
+                    total_queries: 100,
+                    failed_queries: 50,
+                    avg_latency_us: 5000,
+                    last_success: Some("2026-01-08T11:00:00Z".into()),
+                    last_failure: Some("2026-01-08T12:00:00Z".into()),
+                },
+            ],
+        };
+        let ipc_resp = IpcResponse::DnsUpstreamStatus(status);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_upstream_status\""));
+        assert!(json.contains("\"tag\":\"google\""));
+        assert!(json.contains("\"tag\":\"cloudflare\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsUpstreamStatus(s) = parsed {
+            assert_eq!(s.upstreams.len(), 2);
+            assert!(s.upstreams[0].healthy);
+            assert!(!s.upstreams[1].healthy);
+        } else {
+            panic!("Expected DnsUpstreamStatus response");
+        }
+    }
+
+    #[test]
+    fn test_dns_query_log_response_serialization() {
+        let log = DnsQueryLogResponse {
+            entries: vec![
+                DnsQueryLogEntry {
+                    timestamp: 1704700000000,
+                    domain: "example.com".into(),
+                    qtype: 1,
+                    qtype_str: "A".into(),
+                    upstream: "google".into(),
+                    response_code: 0,
+                    rcode_str: "NOERROR".into(),
+                    latency_us: 1500,
+                    blocked: false,
+                    cached: false,
+                },
+                DnsQueryLogEntry {
+                    timestamp: 1704700001000,
+                    domain: "blocked.ad.com".into(),
+                    qtype: 1,
+                    qtype_str: "A".into(),
+                    upstream: "".into(),
+                    response_code: 0,
+                    rcode_str: "NOERROR".into(),
+                    latency_us: 50,
+                    blocked: true,
+                    cached: false,
+                },
+            ],
+            total_available: 1000,
+            offset: 0,
+            limit: 100,
+        };
+        let ipc_resp = IpcResponse::DnsQueryLog(log);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_query_log\""));
+        assert!(json.contains("\"domain\":\"example.com\""));
+        assert!(json.contains("\"blocked\":true"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsQueryLog(l) = parsed {
+            assert_eq!(l.entries.len(), 2);
+            assert_eq!(l.total_available, 1000);
+            assert!(!l.entries[0].blocked);
+            assert!(l.entries[1].blocked);
+        } else {
+            panic!("Expected DnsQueryLog response");
+        }
+    }
+
+    #[test]
+    fn test_dns_query_response_serialization() {
+        let result = DnsQueryResponse {
+            success: true,
+            domain: "example.com".into(),
+            qtype: 1,
+            response_code: 0,
+            answers: vec!["93.184.216.34".into()],
+            latency_us: 1500,
+            cached: false,
+            blocked: false,
+            upstream_used: Some("google".into()),
+        };
+        let ipc_resp = IpcResponse::DnsQueryResult(result);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_query_result\""));
+        assert!(json.contains("\"domain\":\"example.com\""));
+        assert!(json.contains("93.184.216.34"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsQueryResult(r) = parsed {
+            assert!(r.success);
+            assert_eq!(r.domain, "example.com");
+            assert_eq!(r.answers.len(), 1);
+            assert_eq!(r.upstream_used, Some("google".into()));
+        } else {
+            panic!("Expected DnsQueryResult response");
+        }
+    }
+
+    #[test]
+    fn test_dns_config_response_serialization() {
+        let config = DnsConfigResponse {
+            enabled: true,
+            listen_udp: "127.0.0.1:7853".into(),
+            listen_tcp: "127.0.0.1:7853".into(),
+            upstreams: vec![DnsUpstreamInfo {
+                tag: "default".into(),
+                address: "8.8.8.8:53".into(),
+                protocol: "udp".into(),
+                healthy: true,
+                total_queries: 0,
+                failed_queries: 0,
+                avg_latency_us: 0,
+                last_success: None,
+                last_failure: None,
+            }],
+            cache_enabled: true,
+            cache_max_entries: 10000,
+            blocking_enabled: true,
+            blocking_response_type: "zero_ip".into(),
+            logging_enabled: true,
+            logging_format: "json".into(),
+            available_features: std::collections::HashMap::new(),
+        };
+        let ipc_resp = IpcResponse::DnsConfig(config);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_config\""));
+        assert!(json.contains("\"listen_udp\":\"127.0.0.1:7853\""));
+        assert!(json.contains("\"blocking_response_type\":\"zero_ip\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsConfig(c) = parsed {
+            assert!(c.enabled);
+            assert!(c.cache_enabled);
+            assert!(c.blocking_enabled);
+            assert_eq!(c.blocking_response_type, "zero_ip");
+        } else {
+            panic!("Expected DnsConfig response");
+        }
+    }
+
+    #[test]
+    fn test_dns_upstream_config_serialization() {
+        // Full config
+        let config = DnsUpstreamConfig {
+            address: "https://dns.google/dns-query".into(),
+            protocol: "doh".into(),
+            bootstrap: vec!["8.8.8.8:53".into(), "8.8.4.4:53".into()],
+            timeout_secs: Some(10),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"address\":\"https://dns.google/dns-query\""));
+        assert!(json.contains("\"protocol\":\"doh\""));
+        assert!(json.contains("8.8.8.8:53"));
+        assert!(json.contains("\"timeout_secs\":10"));
+
+        let parsed: DnsUpstreamConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.address, "https://dns.google/dns-query");
+        assert_eq!(parsed.protocol, "doh");
+        assert_eq!(parsed.bootstrap.len(), 2);
+        assert_eq!(parsed.timeout_secs, Some(10));
+
+        // Minimal config (defaults)
+        let json_minimal = r#"{"address":"1.1.1.1:53","protocol":"udp"}"#;
+        let parsed: DnsUpstreamConfig = serde_json::from_str(json_minimal).unwrap();
+        assert_eq!(parsed.address, "1.1.1.1:53");
+        assert_eq!(parsed.protocol, "udp");
+        assert!(parsed.bootstrap.is_empty());
+        assert!(parsed.timeout_secs.is_none());
+    }
+
+    // =========================================================================
+    // VLESS Protocol Serialization Tests (v3.3)
+    // =========================================================================
+
+    #[test]
+    fn test_add_vless_outbound_command_serialization() {
+        // Full config
+        let cmd = IpcCommand::AddVlessOutbound {
+            tag: "vless-jp".into(),
+            server_address: "jp.example.com".into(),
+            server_port: 443,
+            uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+            flow: "xtls-rprx-vision".into(),
+            transport: "websocket_tls".into(),
+            tls_server_name: Some("jp.example.com".into()),
+            tls_skip_verify: false,
+            ws_path: Some("/ws".into()),
+            ws_host: Some("jp.example.com".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"add_vless_outbound\""));
+        assert!(json.contains("\"tag\":\"vless-jp\""));
+        assert!(json.contains("\"server_address\":\"jp.example.com\""));
+        assert!(json.contains("\"server_port\":443"));
+        assert!(json.contains("\"uuid\":\"550e8400-e29b-41d4-a716-446655440000\""));
+        assert!(json.contains("\"flow\":\"xtls-rprx-vision\""));
+        assert!(json.contains("\"transport\":\"websocket_tls\""));
+        assert!(json.contains("\"ws_path\":\"/ws\""));
+
+        // Deserialize back
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::AddVlessOutbound {
+                tag,
+                server_address,
+                server_port,
+                uuid,
+                flow,
+                transport,
+                ..
+            } => {
+                assert_eq!(tag, "vless-jp");
+                assert_eq!(server_address, "jp.example.com");
+                assert_eq!(server_port, 443);
+                assert_eq!(uuid, "550e8400-e29b-41d4-a716-446655440000");
+                assert_eq!(flow, "xtls-rprx-vision");
+                assert_eq!(transport, "websocket_tls");
+            }
+            _ => panic!("Expected AddVlessOutbound command"),
+        }
+    }
+
+    #[test]
+    fn test_add_vless_outbound_minimal_config() {
+        // Minimal config with defaults
+        let json = r#"{"type":"add_vless_outbound","tag":"vless-test","server_address":"test.com","server_port":443,"uuid":"test-uuid"}"#;
+        let parsed: IpcCommand = serde_json::from_str(json).unwrap();
+        match parsed {
+            IpcCommand::AddVlessOutbound {
+                tag,
+                transport,
+                flow,
+                tls_skip_verify,
+                ..
+            } => {
+                assert_eq!(tag, "vless-test");
+                assert_eq!(transport, "tcp"); // default
+                assert_eq!(flow, ""); // default empty
+                assert!(!tls_skip_verify); // default false
+            }
+            _ => panic!("Expected AddVlessOutbound command"),
+        }
+    }
+
+    #[test]
+    fn test_remove_vless_outbound_command_serialization() {
+        let cmd = IpcCommand::RemoveVlessOutbound {
+            tag: "vless-jp".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"remove_vless_outbound\""));
+        assert!(json.contains("\"tag\":\"vless-jp\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::RemoveVlessOutbound { tag } => {
+                assert_eq!(tag, "vless-jp");
+            }
+            _ => panic!("Expected RemoveVlessOutbound command"),
+        }
+    }
+
+    #[test]
+    fn test_list_vless_outbounds_command_serialization() {
+        let cmd = IpcCommand::ListVlessOutbounds;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"list_vless_outbounds\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::ListVlessOutbounds));
+    }
+
+    #[test]
+    fn test_configure_vless_inbound_command_serialization() {
+        let cmd = IpcCommand::ConfigureVlessInbound {
+            listen: "0.0.0.0:443".into(),
+            users: vec![
+                VlessUserConfig {
+                    uuid: "uuid-1".into(),
+                    email: Some("user1@example.com".into()),
+                    flow: Some("xtls-rprx-vision".into()),
+                },
+                VlessUserConfig {
+                    uuid: "uuid-2".into(),
+                    email: None,
+                    flow: None,
+                },
+            ],
+            tls_cert_path: Some("/etc/ssl/cert.pem".into()),
+            tls_key_path: Some("/etc/ssl/key.pem".into()),
+            fallback: Some("127.0.0.1:80".into()),
+            udp_enabled: true,
+            reality_private_key: None,
+            reality_short_ids: None,
+            reality_dest: None,
+            reality_server_names: None,
+            reality_max_time_diff_ms: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"configure_vless_inbound\""));
+        assert!(json.contains("\"listen\":\"0.0.0.0:443\""));
+        assert!(json.contains("\"uuid\":\"uuid-1\""));
+        assert!(json.contains("\"email\":\"user1@example.com\""));
+        assert!(json.contains("\"flow\":\"xtls-rprx-vision\""));
+        assert!(json.contains("\"fallback\":\"127.0.0.1:80\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::ConfigureVlessInbound {
+                listen,
+                users,
+                tls_cert_path,
+                fallback,
+                ..
+            } => {
+                assert_eq!(listen, "0.0.0.0:443");
+                assert_eq!(users.len(), 2);
+                assert_eq!(users[0].uuid, "uuid-1");
+                assert_eq!(users[0].email, Some("user1@example.com".into()));
+                assert!(tls_cert_path.is_some());
+                assert_eq!(fallback, Some("127.0.0.1:80".into()));
+            }
+            _ => panic!("Expected ConfigureVlessInbound command"),
+        }
+    }
+
+    #[test]
+    fn test_configure_vless_inbound_with_reality() {
+        let cmd = IpcCommand::ConfigureVlessInbound {
+            listen: "0.0.0.0:443".into(),
+            users: vec![VlessUserConfig {
+                uuid: "uuid-1".into(),
+                email: Some("user1@example.com".into()),
+                flow: Some("xtls-rprx-vision".into()),
+            }],
+            tls_cert_path: None,
+            tls_key_path: None,
+            fallback: None,
+            udp_enabled: true,
+            reality_private_key: Some("QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=".into()),
+            reality_short_ids: Some(vec!["1234567890abcdef".into()]),
+            reality_dest: Some("www.google.com:443".into()),
+            reality_server_names: Some(vec!["www.google.com".into()]),
+            reality_max_time_diff_ms: Some(120_000),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"reality_private_key\""));
+        assert!(json.contains("\"reality_short_ids\""));
+        assert!(json.contains("\"reality_dest\""));
+        assert!(json.contains("\"www.google.com\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::ConfigureVlessInbound {
+                reality_private_key,
+                reality_short_ids,
+                reality_dest,
+                ..
+            } => {
+                assert!(reality_private_key.is_some());
+                assert!(reality_short_ids.is_some());
+                assert_eq!(reality_dest, Some("www.google.com:443".into()));
+            }
+            _ => panic!("Expected ConfigureVlessInbound command"),
+        }
+    }
+
+    #[test]
+    fn test_add_vless_user_command_serialization() {
+        let cmd = IpcCommand::AddVlessUser {
+            uuid: "test-uuid".into(),
+            email: Some("test@example.com".into()),
+            flow: Some("xtls-rprx-vision".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"add_vless_user\""));
+        assert!(json.contains("\"uuid\":\"test-uuid\""));
+        assert!(json.contains("\"email\":\"test@example.com\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::AddVlessUser { uuid, email, flow } => {
+                assert_eq!(uuid, "test-uuid");
+                assert_eq!(email, Some("test@example.com".into()));
+                assert_eq!(flow, Some("xtls-rprx-vision".into()));
+            }
+            _ => panic!("Expected AddVlessUser command"),
+        }
+    }
+
+    #[test]
+    fn test_vless_outbound_info_response_serialization() {
+        let info = VlessOutboundInfoResponse {
+            tag: "vless-jp".into(),
+            server_address: "jp.example.com".into(),
+            server_port: 443,
+            uuid: "550e****0000".into(), // Masked
+            flow: "xtls-rprx-vision".into(),
+            transport: "websocket_tls".into(),
+            enabled: true,
+            health_status: "healthy".into(),
+            active_connections: 5,
+        };
+        let resp = IpcResponse::VlessOutboundInfo(info);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"vless_outbound_info\""));
+        assert!(json.contains("\"tag\":\"vless-jp\""));
+        assert!(json.contains("\"server_address\":\"jp.example.com\""));
+        assert!(json.contains("\"health_status\":\"healthy\""));
+        assert!(json.contains("\"active_connections\":5"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessOutboundInfo(info) = parsed {
+            assert_eq!(info.tag, "vless-jp");
+            assert!(info.enabled);
+            assert_eq!(info.active_connections, 5);
+        } else {
+            panic!("Expected VlessOutboundInfo response");
+        }
+    }
+
+    #[test]
+    fn test_vless_outbound_list_response_serialization() {
+        let outbounds = vec![
+            VlessOutboundInfoResponse {
+                tag: "vless-jp".into(),
+                server_address: "jp.example.com".into(),
+                server_port: 443,
+                uuid: "uuid1".into(),
+                flow: "".into(),
+                transport: "tcp".into(),
+                enabled: true,
+                health_status: "healthy".into(),
+                active_connections: 2,
+            },
+            VlessOutboundInfoResponse {
+                tag: "vless-us".into(),
+                server_address: "us.example.com".into(),
+                server_port: 443,
+                uuid: "uuid2".into(),
+                flow: "".into(),
+                transport: "tls".into(),
+                enabled: false,
+                health_status: "unhealthy".into(),
+                active_connections: 0,
+            },
+        ];
+        let resp = IpcResponse::VlessOutboundList { outbounds };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"vless_outbound_list\""));
+        assert!(json.contains("\"tag\":\"vless-jp\""));
+        assert!(json.contains("\"tag\":\"vless-us\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessOutboundList { outbounds } = parsed {
+            assert_eq!(outbounds.len(), 2);
+            assert_eq!(outbounds[0].tag, "vless-jp");
+            assert_eq!(outbounds[1].tag, "vless-us");
+        } else {
+            panic!("Expected VlessOutboundList response");
+        }
+    }
+
+    #[test]
+    fn test_vless_inbound_status_response_serialization() {
+        let status = VlessInboundStatusResponse {
+            running: true,
+            listen_address: Some("0.0.0.0:443".into()),
+            user_count: 10,
+            tls_enabled: true,
+            reality_enabled: false,
+            udp_enabled: true,
+            total_connections: 1000,
+            active_connections: 25,
+            reality_stats: None,
+            bridge_stats: Some(VlessWgBridgeStats {
+                active_sessions: 5,
+                sessions_registered: 100,
+                sessions_unregistered: 95,
+                packets_routed: 5000,
+                packets_dropped: 10,
+                channel_full: 2,
+            }),
+        };
+        let resp = IpcResponse::VlessInboundStatus(status);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"vless_inbound_status\""));
+        assert!(json.contains("\"running\":true"));
+        assert!(json.contains("\"user_count\":10"));
+        assert!(json.contains("\"tls_enabled\":true"));
+        assert!(json.contains("\"active_connections\":25"));
+        assert!(json.contains("\"bridge_stats\""));
+        assert!(json.contains("\"active_sessions\":5"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessInboundStatus(s) = parsed {
+            assert!(s.running);
+            assert_eq!(s.user_count, 10);
+            assert!(s.tls_enabled);
+            assert!(!s.reality_enabled);
+            assert!(s.bridge_stats.is_some());
+            let bs = s.bridge_stats.unwrap();
+            assert_eq!(bs.active_sessions, 5);
+            assert_eq!(bs.packets_routed, 5000);
+        } else {
+            panic!("Expected VlessInboundStatus response");
+        }
+    }
+
+    #[test]
+    fn test_vless_inbound_status_with_reality() {
+        let status = VlessInboundStatusResponse {
+            running: true,
+            listen_address: Some("0.0.0.0:443".into()),
+            user_count: 5,
+            tls_enabled: false,
+            reality_enabled: true,
+            udp_enabled: true,
+            total_connections: 500,
+            active_connections: 10,
+            reality_stats: Some(RealityInboundStats {
+                auth_attempts: 100,
+                auth_success: 90,
+                auth_failures: 10,
+                fallback_active: 2,
+                fallback_bytes: 1024,
+                fallback_dest: "www.google.com:443".into(),
+                server_names: vec!["www.google.com".into()],
+            }),
+            bridge_stats: None,
+        };
+        let resp = IpcResponse::VlessInboundStatus(status);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"reality_enabled\":true"));
+        assert!(json.contains("\"reality_stats\""));
+        assert!(json.contains("\"auth_attempts\":100"));
+        assert!(json.contains("\"fallback_dest\":\"www.google.com:443\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessInboundStatus(s) = parsed {
+            assert!(s.reality_enabled);
+            assert!(!s.tls_enabled);
+            assert!(s.reality_stats.is_some());
+            let rs = s.reality_stats.unwrap();
+            assert_eq!(rs.auth_success, 90);
+            assert_eq!(rs.auth_failures, 10);
+        } else {
+            panic!("Expected VlessInboundStatus response");
+        }
+    }
+
+    #[test]
+    fn test_vless_inbound_status_without_bridge_stats() {
+        let status = VlessInboundStatusResponse {
+            running: false,
+            listen_address: None,
+            user_count: 0,
+            tls_enabled: false,
+            reality_enabled: false,
+            udp_enabled: false,
+            total_connections: 0,
+            active_connections: 0,
+            reality_stats: None,
+            bridge_stats: None,
+        };
+        let resp = IpcResponse::VlessInboundStatus(status);
+        let json = serde_json::to_string(&resp).unwrap();
+        // bridge_stats should be omitted when None (skip_serializing_if)
+        assert!(!json.contains("\"bridge_stats\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessInboundStatus(s) = parsed {
+            assert!(!s.running);
+            assert!(s.bridge_stats.is_none());
+        } else {
+            panic!("Expected VlessInboundStatus response");
+        }
+    }
+
+    #[test]
+    fn test_vless_user_list_response_serialization() {
+        let users = vec![
+            VlessUserInfo {
+                uuid: "uuid-1".into(),
+                email: Some("user1@example.com".into()),
+                flow: Some("xtls-rprx-vision".into()),
+            },
+            VlessUserInfo {
+                uuid: "uuid-2".into(),
+                email: None,
+                flow: None,
+            },
+        ];
+        let resp = IpcResponse::VlessUserList { users };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"vless_user_list\""));
+        assert!(json.contains("\"uuid\":\"uuid-1\""));
+        assert!(json.contains("\"email\":\"user1@example.com\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessUserList { users } = parsed {
+            assert_eq!(users.len(), 2);
+            assert_eq!(users[0].uuid, "uuid-1");
+            assert_eq!(users[0].email, Some("user1@example.com".into()));
+            assert!(users[1].email.is_none());
+        } else {
+            panic!("Expected VlessUserList response");
+        }
+    }
+
+    #[test]
+    fn test_vless_user_config_serialization() {
+        // Full config
+        let config = VlessUserConfig {
+            uuid: "test-uuid".into(),
+            email: Some("test@example.com".into()),
+            flow: Some("xtls-rprx-vision".into()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"uuid\":\"test-uuid\""));
+        assert!(json.contains("\"email\":\"test@example.com\""));
+        assert!(json.contains("\"flow\":\"xtls-rprx-vision\""));
+
+        // Minimal config with defaults
+        let json_minimal = r#"{"uuid":"minimal-uuid"}"#;
+        let parsed: VlessUserConfig = serde_json::from_str(json_minimal).unwrap();
+        assert_eq!(parsed.uuid, "minimal-uuid");
+        assert!(parsed.email.is_none());
+        assert!(parsed.flow.is_none());
+    }
+
+    #[test]
+    fn test_wg_sni_routing_command_serialization() {
+        // SetWgSniRouting command
+        let cmd = IpcCommand::SetWgSniRouting {
+            tunnel_tag: "wg-pia-nyc".to_string(),
+            enabled: true,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"set_wg_sni_routing\""));
+        assert!(json.contains("\"tunnel_tag\":\"wg-pia-nyc\""));
+        assert!(json.contains("\"enabled\":true"));
+
+        // Parse back
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::SetWgSniRouting {
+            tunnel_tag,
+            enabled,
+        } = parsed
+        {
+            assert_eq!(tunnel_tag, "wg-pia-nyc");
+            assert!(enabled);
+        } else {
+            panic!("Expected SetWgSniRouting command");
+        }
+
+        // GetWgSniRoutingConfig command
+        let cmd = IpcCommand::GetWgSniRoutingConfig;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_wg_sni_routing_config\""));
+
+        // SetGlobalWgSniRouting command
+        let cmd = IpcCommand::SetGlobalWgSniRouting { enabled: false };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"set_global_wg_sni_routing\""));
+        assert!(json.contains("\"enabled\":false"));
+    }
+
+    #[test]
+    fn test_wg_sni_routing_response_serialization() {
+        // WgSniRoutingUpdated response
+        let resp = IpcResponse::WgSniRoutingUpdated(WgSniRoutingUpdatedResponse {
+            tunnel_tag: "wg-custom-uk".to_string(),
+            enabled: true,
+            success: true,
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"wg_sni_routing_updated\""));
+        assert!(json.contains("\"tunnel_tag\":\"wg-custom-uk\""));
+        assert!(json.contains("\"enabled\":true"));
+        assert!(json.contains("\"success\":true"));
+
+        // WgSniRoutingConfig response
+        let resp = IpcResponse::WgSniRoutingConfig(WgSniRoutingConfigResponse {
+            global_enabled: true,
+            enabled_tunnels: vec!["wg-pia-nyc".to_string(), "wg-custom-uk".to_string()],
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"wg_sni_routing_config\""));
+        assert!(json.contains("\"global_enabled\":true"));
+        assert!(json.contains("\"wg-pia-nyc\""));
+        assert!(json.contains("\"wg-custom-uk\""));
+
+        // GlobalWgSniRoutingUpdated response
+        let resp = IpcResponse::GlobalWgSniRoutingUpdated(GlobalWgSniRoutingUpdatedResponse {
+            enabled: false,
+            success: true,
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"global_wg_sni_routing_updated\""));
+        assert!(json.contains("\"enabled\":false"));
+        assert!(json.contains("\"success\":true"));
+    }
+}

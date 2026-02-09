@@ -17,7 +17,8 @@ import {
   Cog6ToothIcon,
   KeyIcon,
   BoltIcon,
-  SignalIcon
+  SignalIcon,
+  ExclamationTriangleIcon
 } from "@heroicons/react/24/outline";
 
 export default function V2RayIngressManager() {
@@ -578,6 +579,29 @@ export default function V2RayIngressManager() {
                 )}
                 {t("v2rayIngress.restart")}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* VMess/Trojan Deprecation Warning Banner */}
+      {v2rayConfig?.enabled === 1 && (v2rayConfig.protocol === "vmess" || v2rayConfig.protocol === "trojan") && (
+        <div
+          className="rounded-xl bg-amber-500/10 border border-amber-500/20 p-4"
+          role="alert"
+          aria-live="polite"
+        >
+          <div className="flex items-start gap-3">
+            <div className="p-2 rounded-lg bg-amber-500/20 flex-shrink-0" aria-hidden="true">
+              <ExclamationTriangleIcon className="h-5 w-5 text-amber-400" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-amber-300 font-medium text-sm">
+                {t("v2rayIngress.deprecationWarning")}
+              </p>
+              <p className="text-amber-400/70 text-xs mt-1">
+                {t("v2rayIngress.deprecationMigrationDoc")}
+              </p>
             </div>
           </div>
         </div>

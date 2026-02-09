@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """链路路由管理器
 
+.. deprecated::
+    此模块已弃用。rust-router 现在在用户空间处理链路路由，无需内核 iptables 规则。
+
+    - 链路路由映射存储在数据库的 chain_routing 表中
+    - rust-router 的 ChainManager 在用户空间执行 DSCP 到出口的路由
+    - 参见 rust-router/src/ingress/processor.rs
+
+    保留此文件仅用于向后兼容和参考。所有 add_route/remove_route 函数的内核
+    iptables 部分已移除，仅保留数据库操作。
+
+原始功能说明（内核 iptables 部分已废弃）：
 在终端节点管理 DSCP/email 到本地出口的路由映射。
 
 当远程入口节点激活链路时，通过隧道 API 注册路由映射到本终端节点。
 此模块读取 chain_routing 表，应用 iptables 和策略路由规则。
 
-使用示例：
+使用示例（内核部分已废弃）：
     manager = ChainRouteManager(db)
 
     # 从数据库同步所有路由规则
@@ -123,7 +134,7 @@ class ChainRouteManager:
         profiles = self.db.get_pia_profiles(enabled_only=True)
         for p in profiles:
             if p["name"] == egress_tag:
-                # 使用与 setup_kernel_wg_egress.py 相同的命名逻辑
+                # 使用 db_helper 的统一命名逻辑
                 from db_helper import get_egress_interface_name
                 return get_egress_interface_name(egress_tag, is_pia=True)
 
@@ -134,13 +145,12 @@ class ChainRouteManager:
                 from db_helper import get_egress_interface_name
                 return get_egress_interface_name(egress_tag, is_pia=False)
 
-        # 检查 WARP WireGuard
+        # WARP egress (WireGuard only)
         warp_list = self.db.get_warp_egress_list(enabled_only=True)
         for e in warp_list:
-            if e["tag"] == egress_tag and e.get("protocol") == "wireguard":
-                # Phase 11-Fix.I: 使用统一的接口命名函数，确保与 setup_kernel_wg_egress.py 一致
-                from setup_kernel_wg_egress import get_egress_interface_name as get_wg_egress_iface
-                return get_wg_egress_iface(egress_tag, egress_type="warp")
+            if e["tag"] == egress_tag:
+                from db_helper import get_egress_interface_name
+                return get_egress_interface_name(egress_tag, egress_type="warp")
 
         # 检查 OpenVPN（有 tun 设备）
         openvpn_list = self.db.get_openvpn_egress_list(enabled_only=True)
@@ -153,6 +163,25 @@ class ChainRouteManager:
         for e in direct_list:
             if e["tag"] == egress_tag:
                 return e.get("bind_interface")
+
+        # 检查 Outbound Groups（负载均衡/故障转移）
+        # 对于组，获取第一个成员的接口
+        group = self.db.get_outbound_group(egress_tag) if hasattr(self.db, 'get_outbound_group') else None
+        if group and group.get("members"):
+            members = group.get("members", [])
+            if isinstance(members, str):
+                import json
+                try:
+                    members = json.loads(members)
+                except json.JSONDecodeError:
+                    members = []
+            if members:
+                # 递归获取第一个成员的接口
+                first_member = members[0]
+                self._logger.info(
+                    f"Outbound group '{egress_tag}' -> using first member '{first_member}'"
+                )
+                return self._get_egress_interface(first_member)
 
         # V2Ray 和 WARP MASQUE 使用 SOCKS，不适用于 DSCP 路由
         self._logger.warning(f"Cannot determine interface for egress: {egress_tag}")
@@ -192,7 +221,7 @@ class ChainRouteManager:
                 self._logger.error(f"Cannot find interface for egress: {egress_tag}")
                 return False
 
-            # Phase 3: 验证接口在系统中实际存在
+            # 验证接口在系统中实际存在
             if not self._interface_exists(interface):
                 self._logger.error(f"Interface '{interface}' does not exist in system")
                 return False

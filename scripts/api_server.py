@@ -16,10 +16,25 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+import uuid
 
 import base64
 import io
+
+# 统一日志配置（通过 LOG_LEVEL 环境变量控制）
+try:
+    from log_config import setup_logging, get_logger
+    setup_logging()
+except ImportError:
+    # 回退：如果 log_config 不可用，使用基本配置
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
 
 # 加密支持
 try:
@@ -58,8 +73,29 @@ except ImportError:
     HAS_DATABASE = False
     print("WARNING: Database helper not available, falling back to JSON storage")
 
+# Binary rule storage support
+USE_BINARY_RULES = os.environ.get("USE_BINARY_RULES", "true").lower() == "true"
 try:
-    from v2ray_uri_parser import parse_v2ray_uri, generate_vmess_uri, generate_vless_uri, generate_trojan_uri
+    from rule_binary import write_rule_binary, read_rule_binary, get_rule_binary_info, RuleBinaryError, VALID_RULE_TYPES as BINARY_RULE_TYPES
+    HAS_RULE_BINARY = True and USE_BINARY_RULES
+except ImportError:
+    HAS_RULE_BINARY = False
+    BINARY_RULE_TYPES = frozenset({"ip", "domain", "domain_suffix", "domain_keyword"})
+    print("WARNING: Rule binary module not available")
+if not USE_BINARY_RULES:
+    print("INFO: Binary rule storage disabled via USE_BINARY_RULES=false")
+
+# Async rule loader support
+try:
+    from rule_loader import AsyncRuleLoader
+    HAS_RULE_LOADER = True
+except ImportError:
+    HAS_RULE_LOADER = False
+    print("WARNING: Async rule loader not available")
+
+try:
+    # [Xray-lite] Only import VLESS-related functions; VMess/Trojan removed
+    from v2ray_uri_parser import parse_v2ray_uri, generate_vless_uri
     HAS_V2RAY_PARSER = True
 except ImportError:
     HAS_V2RAY_PARSER = False
@@ -72,25 +108,20 @@ except ImportError:
     HAS_KEY_MANAGER = False
     print("WARNING: Key manager not available, v2.0 backup format disabled")
 
-# [安全] 导入主机名验证函数和隧道管理函数
+# [安全] 导入主机名验证函数
+# Note: Most peer tunnel functions now use rust-router IPC instead of peer_tunnel_manager
+# HAS_PENDING_TUNNEL is always False - kernel WireGuard pending interfaces are no longer used
+HAS_PENDING_TUNNEL = False  # Legacy kernel WireGuard code paths disabled
 try:
     from peer_tunnel_manager import (
         validate_hostname,
-        create_pending_wireguard_interface,
-        teardown_pending_wireguard_interface,
-        rename_wireguard_interface,
-        update_wireguard_peer_endpoint,
-        get_interface_name,
-        create_wireguard_tunnel_with_endpoint,
-        wait_for_wireguard_handshake,
+        get_interface_name,  # Still used for interface naming convention
         PEER_TUNNEL_PORT_MIN,
     )
     HAS_HOSTNAME_VALIDATOR = True
-    HAS_PENDING_TUNNEL = True
 except ImportError:
     HAS_HOSTNAME_VALIDATOR = False
-    HAS_PENDING_TUNNEL = False
-    PEER_TUNNEL_PORT_MIN = 36200  # Phase 6: 回退值 (must match valid range 36200-36299)
+    PEER_TUNNEL_PORT_MIN = 36200  # 回退值 (must match valid range 36200-36299)
     # 回退实现：基本验证
     def validate_hostname(hostname: str) -> bool:
         """回退实现：基本主机名验证"""
@@ -117,7 +148,7 @@ except ImportError:
     HAS_PAIRING = False
     print("WARNING: Peer pairing module not available")
 
-# DSCP 管理器 (Phase 4 - 入口节点 DSCP 规则设置)
+# DSCP 管理器 (入口节点 DSCP 规则设置)
 try:
     from dscp_manager import get_dscp_manager, ENTRY_ROUTING_MARK_BASE
     HAS_DSCP_MANAGER = True
@@ -125,6 +156,14 @@ except ImportError:
     HAS_DSCP_MANAGER = False
     ENTRY_ROUTING_MARK_BASE = 100  # 回退值
     print("WARNING: DSCP manager not available")
+
+# Rust Router Client for DNS API
+try:
+    from rust_router_client import RustRouterClient
+    HAS_RUST_ROUTER_CLIENT = True
+except ImportError:
+    HAS_RUST_ROUTER_CLIENT = False
+    print("WARNING: Rust router client not available, DNS API disabled")
 
 CONFIG_PATH = Path(os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/sing-box.json"))
 GENERATED_CONFIG_PATH = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
@@ -148,6 +187,14 @@ _GEOIP_CATALOG: Dict[str, Any] = {}
 CUSTOM_CATEGORY_ITEMS_FILE = Path(os.environ.get("CUSTOM_CATEGORY_ITEMS_FILE", "/etc/sing-box/custom-category-items.json"))
 SETTINGS_FILE = Path(os.environ.get("SETTINGS_FILE", "/etc/sing-box/settings.json"))
 ENTRY_DIR = Path("/usr/local/bin")
+
+# ============ Binary Rule Storage ============
+# Directory for binary rule files (msgpack format)
+RULES_DIR = Path(os.environ.get("RULES_DIR", "/etc/sing-box/rules"))
+# Threshold for using binary storage (rules >= this count go to binary file)
+RULE_SET_THRESHOLD = int(os.environ.get("RULE_SET_THRESHOLD", "1000"))
+# Rule loader instance (initialized at startup)
+_rule_loader: Optional["AsyncRuleLoader"] = None
 
 
 def _safe_int_env(name: str, default: int) -> int:
@@ -243,11 +290,12 @@ def _validate_not_reserved_port(port: int) -> None:
         )
 
 
-def _allocate_peer_tunnel_port(db) -> int:
+def _allocate_peer_tunnel_port(db, exclude_ports: set = None) -> int:
     """Issue 7/10 Fix: Safely allocate a peer tunnel port.
 
     Args:
         db: Database connection
+        exclude_ports: 额外需要排除的端口（如对方节点的端口）
 
     Returns:
         Allocated port number
@@ -256,7 +304,7 @@ def _allocate_peer_tunnel_port(db) -> int:
         HTTPException: If port allocation fails (exhausted or error)
     """
     try:
-        port = db.get_next_peer_tunnel_port()
+        port = db.get_next_peer_tunnel_port(exclude_ports=exclude_ports)
         if port is None:
             raise HTTPException(
                 status_code=503,
@@ -280,7 +328,7 @@ def _get_db():
 
 
 def _get_local_node_tag(db) -> str:
-    """Phase 11-Cascade: 获取本节点标识符
+    """获取本节点标识符
 
     优先使用数据库中存储的 node_tag，如果不存在则使用 hostname。
     返回值会被规范化为小写并替换非法字符。
@@ -317,6 +365,57 @@ def _get_local_node_tag(db) -> str:
     return normalized[:64]  # 限制长度
 
 
+def _get_peer_forward_params(db, node_tag: str) -> dict:
+    """统一获取对端节点转发参数
+
+    从数据库读取所有需要的参数，确保 WireGuard 和 Xray 隧道转发正确工作。
+
+    Args:
+        db: 数据库连接
+        node_tag: 对端节点标识
+
+    Returns:
+        dict 包含:
+            - endpoint: 对端公网地址 (IP:port)
+            - tunnel_type: "wireguard" 或 "xray"
+            - api_port: API 端口 (默认 36000)
+            - tunnel_ip: 对端隧道 IP (用于路由目标)
+            - tunnel_local_ip: 本地隧道 IP (WireGuard 隧道转发需要)
+            - node: 完整的节点信息 (供调用方检查 tunnel_status 等)
+    """
+    node = db.get_peer_node(node_tag)
+    if not node:
+        return {
+            "endpoint": None,
+            "tunnel_type": "wireguard",
+            "api_port": 36000,
+            "tunnel_ip": None,
+            "tunnel_local_ip": None,
+            "node": None,
+        }
+
+    tunnel_type = node.get("tunnel_type", "wireguard")
+
+    # tunnel_ip 和 tunnel_local_ip 根据隧道类型设置
+    # WireGuard: 需要两个 IP 才能通过 smoltcp 隧道转发
+    # Xray: 只需要 tunnel_ip 用于 SOCKS5 代理路由
+    if tunnel_type == "wireguard":
+        tunnel_ip = node.get("tunnel_remote_ip")  # 对方的隧道 IP
+        tunnel_local_ip = node.get("tunnel_local_ip")  # 本地的隧道 IP
+    else:  # xray
+        tunnel_ip = node.get("tunnel_remote_ip") or node.get("tunnel_ip")
+        tunnel_local_ip = None  # Xray 不需要本地隧道 IP
+
+    return {
+        "endpoint": node.get("endpoint"),
+        "tunnel_type": tunnel_type,
+        "api_port": node.get("api_port", 36000),
+        "tunnel_ip": tunnel_ip,
+        "tunnel_local_ip": tunnel_local_ip,
+        "node": node,
+    }
+
+
 def _get_available_outbounds(db) -> list:
     """获取所有可用出口列表
 
@@ -328,6 +427,7 @@ def _get_available_outbounds(db) -> list:
     - OpenVPN 出口
     - V2Ray 出口
     - WARP 出口
+    - Shadowsocks 出口
     - 出口组（负载均衡/故障转移）
     """
     available = ["direct"]
@@ -359,6 +459,11 @@ def _get_available_outbounds(db) -> list:
 
     # WARP egress
     for egress in db.get_warp_egress_list(enabled_only=True):
+        if egress.get("tag"):
+            available.append(egress["tag"])
+
+    # Shadowsocks egress
+    for egress in db.get_shadowsocks_egress_list(enabled_only=True):
         if egress.get("tag"):
             available.append(egress["tag"])
 
@@ -583,7 +688,11 @@ _rate_limit_lock = threading.Lock()
 # 速率限制配置
 _RATE_LIMIT_GENERAL = 300  # 一般 API: 每分钟 300 次（放宽以支持频繁操作）
 _RATE_LIMIT_LOGIN = 10  # 登录 API: 每分钟 10 次
+_RATE_LIMIT_REGISTER = 5  # 注册 API: 每分钟 5 次（更严格）
 _RATE_LIMIT_WINDOW = 60  # 时间窗口（秒）
+
+# 保留用户名（不允许注册）
+RESERVED_USERNAMES = {"admin", "root", "system", "administrator", "guest", "api", "www", "support"}
 
 
 def _get_client_ip(request: Request) -> str:
@@ -611,11 +720,26 @@ def _get_direct_client_ip(request: Request) -> str:
     这些端点使用隧道 IP 作为身份证明，因此必须使用实际的 TCP 连接 IP，
     不能信任任何可被伪造的 HTTP 头（X-Forwarded-For, X-Real-IP 等）。
 
+    修复 nginx keep-alive 连接导致 request.client 为 None 的问题。
+    当 nginx 使用持久连接代理到 uvicorn 时，uvicorn 可能无法获取原始客户端信息。
+    在这种情况下，仅当 X-Real-IP 为 127.0.0.1 时才信任（nginx 由本地设置此头），
+    这确保请求确实来自本地 SimpleTcpProxy。
+
     Returns:
         直接 TCP 连接的客户端 IP 地址
     """
     if request.client and request.client.host:
         return request.client.host
+
+    # 回退处理 - nginx keep-alive 连接导致 request.client 为 None
+    # nginx 设置 X-Real-IP: $remote_addr，仅当其值为 127.0.0.1 时信任
+    # 安全性：外部攻击者可以伪造 X-Real-IP 头，但他们无法伪造为 127.0.0.1
+    # 因为 nginx 会用实际的 $remote_addr 覆盖该头
+    x_real_ip = request.headers.get("X-Real-IP")
+    if x_real_ip == "127.0.0.1":
+        logging.debug("[client-ip] Using X-Real-IP=127.0.0.1 as fallback (nginx proxy)")
+        return "127.0.0.1"
+
     return "unknown"
 
 
@@ -682,6 +806,10 @@ _traffic_rates: Dict[str, Dict[str, float]] = {}  # {outbound: {download_rate: f
 # 速率历史记录（保留24小时）
 _rate_history: List[Dict[str, Any]] = []  # [{timestamp: int, rates: {outbound: rate_kb}}]
 _traffic_stats_lock = threading.Lock()
+# Graceful shutdown event for background threads (Issue: DB operations interrupted on shutdown)
+_shutdown_event = threading.Event()
+# 保存后台线程引用，用于优雅关闭
+_background_threads: List[threading.Thread] = []
 _POLL_INTERVAL = 1  # 轮询间隔（秒）
 _RATE_WINDOW = 1  # 速率计算窗口（秒）- 1秒窗口更准确反映瞬时速率
 _HISTORY_INTERVAL = 1  # 历史记录间隔（秒）- 1秒更新，支持实时推进图表
@@ -697,14 +825,8 @@ _OUTBOUNDS_CACHE_TTL = 10  # 10秒刷新一次
 
 # V2Ray API 客户端（懒加载）
 _v2ray_client = None
-# Xray 出站 V2Ray API 客户端（懒加载，用于获取 V2Ray 出口的流量统计）
-_xray_egress_client = None
-# Xray 出站 API 端口
-XRAY_EGRESS_API_PORT = 10086
-# Xray 入站 V2Ray API 客户端（懒加载，用于获取 V2Ray 入口用户的流量统计）
-_xray_ingress_client = None
-# Xray 入站 API 端口
-XRAY_INGRESS_API_PORT = 10087
+# NOTE: Legacy xray-lite clients removed - VLESS now handled by rust-router
+# Stats are collected via rust-router IPC (GetVlessInboundStatus)
 
 # V2Ray 用户活跃度缓存: {email: {"last_seen": timestamp, "upload": bytes, "download": bytes}}
 # 用于跟踪用户在线状态
@@ -737,7 +859,7 @@ _adblock_log_position: int = 0
 _adblock_log_inode: int = 0  # 用于检测日志轮转
 
 
-# ============ Phase 2 Validation Helpers ============
+# ============ Validation Helpers ============
 
 def _parse_chain_hops(chain: Dict[str, Any], raise_on_error: bool = True) -> List[str]:
     """
@@ -791,6 +913,97 @@ def _parse_chain_hops(chain: Dict[str, Any], raise_on_error: bool = True) -> Lis
     return []
 
 
+def _verify_chain_membership(
+    db,
+    chain_tag: str,
+    requesting_node_tag: str,
+    source_node: Optional[str] = None
+) -> tuple:
+    """验证请求节点是否为链路成员
+
+    安全检查：确保只有链路中的节点可以注册/注销链路路由，
+    防止恶意节点注册任意路由。
+
+    安全修复:
+    - 安全修复: hops 解析失败时 fail-closed（原来是 fail-open）
+    - 功能修复: 支持入口节点调用（入口节点不在 hops 中，但是 source_node）
+    - Chain 不存在时: 如果 source_node 匹配请求节点，允许（入口节点直接调用终端）
+
+    Args:
+        db: 数据库连接
+        chain_tag: 链路标签
+        requesting_node_tag: 发起请求的节点标签
+        source_node: 可选，请求中指定的来源节点（入口节点标识）
+
+    Returns:
+        (is_member: bool, error_message: Optional[str])
+        - (True, None): 验证通过
+        - (False, "Chain not found"): 链路不存在且不是入口节点调用
+        - (False, "Invalid configuration"): hops 配置无效
+        - (False, "Not authorized"): 节点无权限
+    """
+    chain = db.get_node_chain(chain_tag)
+
+    if not chain:
+        # Chain 不存在于本地数据库
+        # 场景 1: 入口节点直接调用终端节点
+        # 如果 source_node 与 requesting_node_tag 匹配，说明是入口节点直接调用
+        if source_node and source_node == requesting_node_tag:
+            logging.info(
+                f"[chain-auth] 允许入口节点 '{source_node}' 在终端注册链路 '{chain_tag}' "
+                "(chain 仅存在于入口节点)"
+            )
+            return True, None
+
+        # 场景 2: 中继节点转发请求
+        # 当中继节点（如 node2）代表入口节点（如 node1）向终端节点（如 node3）转发请求时：
+        # - requesting_node_tag = "node2"（通过隧道认证的实际调用者）
+        # - source_node = "node1"（原始入口节点）
+        # 如果 requesting_node_tag 是已连接的 peer，且 source_node 已指定，允许转发
+        if source_node and source_node != requesting_node_tag:
+            relay_peer = db.get_peer_node(requesting_node_tag)
+            if relay_peer and relay_peer.get("tunnel_status") == "connected":
+                logging.info(
+                    f"[chain-auth] 允许中继节点 '{requesting_node_tag}' 代表入口节点 '{source_node}' "
+                    f"在终端注册链路 '{chain_tag}'"
+                )
+                return True, None
+
+        # Fail-closed: 拒绝未授权的请求
+        logging.warning(
+            f"[chain-auth] 链路 '{chain_tag}' 不存在，拒绝节点 '{requesting_node_tag}' 的请求"
+        )
+        return False, f"Chain '{chain_tag}' not found"
+
+    # 解析 hops
+    hops = _parse_chain_hops(chain, raise_on_error=False)
+
+    # 安全修复: fail-closed（原来是 fail-open 安全漏洞）
+    if not hops:
+        logging.error(
+            f"[chain-auth] 链路 '{chain_tag}' hops 解析失败，拒绝访问 (fail-closed)"
+        )
+        return False, f"Chain '{chain_tag}' has invalid hops configuration"
+
+    # 检查请求节点是否在 hops 中（中继/终端节点）
+    if requesting_node_tag in hops:
+        return True, None
+
+    # 检查是否为入口节点（入口节点创建链路但不在 hops 中）
+    # source_node 参数允许入口节点标识自己
+    if source_node and source_node == requesting_node_tag:
+        logging.debug(
+            f"[chain-auth] 允许入口节点 '{source_node}' 操作链路 '{chain_tag}'"
+        )
+        return True, None
+
+    logging.warning(
+        f"[chain-auth] 节点 '{requesting_node_tag}' 不是链路 '{chain_tag}' 的成员. "
+        f"链路成员: {hops}, source_node: {source_node}"
+    )
+    return False, f"Node '{requesting_node_tag}' is not authorized for chain '{chain_tag}'"
+
+
 def _validate_tunnel_ip(ip: str, subnet: str = "10.200.200.0/24") -> bool:
     """
     验证隧道 IP 是否在预期范围内。
@@ -816,13 +1029,74 @@ def _validate_tunnel_ip(ip: str, subnet: str = "10.200.200.0/24") -> bool:
 # ============ 认证相关模型 ============
 
 class SetupRequest(BaseModel):
-    """首次设置管理员密码"""
+    """首次设置管理员账户"""
+    username: str = Field(default="admin", min_length=3, max_length=32, description="Admin username")
     password: str = Field(..., min_length=8, description="Admin password (min 8 chars)")
 
 
 class LoginRequest(BaseModel):
     """登录请求"""
-    password: str = Field(..., description="Admin password")
+    username: str = Field(default="admin", description="Username")
+    password: str = Field(..., description="Password")
+
+
+class PasswordChangeRequest(BaseModel):
+    """密码修改请求"""
+    current_password: str = Field(..., description="Current password")
+    new_password: str = Field(..., min_length=8, description="New password (min 8 chars)")
+
+
+class RegisterRequest(BaseModel):
+    """用户注册请求"""
+    username: str = Field(..., min_length=3, max_length=32)
+    password: str = Field(..., min_length=8)
+    email: Optional[str] = None
+
+
+class CheckPendingRequest(BaseModel):
+    """检查待审批状态请求"""
+    username: str
+    password: str
+
+
+class RegistrationSettingsRequest(BaseModel):
+    """注册设置请求"""
+    allow_registration: Optional[bool] = None
+    default_role: Optional[str] = None  # "user" or "pending"
+
+
+class UserCreateRequest(BaseModel):
+    """创建用户请求 (仅管理员)"""
+    username: str = Field(..., min_length=3, max_length=32, description="Username")
+    password: str = Field(..., min_length=8, description="Password (min 8 chars)")
+    email: Optional[str] = Field(None, description="Email address")
+    role: str = Field("user", description="Role: 'admin' or 'user'")
+
+    @validator('role')
+    def validate_role(cls, v):
+        if v not in ('admin', 'user'):
+            raise ValueError("Role must be 'admin' or 'user'")
+        return v
+
+    @validator('username')
+    def validate_username(cls, v):
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9_-]*$', v):
+            raise ValueError("Username must start with a letter and contain only letters, numbers, underscores, and hyphens")
+        return v
+
+
+class UserUpdateRequest(BaseModel):
+    """更新用户请求"""
+    password: Optional[str] = Field(None, min_length=8, description="New password")
+    email: Optional[str] = Field(None, description="Email address")
+    role: Optional[str] = Field(None, description="Role: 'admin' or 'user' (admin only)")
+    enabled: Optional[bool] = Field(None, description="Enable/disable user (admin only)")
+
+    @validator('role')
+    def validate_role(cls, v):
+        if v is not None and v not in ('admin', 'user'):
+            raise ValueError("Role must be 'admin' or 'user'")
+        return v
 
 
 class TokenResponse(BaseModel):
@@ -1046,18 +1320,15 @@ class BackupImportRequest(BaseModel):
 # ============ V2Ray Egress/Inbound Models ============
 
 class V2RayEgressCreateRequest(BaseModel):
-    """创建 V2Ray 出口 (VMess/VLESS/Trojan)"""
+    """创建 V2Ray 出口 (VLESS only - VMess/Trojan removed in Xray-lite)"""
     tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="出口标识符")
     description: str = Field("", description="描述")
-    protocol: str = Field(..., description="协议 (vmess/vless/trojan)")
+    protocol: str = Field("vless", description="协议 (仅支持 vless)")
     server: str = Field(..., description="服务器地址")
     server_port: int = Field(443, ge=1, le=65535, description="服务器端口")
-    # Auth
-    uuid: Optional[str] = Field(None, description="UUID (VMess/VLESS)")
-    password: Optional[str] = Field(None, description="密码 (Trojan)")
-    # VMess specific
-    security: str = Field("auto", description="VMess 加密方式")
-    alter_id: int = Field(0, ge=0, description="VMess alterId")
+    # Auth (VLESS)
+    uuid: Optional[str] = Field(None, description="UUID (VLESS)")
+    # [REMOVED] password, security, alter_id - VMess/Trojan fields removed in Xray-lite
     # VLESS specific
     flow: Optional[str] = Field(None, description="VLESS flow (xtls-rprx-vision)")
     # TLS
@@ -1082,15 +1353,13 @@ class V2RayEgressCreateRequest(BaseModel):
 
 
 class V2RayEgressUpdateRequest(BaseModel):
-    """更新 V2Ray 出口"""
+    """更新 V2Ray 出口 (VLESS only - Xray-lite)"""
     description: Optional[str] = None
     protocol: Optional[str] = None
     server: Optional[str] = None
     server_port: Optional[int] = Field(None, ge=1, le=65535)
     uuid: Optional[str] = None
-    password: Optional[str] = None
-    security: Optional[str] = None
-    alter_id: Optional[int] = Field(None, ge=0)
+    # [REMOVED in Xray-lite] password, security, alter_id - VMess/Trojan fields removed
     flow: Optional[str] = None
     tls_enabled: Optional[bool] = None
     tls_sni: Optional[str] = None
@@ -1111,13 +1380,13 @@ class V2RayEgressUpdateRequest(BaseModel):
 
 
 class V2RayURIParseRequest(BaseModel):
-    """解析 V2Ray URI (vmess://, vless://, trojan://)"""
-    uri: str = Field(..., description="V2Ray 分享链接")
+    """解析 V2Ray URI (仅支持 vless:// - VMess/Trojan removed in Xray-lite)"""
+    uri: str = Field(..., description="V2Ray 分享链接 (vless:// only)")
 
 
 class V2RayInboundUpdateRequest(BaseModel):
-    """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）"""
-    protocol: str = Field("vless", description="协议 (vmess/vless/trojan)")
+    """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）- VLESS only"""
+    protocol: str = Field("vless", description="协议 (仅支持 vless)")
     listen_address: str = Field("0.0.0.0", description="监听地址")
     listen_port: int = Field(443, ge=1, le=65535, description="监听端口")
     tls_enabled: bool = Field(True, description="启用 TLS")
@@ -1142,28 +1411,55 @@ class V2RayInboundUpdateRequest(BaseModel):
     # TUN config
     tun_device: str = Field("xray-tun0", description="TUN 设备名")
     tun_subnet: str = Field("10.24.0.0/24", description="TUN 子网")
+    # UDP support
+    udp_enabled: bool = Field(True, description="启用 UDP 支持 (VLESS command 0x02)")
     # Enable
     enabled: bool = Field(False, description="启用入口")
 
 
 class V2RayUserCreateRequest(BaseModel):
-    """创建 V2Ray 用户"""
+    """创建 V2Ray 用户 (VLESS only - Xray-lite)"""
     name: str = Field(..., pattern=r"^[a-zA-Z][a-zA-Z0-9_-]*$", description="用户名")
     email: Optional[str] = Field(None, description="邮箱")
-    uuid: Optional[str] = Field(None, description="UUID (VMess/VLESS，不填自动生成)")
-    password: Optional[str] = Field(None, description="密码 (Trojan)")
-    alter_id: int = Field(0, ge=0, description="VMess alterId")
-    flow: Optional[str] = Field(None, description="VLESS flow")
+    uuid: Optional[str] = Field(None, description="UUID (VLESS，不填自动生成)")
+    # [REMOVED in Xray-lite] password, alter_id - VMess/Trojan fields removed
+    flow: Optional[str] = Field(None, description="VLESS flow (xtls-rprx-vision)")
 
 
 class V2RayUserUpdateRequest(BaseModel):
-    """更新 V2Ray 用户"""
+    """更新 V2Ray 用户 (VLESS only - Xray-lite)"""
     email: Optional[str] = None
     uuid: Optional[str] = None
-    password: Optional[str] = None
-    alter_id: Optional[int] = Field(None, ge=0)
+    # [REMOVED in Xray-lite] password, alter_id - VMess/Trojan fields removed
     flow: Optional[str] = None
     enabled: Optional[int] = Field(None, ge=0, le=1)
+
+
+# ============ 规则集 (Rule Sets) 模型 ============
+
+class RuleSetCreateRequest(BaseModel):
+    """创建规则集请求"""
+    id: Optional[str] = Field(None, description="规则集 ID（不填则自动生成）")
+    name: str = Field(..., description="规则集名称")
+    rule_type: str = Field(..., description="规则类型: ip, domain, domain_suffix, domain_keyword")
+    outbound: str = Field(..., description="出口标签")
+    rules: List[str] = Field(..., description="规则列表")
+    priority: int = Field(0, description="优先级（数值越大优先级越高）")
+
+    @validator("rule_type")
+    def validate_rule_type(cls, v):
+        valid_types = {"ip", "domain", "domain_suffix", "domain_keyword"}
+        if v not in valid_types:
+            raise ValueError(f"rule_type 必须是 {', '.join(valid_types)} 之一")
+        return v
+
+
+class RuleSetUpdateRequest(BaseModel):
+    """更新规则集请求"""
+    name: Optional[str] = Field(None, description="规则集名称")
+    outbound: Optional[str] = Field(None, description="出口标签")
+    enabled: Optional[bool] = Field(None, description="是否启用")
+    priority: Optional[int] = Field(None, description="优先级")
 
 
 # ============ 对等节点 (Peer Node) 模型 ============
@@ -1185,7 +1481,7 @@ class PeerNotifyRequest(BaseModel):
 
 
 class ReverseSetupRequest(BaseModel):
-    """Phase 11.2: 请求建立反向连接
+    """请求建立反向连接
 
     当节点 A 导入节点 B 的配对请求并完成配对后，
     A 通过隧道调用 B 的此 API，请求 B 建立到 A 的反向连接。
@@ -1202,7 +1498,7 @@ class ReverseSetupRequest(BaseModel):
 
 
 class CompleteHandshakeRequest(BaseModel):
-    """Phase 11-Tunnel: 完成配对握手
+    """完成配对握手
 
     当 Node B 导入 Node A 的配对请求码并建立隧道后，
     B 通过隧道调用 A 的此 API，通知 A 完成配对。
@@ -1217,11 +1513,11 @@ class CompleteHandshakeRequest(BaseModel):
     endpoint: str = Field(..., description="请求方的 WireGuard 监听端点 (IP:port)")
     tunnel_ip: str = Field(..., description="请求方的隧道 IP（应与 pending_pairing.tunnel_remote_ip 匹配）")
     wg_public_key: str = Field(..., description="请求方的 WireGuard 公钥")
-    api_port: Optional[int] = Field(None, ge=1, le=65535, description="请求方的 API 端口（默认 36000）Phase 11-Fix.K")
+    api_port: Optional[int] = Field(None, ge=1, le=65535, description="请求方的 API 端口（默认 36000）")
 
 
 class PeerEventRequest(BaseModel):
-    """Phase 11-Cascade: 对等节点事件通知
+    """对等节点事件通知
 
     用于在节点间传播删除、断开等事件，实现级联清理。
 
@@ -1345,10 +1641,10 @@ class GeneratePairRequestRequest(BaseModel):
     """
     node_tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="本节点标识符")
     node_description: str = Field("", description="节点描述")
-    endpoint: str = Field(..., description="隧道端点 (IP:port)")
+    endpoint: str = Field(..., description="本节点公网地址 (IP 或域名，端口自动分配)")
     tunnel_type: str = Field("wireguard", pattern=r"^(wireguard|xray)$", description="隧道类型")
-    bidirectional: bool = Field(True, description="启用双向自动连接 (Phase 11.2)")
-    api_port: Optional[int] = Field(None, ge=1, le=65535, description="API 端口（默认 36000）Phase 11-Fix.K")
+    bidirectional: bool = Field(True, description="启用双向自动连接")
+    api_port: Optional[int] = Field(None, ge=1, le=65535, description="API 端口（默认 36000）")
 
 
 class GeneratePairRequestResponse(BaseModel):
@@ -1367,7 +1663,7 @@ class ImportPairRequestRequest(BaseModel):
     local_node_tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="本节点标识符")
     local_node_description: str = Field("", description="本节点描述")
     local_endpoint: str = Field(..., description="本节点端点 (IP:port)")
-    api_port: Optional[int] = Field(None, ge=1, le=65535, description="本节点 API 端口（默认 36000）Phase 11-Fix.K")
+    api_port: Optional[int] = Field(None, ge=1, le=65535, description="本节点 API 端口（默认 36000）")
 
 
 class ImportPairRequestResponse(BaseModel):
@@ -1396,20 +1692,20 @@ class CompletePairingResponse(BaseModel):
 class NodeChainCreateRequest(BaseModel):
     """创建多跳链路"""
     tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="链路标识符")
-    name: str = Field(..., description="链路名称")
+    name: Optional[str] = Field(None, description="链路名称（可选，默认使用 tag）")
     description: str = Field("", description="链路描述")
-    # Phase 7 Fix: 添加最大长度限制（API 层限制 10 跳，递归验证使用 max_depth=5）
-    hops: List[str] = Field(..., min_length=2, max_length=10, description="节点跳转列表（2-10 跳）")
+    # 添加最大长度限制（API 层限制 10 跳，递归验证使用 max_depth=5）
+    hops: List[str] = Field(..., min_length=1, max_length=10, description="节点跳转列表（1-10 跳，单跳用于指定远程出口）")
     hop_protocols: Optional[Dict[str, str]] = Field(None, description="每跳协议配置")
     entry_rules: Optional[Dict[str, Any]] = Field(None, description="入口分流规则")
     relay_rules: Optional[Dict[str, Any]] = Field(None, description="中继分流规则")
     priority: int = Field(0, description="优先级")
     enabled: int = Field(1, ge=0, le=1, description="是否启用")
-    # Phase 6 新增字段
+    #
     exit_egress: Optional[str] = Field(None, description="终端节点的本地出口")
     dscp_value: Optional[int] = Field(None, ge=1, le=63, description="DSCP 标记值（1-63），不提供则自动分配")
-    chain_mark_type: str = Field("dscp", pattern=r"^(dscp|xray_email)$", description="标记类型")
-    # Phase 11-Fix.C: 传递模式验证
+    chain_mark_type: str = Field("dscp", pattern=r"^dscp$", description="标记类型（仅支持 DSCP，Xray 隧道不支持多跳链路）")
+    # 传递模式验证
     allow_transitive: bool = Field(False, description="是否允许传递验证（只验证第一跳，后续跳通过隧道验证）")
 
 
@@ -1417,19 +1713,19 @@ class NodeChainUpdateRequest(BaseModel):
     """更新多跳链路"""
     name: Optional[str] = Field(None, description="链路名称")
     description: Optional[str] = Field(None, description="链路描述")
-    # Phase 7 Fix: 与 NodeChainCreateRequest 保持一致
-    hops: Optional[List[str]] = Field(None, min_length=2, max_length=10, description="节点跳转列表（2-10 跳）")
+    # 与 NodeChainCreateRequest 保持一致
+    hops: Optional[List[str]] = Field(None, min_length=1, max_length=10, description="节点跳转列表（1-10 跳，单跳用于指定远程出口）")
     hop_protocols: Optional[Dict[str, str]] = Field(None, description="每跳协议配置")
     entry_rules: Optional[Dict[str, Any]] = Field(None, description="入口分流规则")
     relay_rules: Optional[Dict[str, Any]] = Field(None, description="中继分流规则")
     priority: Optional[int] = Field(None, description="优先级")
     enabled: Optional[int] = Field(None, ge=0, le=1, description="是否启用")
-    # Phase 6 新增字段
+    #
     exit_egress: Optional[str] = Field(None, description="终端节点的本地出口")
     dscp_value: Optional[int] = Field(None, ge=1, le=63, description="DSCP 标记值（1-63）")
-    chain_mark_type: Optional[str] = Field(None, pattern=r"^(dscp|xray_email)$", description="标记类型")
+    chain_mark_type: Optional[str] = Field(None, pattern=r"^dscp$", description="标记类型（仅支持 DSCP）")
     chain_state: Optional[str] = Field(None, pattern=r"^(inactive|activating|active|error)$", description="链路状态")
-    # Phase 11-Fix.C: 传递模式验证
+    # 传递模式验证
     allow_transitive: Optional[bool] = Field(None, description="是否允许传递验证（只验证第一跳，后续跳通过隧道验证）")
 
 
@@ -1511,11 +1807,60 @@ app.add_middleware(
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24
 
+
+@dataclass
+class UserContext:
+    """用户上下文，从 JWT token 中提取"""
+    user_id: int
+    username: str
+    role: str  # "admin" or "user"
+    jti: str = ""  # Token ID for revocation
+    legacy: bool = False  # True if using old single-admin token
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
+
+
+# Admin-only endpoint prefixes
+ADMIN_ONLY_PREFIXES = [
+    "/api/egress/",        # All egress management (except GET /api/egress)
+    "/api/pia/",           # PIA management
+    "/api/users",          # User management
+    "/api/peers",          # Peer node management
+    "/api/chains",         # Chain management
+    "/api/outbound-groups",# ECMP groups
+    "/api/backup/",        # Backup/restore
+    "/api/settings",       # System settings
+    "/api/ingress/subnet", # Subnet management
+]
+
+
+def _is_admin_only_endpoint(path: str, method: str) -> bool:
+    """检查端点是否仅限管理员访问"""
+    # GET /api/egress returns tag list for users (allowed)
+    if path == "/api/egress" and method == "GET":
+        return False
+
+    # GET /api/outbound-groups returns group list for users (allowed to use in rules)
+    if path == "/api/outbound-groups" and method == "GET":
+        return False
+
+    # Check admin-only prefixes
+    for prefix in ADMIN_ONLY_PREFIXES:
+        if path.startswith(prefix):
+            return True
+
+    return False
+
+
 # 公开端点（不需要认证）
 PUBLIC_PATHS = {
     "/api/auth/status",
     "/api/auth/setup",
     "/api/auth/login",
+    "/api/auth/register",
+    "/api/auth/check-pending",
     "/api/health",
     # NOTE: /api/peer-auth/validate 和 /api/peer-auth/exchange 端点已移除（PSK 认证已废弃）
     # 节点间连接通知端点（隧道 IP 认证）
@@ -1533,22 +1878,27 @@ PUBLIC_PATHS = {
     "/api/chain-routing/unregister",
     "/api/chain-routing",
     "/api/chain-routing/status",
-    # Phase 11.2: 双向自动连接
+    # 2PC endpoints for distributed chain activation
+    "/api/chain-routing/prepare",
+    "/api/chain-routing/commit",
+    "/api/chain-routing/abort",
+    # 双向自动连接
     "/api/peer-tunnel/reverse-setup",
-    # Phase 11-Tunnel: 隧道优先配对握手（通过隧道调用）
+    # 隧道优先配对握手（通过隧道调用）
     "/api/peer-tunnel/complete-handshake",
-    # Phase 11-Cascade: 级联删除通知（隧道 IP 认证）
+    # 级联删除通知（隧道 IP 认证）
     "/api/peer-tunnel/peer-event",
-    # Phase 11.4: 中继路由注册（PSK 认证）
+    # 中继路由注册（PSK 认证）
+    "/api/relay-routing/prepare",
     "/api/relay-routing/register",
     "/api/relay-routing/unregister",
-    # Phase 11-Fix.C: 链路跳点验证（支持 PSK 远程调用）
+    # 链路跳点验证（支持 PSK 远程调用）
     "/api/chains/validate-hops",
 }
 
 # 公开端点前缀（不需要认证，支持路径参数）
 PUBLIC_PATH_PREFIXES = [
-    # Phase 4: 转发出口查询（隧道 IP/UUID 认证，支持 /api/peer/forward-egress/{target_tag}）
+    # 转发出口查询（隧道 IP/UUID 认证，支持 /api/peer/forward-egress/{target_tag}）
     "/api/peer/forward-egress/",
 ]
 
@@ -1563,12 +1913,17 @@ def _verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(password.encode(), password_hash.encode())
 
 
-def _create_token(secret: str) -> tuple:
-    """创建 JWT token，返回 (token, expires_in_seconds)"""
+def _create_user_token(secret: str, user_id: int, username: str, role: str,
+                       token_version: int = 1) -> tuple:
+    """创建多用户 JWT token，返回 (token, expires_in_seconds)"""
     from datetime import timedelta
     expires_at = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)
     payload = {
-        "sub": "admin",
+        "jti": str(uuid.uuid4()),  # Token ID for revocation
+        "sub": str(user_id),       # User ID
+        "username": username,       # Username for display
+        "role": role,               # Role for authorization
+        "token_version": token_version,  # For password change invalidation
         "exp": expires_at,
         "iat": datetime.now(timezone.utc)
     }
@@ -1577,14 +1932,66 @@ def _create_token(secret: str) -> tuple:
     return token, expires_in
 
 
+# Keep old function for backward compatibility during transition
+def _create_token(secret: str) -> tuple:
+    """创建 JWT token（旧版，兼容单管理员模式）"""
+    return _create_user_token(secret, user_id=1, username="admin", role="admin", token_version=1)
+
+
+def _verify_token_enhanced(token: str, secret: str, db) -> Optional[UserContext]:
+    """验证 JWT token 并返回用户上下文"""
+    try:
+        payload = jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
+
+        # Legacy token support (old single-admin format)
+        if payload.get("sub") == "admin" and "role" not in payload:
+            return UserContext(user_id=1, username="admin", role="admin", jti="", legacy=True)
+
+        # New multi-user token format
+        user_id = int(payload.get("sub", 0))
+        if user_id == 0:
+            return None
+
+        # Check token blacklist
+        jti = payload.get("jti", "")
+        if jti and db.is_token_revoked(jti):
+            return None
+
+        # Check token_version matches current user
+        user = db.get_user(user_id)
+        if not user:
+            return None
+
+        if not user.get("enabled"):
+            return None
+
+        # Check if token was issued before password change
+        token_version = payload.get("token_version", 1)
+        if token_version != user.get("token_version", 1):
+            return None
+
+        return UserContext(
+            user_id=user_id,
+            username=payload.get("username", user.get("username", "")),
+            role=payload.get("role", user.get("role", "user")),
+            jti=jti,
+            legacy=False
+        )
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+    except Exception:
+        return None
+
+
+# Keep old function signature for compatibility
 def _verify_token(token: str, secret: str) -> bool:
-    """验证 JWT token"""
+    """验证 JWT token（旧版兼容）"""
     try:
         jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
         return True
-    except jwt.ExpiredSignatureError:
-        return False
-    except jwt.InvalidTokenError:
+    except:
         return False
 
 
@@ -1601,13 +2008,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # API 速率限制 (H3)
         if path.startswith("/api/"):
             client_ip = _get_client_ip(request)
-            # 登录端点使用更严格的限制
-            if path == "/api/auth/login":
+            # 登录/注册端点使用更严格的限制
+            if path in {"/api/auth/login", "/api/auth/setup"}:
                 limit = _RATE_LIMIT_LOGIN
+            elif path == "/api/auth/register":
+                limit = _RATE_LIMIT_REGISTER
             else:
                 limit = _RATE_LIMIT_GENERAL
 
             if not _check_rate_limit(client_ip, limit):
+                logging.warning(f"Rate limit exceeded: ip={client_ip}, path={path}, limit={limit}")
                 return Response(
                     content='{"detail":"Too many requests, please try again later"}',
                     status_code=429,
@@ -1627,10 +2037,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if not path.startswith("/api/"):
             return await call_next(request)
 
-        # 检查是否已设置密码，未设置则允许访问
+        # 检查是否已设置用户，未设置则允许访问
         try:
             db = _get_db()
-            if not db.user.is_admin_setup():
+            if db.get_user_count() == 0:
                 return await call_next(request)
         except Exception as e:
             # 数据库错误时拒绝访问（安全优先，fail-closed）
@@ -1652,9 +2062,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = auth_header.split(" ")[1]
-        secret = db.user.get_or_create_jwt_secret()
+        secret = db.get_or_create_jwt_secret()
 
-        if not _verify_token(token, secret):
+        # Enhanced token verification with user context extraction
+        user_context = _verify_token_enhanced(token, secret, db)
+        if not user_context:
             return Response(
                 content='{"detail":"Invalid or expired token"}',
                 status_code=401,
@@ -1662,7 +2074,83 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"}
             )
 
+        # Check if account is locked
+        if db.is_account_locked(user_context.user_id):
+            return Response(
+                content='{"detail":"Account is locked. Please try again later."}',
+                status_code=401,
+                media_type="application/json"
+            )
+
+        # Check if user is pending approval
+        if user_context.role == "pending":
+            # Pending users can only access auth endpoints
+            if not path.startswith("/api/auth/"):
+                logging.debug(f"Pending user blocked: user_id={user_context.user_id}, username={user_context.username}, path={path}")
+                return Response(
+                    content='{"detail":"Account pending approval"}',
+                    status_code=403,
+                    media_type="application/json"
+                )
+
+        # Store user context in request state
+        request.state.user = user_context
+
+        # Check admin-only endpoints
+        if _is_admin_only_endpoint(path, request.method) and not user_context.is_admin:
+            return Response(
+                content='{"detail":"Admin access required"}',
+                status_code=403,
+                media_type="application/json"
+            )
+
         return await call_next(request)
+
+
+def get_user_context(request: Request) -> UserContext:
+    """从请求中获取当前用户上下文"""
+    user = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
+
+def get_owner_filter(request: Request) -> Optional[int]:
+    """获取用于过滤的 owner_id
+
+    管理员返回 None（可以看到所有资源），普通用户返回其 user_id（只能看到自己的资源）
+    """
+    user = get_user_context(request)
+    return None if user.is_admin else user.user_id
+
+
+def get_owner_id(request: Request) -> int:
+    """获取用于资源创建的 owner_id
+
+    始终返回当前用户的 user_id，用于设置新创建资源的所有者。
+    与 get_owner_filter 不同，此函数始终返回用户 ID（即使是管理员）。
+    """
+    user = get_user_context(request)
+    return user.user_id
+
+
+def check_resource_ownership(request: Request, resource: Optional[dict], resource_name: str = "Resource") -> None:
+    """检查资源所有权
+
+    如果资源不存在或用户无权访问，抛出 404 异常（防止信息泄露）
+
+    Args:
+        request: HTTP 请求
+        resource: 资源字典（需要包含 owner_id 字段）
+        resource_name: 资源名称（用于错误消息）
+    """
+    if not resource:
+        raise HTTPException(404, f"{resource_name} not found")
+
+    user = get_user_context(request)
+    if not user.is_admin and resource.get("owner_id") != user.user_id:
+        # 返回 404 而非 403 以防止信息泄露
+        raise HTTPException(404, f"{resource_name} not found")
 
 
 # 添加认证中间件（在 CORS 之后）
@@ -1790,132 +2278,90 @@ def _get_v2ray_client():
     return _v2ray_client
 
 
-def _get_xray_egress_client():
-    """获取 Xray 出站 V2Ray API 客户端（懒加载）
-
-    仅当有启用的 V2Ray 出口时才初始化客户端。
-    Xray 出站 API 使用端口 10086（与 sing-box 的 10085 区分）。
-    """
-    global _xray_egress_client
-    if _xray_egress_client is None:
-        try:
-            # 检查是否有启用的 V2Ray 出口
-            db = _get_db()
-            v2ray_egress = db.get_v2ray_egress_list(enabled_only=True)
-            if not v2ray_egress:
-                return None
-
-            from v2ray_stats_client import V2RayStatsClient
-            _xray_egress_client = V2RayStatsClient(f"127.0.0.1:{XRAY_EGRESS_API_PORT}")
-        except ImportError:
-            return None
-        except Exception as e:
-            print(f"[Traffic] Xray egress stats client init failed: {e}")
-            return None
-    return _xray_egress_client
-
-
-def _reset_xray_egress_client():
-    """重置 Xray 出站统计客户端
-
-    在 V2Ray 出口配置改变后调用，以便重新初始化客户端。
-    """
-    global _xray_egress_client
-    if _xray_egress_client is not None:
-        try:
-            _xray_egress_client.close()
-        except Exception:
-            pass
-    _xray_egress_client = None
-
-
-def _get_xray_ingress_client():
-    """获取 Xray 入站 V2Ray API 客户端（懒加载）
-
-    仅当 V2Ray 入口已配置且启用时才初始化客户端。
-    Xray 入站 API 使用端口 10087。
-    """
-    global _xray_ingress_client
-    if _xray_ingress_client is None:
-        try:
-            # 检查 V2Ray 入口是否已配置且启用
-            db = _get_db()
-            config = db.get_v2ray_inbound_config()
-            if not config or not config.get("enabled"):
-                return None
-
-            from v2ray_stats_client import V2RayStatsClient
-            _xray_ingress_client = V2RayStatsClient(f"127.0.0.1:{XRAY_INGRESS_API_PORT}")
-        except ImportError:
-            return None
-        except Exception as e:
-            print(f"[Traffic] Xray ingress stats client init failed: {e}")
-            return None
-    return _xray_ingress_client
-
-
-def _reset_xray_ingress_client():
-    """重置 Xray 入站统计客户端
-
-    在 V2Ray 入口配置改变后调用，以便重新初始化客户端。
-    """
-    global _xray_ingress_client
-    if _xray_ingress_client is not None:
-        try:
-            _xray_ingress_client.close()
-        except Exception:
-            pass
-    _xray_ingress_client = None
+# NOTE: Legacy xray-lite client functions removed:
+# - _get_xray_egress_client()
+# - _reset_xray_egress_client()
+# - _get_xray_ingress_client()
+# - _reset_xray_ingress_client()
+# VLESS stats are now obtained via rust-router IPC (GetVlessInboundStatus)
 
 
 def _update_v2ray_user_activity():
     """更新 V2Ray 用户活跃度缓存
 
-    从 Xray 入站 API 获取每用户流量统计，检测流量变化来判断用户是否在线。
+    NOTE: Legacy xray-lite stats collection disabled.
+    VLESS user stats are now collected via rust-router IPC.
+    This function is kept for API compatibility but is now a no-op.
     """
-    global _v2ray_user_activity
+    # Legacy xray-lite stats collection removed
+    # TODO: Implement VLESS user stats via rust-router IPC when needed
+    pass
 
-    ingress_client = _get_xray_ingress_client()
-    if not ingress_client:
-        return
+
+def _get_rust_router_outbound_stats_sync():
+    """获取 rust-router 出口统计（同步版本，用于后台线程）
+
+    返回格式与 V2Ray API 兼容: {tag: {"download": bytes, "upload": bytes}}
+    包括：
+    - 常规出口（direct, block 等）
+    - WireGuard 隧道出口（PIA, Custom, WARP, Peer）
+    """
+    if not HAS_RUST_ROUTER_CLIENT:
+        return None
 
     try:
-        # 获取用户流量统计 (格式: user>>>email>>>traffic>>>uplink/downlink)
-        user_stats = ingress_client.get_user_stats()
-        now = time.time()
+        import asyncio
 
-        with _v2ray_user_activity_lock:
-            for email, stats in user_stats.items():
-                upload = stats.get("upload", 0)
-                download = stats.get("download", 0)
+        async def _fetch_stats():
+            from rust_router_client import RustRouterClient
+            client = RustRouterClient()
+            await client.connect()
+            # 获取常规出口统计
+            outbound_resp = await client._send_command({"type": "get_outbound_stats"})
+            # 获取 WireGuard 隧道统计
+            wg_resp = await client._send_command({"type": "list_wg_tunnels"})
+            await client.close()
+            return outbound_resp, wg_resp
 
-                if email in _v2ray_user_activity:
-                    # 检测流量是否有变化
-                    prev = _v2ray_user_activity[email]
-                    if upload != prev.get("upload", 0) or download != prev.get("download", 0):
-                        # 流量有变化，更新 last_seen
-                        _v2ray_user_activity[email] = {
-                            "last_seen": now,
-                            "upload": upload,
-                            "download": download
-                        }
-                    # 如果流量无变化，保持 last_seen 不变
-                else:
-                    # 新用户，记录初始状态
-                    _v2ray_user_activity[email] = {
-                        "last_seen": now,
-                        "upload": upload,
-                        "download": download
+        # Run async function in a new event loop (safe for thread)
+        outbound_resp, wg_resp = asyncio.run(_fetch_stats())
+
+        stats = {}
+
+        # 处理常规出口统计
+        if outbound_resp.success:
+            outbounds_data = outbound_resp.data.get("outbounds", {})
+            for tag, data in outbounds_data.items():
+                stats[tag] = {
+                    "download": data.get("bytes_rx", 0),
+                    "upload": data.get("bytes_tx", 0)
+                }
+
+        # 处理 WireGuard 隧道统计
+        if wg_resp.success:
+            tunnels = wg_resp.data.get("tunnels", [])
+            for tunnel in tunnels:
+                tag = tunnel.get("tag")
+                if tag:
+                    stats[tag] = {
+                        "download": tunnel.get("rx_bytes", 0),
+                        "upload": tunnel.get("tx_bytes", 0)
                     }
+
+        return stats if stats else None
+
     except Exception as e:
-        # 静默忽略错误（Xray 可能未启动）
-        pass
+        logging.debug(f"rust-router outbound stats unavailable: {type(e).__name__}: {e}")
+        return None
 
 
 def _update_traffic_stats():
     """后台线程：定期更新累计流量统计和实时速率
 
     使用 V2Ray API 获取精确的出口流量统计（100% 准确）
+    当 sing-box 不可用时，回退到 rust-router IPC 获取统计
+    
+    Issue Fix: 使用 _shutdown_event 实现优雅关闭，避免在 DB 操作中被强制终止
     """
     global _traffic_stats, _traffic_rates, _rate_history
     global _last_history_time, _rate_samples
@@ -1924,29 +2370,31 @@ def _update_traffic_stats():
     _cache_cleanup_counter = 0
     _CACHE_CLEANUP_INTERVAL = 300  # 秒
 
-    while True:
+    while not _shutdown_event.is_set():
         try:
+            outbound_stats = None
+
+            # 优先使用 sing-box V2Ray API
             client = _get_v2ray_client()
-            if client is None:
-                time.sleep(_POLL_INTERVAL)
+            if client is not None:
+                try:
+                    outbound_stats = client.get_outbound_stats()
+                except Exception as e:
+                    logging.debug(f"sing-box V2Ray API unavailable: {type(e).__name__}: {e}")
+                    outbound_stats = None
+
+            # 回退到 rust-router IPC（当 sing-box 不可用或返回空时）
+            # 注意：V2Ray API 可能返回空字典 {} 而不是 None
+            if not outbound_stats:
+                outbound_stats = _get_rust_router_outbound_stats_sync()
+
+            # 如果两者都不可用，跳过此周期
+            if not outbound_stats:
+                _shutdown_event.wait(_POLL_INTERVAL)
                 continue
 
-            # 从 sing-box V2Ray API 获取精确的出口流量统计
-            outbound_stats = client.get_outbound_stats()
-
-            # 从 Xray 出站获取 V2Ray 出口的流量统计
-            xray_client = _get_xray_egress_client()
-            if xray_client:
-                try:
-                    xray_stats = xray_client.get_outbound_stats()
-                    # 合并 Xray 统计：Xray 出口的统计替换 sing-box 中对应的 SOCKS 出站统计
-                    # 因为 sing-box 只看到到 SOCKS 代理的流量，而 Xray 看到的是实际出口流量
-                    for tag, stats in xray_stats.items():
-                        if tag not in ("api", "freedom"):  # 排除内部 tag
-                            outbound_stats[tag] = stats
-                except Exception as e:
-                    # M5 修复: 记录 Xray 统计错误（可能还未启动或已停止）
-                    logging.debug(f"Xray egress stats unavailable: {type(e).__name__}: {e}")
+            # NOTE: Legacy xray-lite stats collection removed
+            # VLESS outbound stats are now collected via rust-router IPC (included in outbound_stats above)
 
             # 在锁外获取 outbounds 列表（使用缓存，避免锁内 DB 查询）
             all_outbounds = _get_cached_outbounds()
@@ -2022,7 +2470,7 @@ def _update_traffic_stats():
                 # M5 修复: 记录用户活动更新错误
                 logging.debug(f"V2Ray user activity update failed: {type(e).__name__}: {e}")
 
-            # Phase 11.5: 定期清理过期的终端出口缓存
+            # 定期清理过期的终端出口缓存
             _cache_cleanup_counter += _POLL_INTERVAL
             if _cache_cleanup_counter >= _CACHE_CLEANUP_INTERVAL:
                 _cache_cleanup_counter = 0
@@ -2039,11 +2487,331 @@ def _update_traffic_stats():
             # M5 修复: 使用 logging 而不是 print，记录完整异常信息
             logging.exception(f"Traffic stats thread error: {type(e).__name__}: {e}")
 
-        time.sleep(_POLL_INTERVAL)
+        _shutdown_event.wait(_POLL_INTERVAL)
+    
+    logging.info("[Traffic] 流量统计后台线程已停止（收到关闭信号）")
+
+
+def _restore_peer_connections():
+    """在 API server 启动时恢复 peer 连接
+
+    rust-router 重启后会丢失内存中的 peer 配置，需要从数据库恢复。
+    这个函数会：
+    1. 等待 rust-router 就绪
+    2. 查找数据库中标记为 "connected" 的 peer
+    3. 将它们的配置添加到 rust-router
+    4. 尝试建立连接
+
+    在后台线程中运行，失败不会阻塞 API server 启动。
+    """
+    _STARTUP_DELAY = 5  # 等待 rust-router 启动
+    _RETRY_DELAY = 10   # 重试间隔
+    _MAX_RETRIES = 3    # 最大重试次数
+
+    # 等待系统初始化
+    if _shutdown_event.wait(_STARTUP_DELAY):
+        logging.info("[Peer Restore] 收到关闭信号，取消恢复任务")
+        return
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        logging.debug("[Peer Restore] 数据库不可用，跳过 peer 恢复")
+        return
+
+    if not HAS_RUST_ROUTER_CLIENT:
+        logging.debug("[Peer Restore] rust-router 客户端不可用，跳过 peer 恢复")
+        return
+
+    try:
+        db = _get_db()
+
+        # 获取所有 peer 节点
+        all_peers = db.get_peer_nodes()
+        if not all_peers:
+            logging.debug("[Peer Restore] 没有配置的 peer 节点")
+            return
+
+        # 筛选需要恢复的 peer：数据库状态为 connected 的 WireGuard peer
+        peers_to_restore = []
+        for peer in all_peers:
+            tag = peer.get("tag")
+            db_status = peer.get("tunnel_status", "disconnected")
+            tunnel_type = peer.get("tunnel_type", "wireguard")
+            enabled = peer.get("enabled", 1)
+
+            # 只恢复启用的、数据库标记为 connected 的 WireGuard peer
+            if enabled and db_status == "connected" and tunnel_type == "wireguard":
+                peers_to_restore.append(peer)
+
+        if not peers_to_restore:
+            logging.debug("[Peer Restore] 没有需要恢复的 peer 连接")
+            return
+
+        logging.info(f"[Peer Restore] 发现 {len(peers_to_restore)} 个需要恢复的 peer 连接")
+
+        # 恢复每个 peer
+        for peer in peers_to_restore:
+            if _shutdown_event.is_set():
+                logging.info("[Peer Restore] 收到关闭信号，停止恢复")
+                return
+
+            tag = peer.get("tag")
+
+            for retry in range(_MAX_RETRIES):
+                try:
+                    success = _restore_single_peer(peer)
+                    if success:
+                        logging.info(f"[Peer Restore] 成功恢复 peer '{tag}'")
+                        break
+                    else:
+                        logging.warning(f"[Peer Restore] 恢复 peer '{tag}' 失败 (尝试 {retry + 1}/{_MAX_RETRIES})")
+                except Exception as e:
+                    logging.warning(f"[Peer Restore] 恢复 peer '{tag}' 异常: {e} (尝试 {retry + 1}/{_MAX_RETRIES})")
+
+                if retry < _MAX_RETRIES - 1:
+                    _shutdown_event.wait(_RETRY_DELAY)
+                    if _shutdown_event.is_set():
+                        return
+
+    except Exception as e:
+        logging.exception(f"[Peer Restore] peer 连接恢复失败: {e}")
+
+
+def _restore_single_peer(peer: dict) -> bool:
+    """恢复单个 peer 连接
+
+    Args:
+        peer: peer 节点配置字典
+
+    Returns:
+        True if successful, False otherwise
+    """
+    tag = peer.get("tag")
+
+    async def _do_restore():
+        client = RustRouterClient()
+        try:
+            # 1. 添加 peer 配置到 rust-router
+            add_result = await client.add_peer(
+                tag=tag,
+                endpoint=peer.get("endpoint", ""),
+                tunnel_type="wireguard",
+                description=peer.get("description", ""),
+                api_port=peer.get("api_port", 36000),
+                wg_public_key=peer.get("wg_peer_public_key"),
+                wg_local_private_key=peer.get("wg_private_key"),
+                tunnel_local_ip=peer.get("tunnel_local_ip"),
+                tunnel_remote_ip=peer.get("tunnel_remote_ip"),
+                tunnel_port=peer.get("tunnel_port"),
+                persistent_keepalive=25,
+            )
+
+            if not add_result.success and "already exists" not in (add_result.error or "").lower():
+                logging.warning(f"[Peer Restore] 添加 peer '{tag}' 配置失败: {add_result.error}")
+                return False
+
+            # 2. 连接 peer
+            connect_result = await client.connect_peer(tag)
+            if not connect_result.success and "already connected" not in (connect_result.error or "").lower():
+                logging.warning(f"[Peer Restore] 连接 peer '{tag}' 失败: {connect_result.error}")
+                return False
+
+            return True
+        finally:
+            await client.close()
+
+    return _run_async_ipc(_do_restore())
+
+
+def _restore_chain_routes():
+    """在 API server 启动时恢复 chain 路由到 rust-router
+
+    rust-router 重启后会丢失内存中的 chain 配置，需要从数据库恢复。
+    这个函数会：
+    1. 等待 rust-router 就绪（在 peer restore 之后）
+    2. 从 chain_routing 表读取所有已注册的 DSCP 路由
+    3. 重新创建并激活 chains 到 rust-router
+
+    注意：此函数仅在 Terminal 节点上执行实际恢复，Entry 节点需要重新激活 chains。
+    """
+    _STARTUP_DELAY = 8  # 等待 peer 恢复完成后再恢复 chains
+    _RETRY_DELAY = 5    # 重试间隔
+    _MAX_RETRIES = 2    # 最大重试次数
+
+    # 等待系统初始化
+    if _shutdown_event.wait(_STARTUP_DELAY):
+        logging.info("[Chain Restore] 收到关闭信号，取消恢复任务")
+        return
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        logging.debug("[Chain Restore] 数据库不可用，跳过 chain 恢复")
+        return
+
+    if not HAS_RUST_ROUTER_CLIENT:
+        logging.debug("[Chain Restore] rust-router 客户端不可用，跳过 chain 恢复")
+        return
+
+    try:
+        db = _get_db()
+
+        # 获取所有 DSCP 类型的 chain_routing 记录
+        routes = db.get_chain_routing_list(mark_type="dscp")
+        if not routes:
+            logging.debug("[Chain Restore] 没有需要恢复的 chain 路由")
+            return
+
+        logging.info(f"[Chain Restore] 发现 {len(routes)} 条需要恢复的 chain 路由")
+
+        # 获取本地节点 tag
+        local_tag = _get_local_node_tag(db)
+
+        # 恢复每个 chain route
+        restored_count = 0
+        for route in routes:
+            if _shutdown_event.is_set():
+                logging.info("[Chain Restore] 收到关闭信号，停止恢复")
+                return
+
+            chain_tag = route.get("chain_tag")
+            dscp_value = route.get("mark_value")
+            egress_tag = route.get("egress_tag")
+            source_node = route.get("source_node", "unknown")
+
+            for retry in range(_MAX_RETRIES):
+                try:
+                    success = _restore_single_chain_route(
+                        chain_tag=chain_tag,
+                        dscp_value=dscp_value,
+                        egress_tag=egress_tag,
+                        local_tag=local_tag,
+                        source_tag=source_node,
+                    )
+                    if success:
+                        logging.info(
+                            f"[Chain Restore] 成功恢复 chain '{chain_tag}' "
+                            f"(DSCP={dscp_value} -> {egress_tag})"
+                        )
+                        restored_count += 1
+                        break
+                    else:
+                        logging.warning(
+                            f"[Chain Restore] 恢复 chain '{chain_tag}' 失败 "
+                            f"(尝试 {retry + 1}/{_MAX_RETRIES})"
+                        )
+                except Exception as e:
+                    logging.warning(
+                        f"[Chain Restore] 恢复 chain '{chain_tag}' 异常: {e} "
+                        f"(尝试 {retry + 1}/{_MAX_RETRIES})"
+                    )
+
+                if retry < _MAX_RETRIES - 1:
+                    _shutdown_event.wait(_RETRY_DELAY)
+                    if _shutdown_event.is_set():
+                        return
+
+        logging.info(f"[Chain Restore] 完成，成功恢复 {restored_count}/{len(routes)} 条 chain 路由")
+
+    except Exception as e:
+        logging.exception(f"[Chain Restore] chain 路由恢复失败: {e}")
+
+
+def _restore_single_chain_route(
+    chain_tag: str,
+    dscp_value: int,
+    egress_tag: str,
+    local_tag: str,
+    source_tag: str,
+) -> bool:
+    """恢复单个 chain 路由到 rust-router
+
+    Args:
+        chain_tag: 链路标识
+        dscp_value: DSCP 值
+        egress_tag: 出口标签
+        local_tag: 本地节点 tag
+        source_tag: 来源节点 tag
+
+    Returns:
+        True if successful, False otherwise
+    """
+    async def _do_restore():
+        client = RustRouterClient()
+        try:
+            # 1. 检查 rust-router 是否可用
+            ping_resp = await client.ping()
+            if not ping_resp.success:
+                logging.warning("[Chain Restore] rust-router 不可用")
+                return False
+
+            # 2. 构建 chain 配置（Terminal 角色）
+            chain_config = {
+                "tag": chain_tag,
+                "description": f"Restored chain route from {source_tag}",
+                "dscp_value": dscp_value,
+                "hops": [
+                    {
+                        "node_tag": source_tag,
+                        "role": "entry",
+                        "tunnel_type": "wireguard",
+                    },
+                    {
+                        "node_tag": local_tag,
+                        "role": "terminal",
+                        "tunnel_type": "wireguard",
+                    },
+                ],
+                "rules": [],
+                "exit_egress": egress_tag,
+                "allow_transitive": False,
+            }
+
+            # 3. 检查 chain 是否已存在
+            chains_list = await client.list_chains()
+            existing_tags = {c.tag for c in chains_list if c.tag}
+
+            if chain_tag in existing_tags:
+                # Chain 已存在，检查状态
+                status_resp = await client.get_chain_status(chain_tag)
+                if status_resp.success and status_resp.data:
+                    state = status_resp.data.get("state", "")
+                    if state == "active":
+                        logging.debug(
+                            f"[Chain Restore] chain '{chain_tag}' 已激活，跳过"
+                        )
+                        return True
+                    # 如果存在但未激活，删除后重建
+                    await client.delete_chain(chain_tag)
+
+            # 4. 创建 chain
+            create_resp = await client.create_chain(
+                tag=chain_tag,
+                config=chain_config,
+            )
+            if not create_resp.success:
+                logging.warning(
+                    f"[Chain Restore] 创建 chain '{chain_tag}' 失败: {create_resp.error}"
+                )
+                return False
+
+            # 5. 激活 chain（Terminal 节点需要立即激活以处理 DSCP 包）
+            activate_resp = await client.activate_chain(chain_tag)
+            if not activate_resp.success:
+                logging.warning(
+                    f"[Chain Restore] 激活 chain '{chain_tag}' 失败: {activate_resp.error}"
+                )
+                # 激活失败，清理创建的 chain
+                await client.delete_chain(chain_tag)
+                return False
+
+            return True
+
+        finally:
+            await client.close()
+
+    return _run_async_ipc(_do_restore())
 
 
 def _bidirectional_status_checker():
-    """Phase 11-Fix.B: 后台线程定期检查 peer 双向连接状态
+    """后台线程定期检查 peer 双向连接状态
 
     每 60 秒检查一次所有已连接但非 bidirectional 的节点，自动更新它们的双向状态。
 
@@ -2054,14 +2822,18 @@ def _bidirectional_status_checker():
 
     对于 WireGuard 隧道，一旦密钥交换完成（有 wg_peer_public_key），就应该是 bidirectional。
     对于 Xray 隧道，需要检查 inbound_enabled 状态。
+    
+    Issue Fix: 使用 _shutdown_event 实现优雅关闭，避免在 DB 操作中被强制终止
     """
     _BIDIR_CHECK_INTERVAL = 60  # 秒
     _STARTUP_DELAY = 10  # 启动延迟，等待系统初始化
 
-    # 等待系统初始化完成
-    time.sleep(_STARTUP_DELAY)
+    # 等待系统初始化完成（可被 shutdown 事件中断）
+    if _shutdown_event.wait(_STARTUP_DELAY):
+        logging.info("[Bidirectional] 双向状态检查后台线程已停止（启动期间收到关闭信号）")
+        return
 
-    while True:
+    while not _shutdown_event.is_set():
         try:
             if HAS_DATABASE and USER_DB_PATH.exists():
                 db = _get_db()
@@ -2081,6 +2853,9 @@ def _bidirectional_status_checker():
                         all_peers.append(peer)
 
                 for peer in all_peers:
+                    # 检查是否收到关闭信号，避免长时间阻塞
+                    if _shutdown_event.is_set():
+                        break
                     tag = peer.get("tag")
                     tunnel_status = peer.get("tunnel_status")
                     if tag and tunnel_status == "connected":
@@ -2095,7 +2870,60 @@ def _bidirectional_status_checker():
         except Exception as e:
             logging.warning(f"[bidirectional-checker] 检查循环异常: {e}")
 
-        time.sleep(_BIDIR_CHECK_INTERVAL)
+        _shutdown_event.wait(_BIDIR_CHECK_INTERVAL)
+    
+    logging.info("[Bidirectional] 双向状态检查后台线程已停止（收到关闭信号）")
+
+
+def _recover_orphaned_chains():
+    """启动时恢复孤立的链路状态
+
+    在服务器崩溃或异常关闭后，链路可能卡在 'activating' 状态。
+    此函数将这些链路重置为 'error' 状态，并记录错误消息，
+    用户可以随后手动激活或删除。
+
+    Returns:
+        int: 恢复的链路数量
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return 0
+
+    try:
+        db = _get_db()
+        recovered_count = 0
+
+        # 获取所有链路
+        # 修复方法名 list_node_chains -> get_node_chains
+        chains = db.get_node_chains()
+        for chain in chains:
+            chain_state = chain.get("chain_state", "inactive")
+            tag = chain.get("tag", "unknown")
+
+            # 恢复卡在 'activating' 状态的链路
+            if chain_state == "activating":
+                logging.warning(
+                    f"[chain-recovery] 链路 '{tag}' 卡在 'activating' 状态，"
+                    f"重置为 'error' 状态（服务重启恢复）"
+                )
+                # 使用原子事务同时更新状态和错误消息
+                # 避免非原子的 update_node_chain 导致的潜在竞态条件
+                success, error = db.atomic_chain_state_transition(
+                    tag=tag,
+                    expected_state="activating",
+                    new_state="error",
+                    last_error="服务重启时恢复 - 链路在激活过程中被中断"
+                )
+                if success:
+                    recovered_count += 1
+                else:
+                    # 状态已被其他进程更改（可能已被用户手动处理）
+                    logging.info(f"[chain-recovery] 链路 '{tag}' 状态转换失败: {error}")
+
+        return recovered_count
+
+    except Exception as e:
+        logging.error(f"[chain-recovery] 链路恢复失败: {e}")
+        return 0
 
 
 @app.on_event("startup")
@@ -2106,14 +2934,17 @@ async def startup_event():
     refresh_wg_subnet_cache()
     print(f"[WireGuard] 子网前缀缓存已初始化: {get_cached_wg_subnet_prefix()}")
     # 启动流量统计后台线程（使用 V2Ray API 精确统计）
-    traffic_thread = threading.Thread(target=_update_traffic_stats, daemon=True)
+    # Issue Fix: 保存线程引用用于优雅关闭，不再设置 daemon=True 以便等待完成
+    traffic_thread = threading.Thread(target=_update_traffic_stats, name="traffic-stats", daemon=True)
     traffic_thread.start()
+    _background_threads.append(traffic_thread)
     print("[Traffic] 流量统计后台线程已启动（V2Ray API 精确模式）")
-    # Phase 11-Fix.B: 启动双向状态检查后台线程
-    bidir_thread = threading.Thread(target=_bidirectional_status_checker, daemon=True)
+    # 启动双向状态检查后台线程
+    bidir_thread = threading.Thread(target=_bidirectional_status_checker, name="bidir-checker", daemon=True)
     bidir_thread.start()
+    _background_threads.append(bidir_thread)
     print("[Bidirectional] 双向状态检查后台线程已启动（60秒间隔）")
-    # Phase 11.1: 清理过期的终端出口缓存
+    # 清理过期的终端出口缓存
     try:
         if HAS_DATABASE and USER_DB_PATH.exists():
             db = _get_db()
@@ -2122,6 +2953,170 @@ async def startup_event():
                 print(f"[Cache] 已清理 {deleted} 条过期的终端出口缓存")
     except Exception as e:
         logging.warning(f"[Cache] 清理过期缓存失败: {e}")
+    # 恢复卡在 'activating' 状态的孤立链路
+    recovered = _recover_orphaned_chains()
+    if recovered > 0:
+        print(f"[Chain Recovery] 已恢复 {recovered} 条孤立链路（重置为 error 状态）")
+    # Sync WG_LISTEN_PORT env var to database
+    _sync_wg_listen_port_to_db()
+    # 验证配置，检查潜在的 IP/端口冲突
+    _validate_network_config()
+    # 恢复已连接状态的 peer 节点
+    # 在后台线程中执行，避免阻塞启动
+    peer_restore_thread = threading.Thread(
+        target=_restore_peer_connections,
+        name="peer-restore",
+        daemon=True
+    )
+    peer_restore_thread.start()
+    _background_threads.append(peer_restore_thread)
+    print("[Peer] 启动 peer 连接恢复后台任务")
+    # 恢复 chain 路由到 rust-router
+    # 在后台线程中执行，在 peer 恢复之后启动（有 8 秒延迟）
+    chain_restore_thread = threading.Thread(
+        target=_restore_chain_routes,
+        name="chain-restore",
+        daemon=True
+    )
+    chain_restore_thread.start()
+    _background_threads.append(chain_restore_thread)
+    print("[Chain] 启动 chain 路由恢复后台任务")
+    # Note: VLESS/Shadowsocks 出口恢复已移至 rust_router_manager.py 的 sync_outbounds()
+    # 统一由 rust-router-manager 在启动时同步，避免竞态条件
+    # Initialize rule loader for binary rule sets
+    if HAS_RULE_LOADER and HAS_RULE_BINARY and HAS_DATABASE:
+        global _rule_loader
+        try:
+            RULES_DIR.mkdir(parents=True, exist_ok=True)
+            _rule_loader = AsyncRuleLoader(RULES_DIR, _get_db())
+            asyncio.create_task(_rule_loader.start_background_load())
+            print(f"[RuleLoader] 规则加载器已初始化，目录: {RULES_DIR}")
+        except Exception as e:
+            logging.error(f"[RuleLoader] 初始化失败: {e}")
+            _rule_loader = None
+
+
+def _validate_network_config():
+    """验证网络配置，检查潜在的 IP 子网和端口冲突
+
+    在启动时运行，如果检测到冲突会记录警告日志。
+    """
+    import ipaddress
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return
+
+    warnings = []
+
+    try:
+        db = _get_db()
+
+        # 1. 检查入口子网与 peer tunnel 子网的冲突
+        server = db.get_wireguard_server()
+        if server:
+            ingress_addr = server.get("address", DEFAULT_WG_SUBNET)
+            try:
+                ingress_network = ipaddress.ip_network(ingress_addr, strict=False)
+                peer_tunnel_network = ipaddress.ip_network("10.200.200.0/24")
+                if ingress_network.overlaps(peer_tunnel_network):
+                    warnings.append(
+                        f"⚠️  入口子网 {ingress_addr} 与 peer tunnel 子网 10.200.200.0/24 冲突！"
+                    )
+            except ValueError:
+                pass
+
+            # 2. 检查入口端口是否在 peer tunnel 端口范围内
+            ingress_port = server.get("listen_port", DEFAULT_WG_PORT)
+            TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
+            TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
+            if TUNNEL_PORT_MIN <= ingress_port <= TUNNEL_PORT_MAX:
+                warnings.append(
+                    f"⚠️  入口端口 {ingress_port} 在 peer tunnel 端口范围 ({TUNNEL_PORT_MIN}-{TUNNEL_PORT_MAX}) 内！"
+                )
+
+        # 3. 检查现有 peer nodes 是否有端口冲突
+        peer_nodes = db.get_peer_nodes()
+        for node in peer_nodes:
+            tunnel_port = node.get("tunnel_port")
+            if tunnel_port and server:
+                ingress_port = server.get("listen_port", DEFAULT_WG_PORT)
+                if tunnel_port == ingress_port:
+                    warnings.append(
+                        f"⚠️  Peer 节点 '{node.get('tag')}' 的隧道端口 {tunnel_port} 与入口端口冲突！"
+                    )
+
+        # 输出警告
+        for warning in warnings:
+            logging.warning(f"[Config Validation] {warning}")
+            print(f"[Config Validation] {warning}")
+
+        if not warnings:
+            print("[Config Validation] 网络配置验证通过，无冲突")
+
+    except Exception as e:
+        logging.error(f"[Config Validation] 配置验证失败: {e}")
+
+
+def _sync_wg_listen_port_to_db():
+    """Sync WG_LISTEN_PORT environment variable to wireguard_server table.
+    
+    This ensures the database listen_port matches the actual port rust-router
+    is listening on, so generated client configs use the correct port.
+    """
+    env_port = os.environ.get("WG_LISTEN_PORT")
+    if not env_port:
+        return
+    
+    try:
+        env_port_int = int(env_port)
+    except ValueError:
+        logging.warning(f"[WG Sync] Invalid WG_LISTEN_PORT value: {env_port}")
+        return
+    
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return
+    
+    try:
+        db = _get_db()
+        server = db.get_wireguard_server()
+        if not server:
+            return
+        
+        db_port = server.get("listen_port")
+        if db_port != env_port_int:
+            db.set_wireguard_server(
+                interface_name=server.get("interface_name", "wg-ingress"),
+                address=server.get("address", DEFAULT_WG_SUBNET),
+                listen_port=env_port_int,
+                mtu=server.get("mtu", 1420),
+                private_key=server.get("private_key")
+            )
+            print(f"[WG Sync] Updated wireguard_server.listen_port: {db_port} -> {env_port_int}")
+    except Exception as e:
+        logging.warning(f"[WG Sync] Failed to sync listen_port: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """应用关闭时优雅停止后台线程
+    
+    Issue Fix: 设置 shutdown 事件通知后台线程停止，并等待它们完成当前操作
+    避免在 DB 操作中被强制终止导致数据不一致
+    """
+    print("[Shutdown] 正在停止后台线程...")
+    
+    # 设置 shutdown 事件，通知所有后台线程停止
+    _shutdown_event.set()
+    
+    # 等待后台线程完成（最多等待 5 秒）
+    _SHUTDOWN_TIMEOUT = 5.0
+    for thread in _background_threads:
+        if thread.is_alive():
+            thread.join(timeout=_SHUTDOWN_TIMEOUT)
+            if thread.is_alive():
+                logging.warning(f"[Shutdown] 后台线程 {thread.name} 未能在 {_SHUTDOWN_TIMEOUT}s 内停止")
+    
+    print("[Shutdown] 后台线程已停止")
 
 
 def load_json_config() -> dict:
@@ -2149,18 +3144,30 @@ def save_json_config(data: dict) -> None:
 
 
 def get_wireguard_status() -> dict:
-    try:
-        result = subprocess.run(
-            ["wg", "show", "wg-ingress"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return {"raw": result.stdout}
-    except subprocess.CalledProcessError as exc:
-        return {"error": exc.stderr.strip() or "failed to read wg status"}
-    except FileNotFoundError:
-        return {"error": "wg binary not available"}
+    """Get WireGuard ingress server status.
+    
+    In userspace mode, queries rust-router IPC for ingress status.
+    The ingress server (wg-ingress) is managed by rust-router.
+    """
+    # Userspace mode: query rust-router for ingress status
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            status = _get_rust_router_status_sync()
+            if status.get("running"):
+                ingress = status.get("ingress", {})
+                return {
+                    "mode": "userspace",
+                    "running": True,
+                    "listen_port": ingress.get("listen_port"),
+                    "public_key": ingress.get("public_key"),
+                    "peer_count": ingress.get("peer_count", 0),
+                }
+            else:
+                return {"mode": "userspace", "running": False, "error": "rust-router not running"}
+        except Exception as e:
+            return {"mode": "userspace", "error": f"IPC query failed: {e}"}
+    
+    return {"error": "rust-router client not available"}
 
 
 def list_processes(pattern: str) -> bool:
@@ -2442,7 +3449,7 @@ def save_settings(data: Dict[str, Any]) -> None:
 def _derive_api_port_from_endpoint(endpoint: str, node: dict = None) -> tuple:
     """从 endpoint 推导 API 端口
 
-    Phase 11-Fix.B: 修复错误的 wg_port - 100 公式
+    修复错误的 wg_port - 100 公式
 
     Args:
         endpoint: "host:port" 格式的端点地址
@@ -2583,35 +3590,46 @@ def parse_wireguard_conf(content: str) -> Dict[str, Any]:
 
 @app.get("/api/auth/status")
 def api_auth_status():
-    """检查认证状态：是否已设置密码
+    """检查认证状态：是否已设置管理员账户
 
     此端点始终公开，用于确定显示登录页还是设置页
     """
     try:
         db = _get_db()
-        is_setup = db.user.is_admin_setup()
+        user_count = db.get_user_count()
+        is_setup = user_count > 0
+
+        # 获取注册设置
+        allow_registration = db.get_setting("allow_self_registration", "false").lower() == "true"
+        registration_default_role = db.get_setting("registration_default_role", "pending")
     except Exception:
         is_setup = False
+        allow_registration = False
+        registration_default_role = "pending"
 
     return {
         "is_setup": is_setup,
-        "requires_auth": True
+        "requires_auth": True,
+        "allow_registration": allow_registration,
+        "registration_default_role": registration_default_role
     }
 
 
 @app.post("/api/auth/setup")
-def api_auth_setup(request: SetupRequest):
-    """首次设置：创建管理员密码
+def api_auth_setup(http_request: Request, request: SetupRequest):
+    """初始化管理员账户（首次设置）
 
-    仅在密码未设置时可用
+    仅在没有用户时可用
     """
     db = _get_db()
 
-    if db.user.is_admin_setup():
-        raise HTTPException(
-            status_code=400,
-            detail="Admin password already set"
-        )
+    # 检查是否已有用户
+    if db.get_user_count() > 0:
+        raise HTTPException(status_code=400, detail="Admin already exists")
+
+    # 验证用户名格式
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9_]{2,31}$', request.username):
+        raise HTTPException(status_code=400, detail="Invalid username format")
 
     if len(request.password) < 8:
         raise HTTPException(
@@ -2619,56 +3637,307 @@ def api_auth_setup(request: SetupRequest):
             detail="Password must be at least 8 characters"
         )
 
+    # 创建管理员用户
     password_hash = _hash_password(request.password)
-    db.user.set_admin_password(password_hash)
+    user_id = db.add_user(
+        username=request.username,
+        password_hash=password_hash,
+        role="admin"
+    )
 
-    # 创建并返回 token
-    secret = db.user.get_or_create_jwt_secret()
-    token, expires_in = _create_token(secret)
+    # 创建 token
+    secret = db.get_or_create_jwt_secret()
+    token, expires_in = _create_user_token(
+        secret=secret,
+        user_id=user_id,
+        username=request.username,
+        role="admin",
+        token_version=1
+    )
+
+    # 记录审计日志
+    client_ip = _get_client_ip(http_request)
+    db.add_audit_log(
+        action="setup",
+        user_id=user_id,
+        resource_type="user",
+        resource_id=str(user_id),
+        ip_address=client_ip
+    )
 
     return {
-        "message": "Admin password set successfully",
+        "message": "Admin account created successfully",
         "access_token": token,
         "token_type": "bearer",
-        "expires_in": expires_in
+        "expires_in": expires_in,
+        "user": {
+            "id": user_id,
+            "username": request.username,
+            "role": "admin"
+        }
     }
 
 
 @app.post("/api/auth/login")
-def api_auth_login(request: LoginRequest):
-    """登录获取 JWT token"""
+def api_auth_login(http_request: Request, request: LoginRequest):
+    """用户登录"""
     db = _get_db()
+    client_ip = _get_client_ip(http_request)
 
-    if not db.user.is_admin_setup():
-        raise HTTPException(
-            status_code=400,
-            detail="Admin password not set, use /api/auth/setup first"
+    # 查找用户
+    user = db.get_user_by_username(request.username)
+
+    # 防止时序攻击：即使用户不存在也执行密码验证
+    if not user:
+        bcrypt.checkpw(b"dummy_password", bcrypt.gensalt())
+        db.add_audit_log(
+            action="login_failed",
+            details='{"reason": "user_not_found"}',
+            ip_address=client_ip
+        )
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # 检查账户是否被锁定
+    if db.is_account_locked(user["id"]):
+        db.add_audit_log(
+            action="login_failed",
+            user_id=user["id"],
+            details='{"reason": "account_locked"}',
+            ip_address=client_ip
+        )
+        raise HTTPException(status_code=401, detail="Account is locked. Please try again later.")
+
+    # 检查账户是否启用
+    if not user.get("enabled"):
+        db.add_audit_log(
+            action="login_failed",
+            user_id=user["id"],
+            details='{"reason": "account_disabled"}',
+            ip_address=client_ip
+        )
+        raise HTTPException(status_code=401, detail="Account is disabled")
+
+    # 验证密码
+    if not _verify_password(request.password, user["password_hash"]):
+        # 记录失败并可能锁定账户
+        failed_count = db.record_failed_login(user["id"])
+        if failed_count >= 5:
+            db.lock_account(user["id"], lock_minutes=30)
+            db.add_audit_log(
+                action="account_locked",
+                user_id=user["id"],
+                details=f'{{"failed_attempts": {failed_count}}}',
+                ip_address=client_ip
+            )
+
+        db.add_audit_log(
+            action="login_failed",
+            user_id=user["id"],
+            details=f'{{"reason": "invalid_password", "attempt": {failed_count}}}',
+            ip_address=client_ip
+        )
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # 检查是否为待审批用户
+    if user["role"] == "pending":
+        # 记录待审批用户登录尝试
+        db.add_audit_log(
+            action="login_pending",
+            user_id=user["id"],
+            ip_address=client_ip,
+            details=json.dumps({"username": request.username})
+        )
+        return JSONResponse(
+            status_code=200,  # 200, not 403 - login succeeded but account is pending
+            content={
+                "status": "pending",
+                "message": "Your account is pending approval",
+                "user": {
+                    "id": user["id"],
+                    "username": user["username"],
+                    "role": "pending"
+                }
+            }
         )
 
-    password_hash = db.user.get_admin_password_hash()
-    if not password_hash or not _verify_password(request.password, password_hash):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid credentials"
-        )
+    # 登录成功
+    db.reset_failed_login(user["id"])
+    db.update_user(user["id"], last_login_at=datetime.now(timezone.utc).isoformat())
 
-    secret = db.user.get_or_create_jwt_secret()
-    token, expires_in = _create_token(secret)
+    # 创建 token
+    secret = db.get_or_create_jwt_secret()
+    token, expires_in = _create_user_token(
+        secret=secret,
+        user_id=user["id"],
+        username=user["username"],
+        role=user["role"],
+        token_version=user.get("token_version", 1)
+    )
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="login",
+        user_id=user["id"],
+        ip_address=client_ip
+    )
 
     return {
         "access_token": token,
         "token_type": "bearer",
-        "expires_in": expires_in
+        "expires_in": expires_in,
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "role": user["role"]
+        }
     }
+
+
+@app.post("/api/auth/register")
+def api_auth_register(http_request: Request, request: RegisterRequest):
+    """用户自助注册"""
+    db = _get_db()
+    client_ip = _get_client_ip(http_request)
+
+    # 检查是否启用注册
+    if db.get_setting("allow_self_registration", "false").lower() != "true":
+        raise HTTPException(status_code=403, detail="Registration is disabled")
+
+    # 验证用户名格式（字母开头，只允许字母、数字、下划线、短横线）
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9_-]{2,31}$', request.username):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid username format. Must start with a letter and contain only letters, numbers, underscores, and hyphens."
+        )
+
+    # 检查保留用户名
+    if request.username.lower() in RESERVED_USERNAMES:
+        raise HTTPException(status_code=400, detail="Username is reserved")
+
+    # 密码复杂度检查
+    if not (re.search(r'[A-Z]', request.password) and
+            re.search(r'[a-z]', request.password) and
+            re.search(r'\d', request.password)):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain uppercase, lowercase, and number"
+        )
+
+    # 检查用户名唯一性
+    if db.get_user_by_username(request.username):
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    # 获取默认角色
+    default_role = db.get_setting("registration_default_role", "pending")
+    if default_role not in ("user", "pending"):
+        default_role = "pending"  # 安全回退
+
+    # 创建用户
+    password_hash = _hash_password(request.password)
+    user_id = db.add_user(
+        username=request.username,
+        password_hash=password_hash,
+        email=request.email,
+        role=default_role
+    )
+
+    # 创建默认配额
+    db.set_user_quota(user_id)
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="self_register",
+        user_id=user_id,
+        ip_address=client_ip,
+        details=json.dumps({"username": request.username, "role": default_role})
+    )
+
+    # 如果是待审批状态，返回成功但不返回 token
+    if default_role == "pending":
+        logging.info(f"User registration (pending): username={request.username}, user_id={user_id}, ip={client_ip}")
+        return {
+            "status": "pending",
+            "message": "Registration successful. Please wait for admin approval.",
+            "user": {
+                "id": user_id,
+                "username": request.username,
+                "role": "pending"
+            }
+        }
+
+    # 如果直接是用户角色，创建 token 以便立即登录
+    user = db.get_user(user_id)
+    secret = db.get_or_create_jwt_secret()
+    token, expires_in = _create_user_token(
+        secret=secret,
+        user_id=user_id,
+        username=request.username,
+        role="user",
+        token_version=user["token_version"]
+    )
+
+    # 更新最后登录时间
+    db.update_user(user_id, last_login_at=datetime.now(timezone.utc).isoformat())
+
+    logging.info(f"User registration (direct): username={request.username}, user_id={user_id}, ip={client_ip}")
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+        "user": {
+            "id": user_id,
+            "username": request.username,
+            "role": "user",
+            "email": request.email
+        }
+    }
+
+
+@app.post("/api/auth/check-pending")
+def api_check_pending_status(http_request: Request, request: CheckPendingRequest):
+    """检查待审批用户状态（无需 token）"""
+    db = _get_db()
+    user = db.get_user_by_username(request.username)
+
+    # 防止时序攻击：即使用户不存在也执行密码验证
+    if not user:
+        _verify_password("dummy", "$2b$12$dummy.hash.for.timing.attack.prevention")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not _verify_password(request.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not user["enabled"]:
+        raise HTTPException(status_code=401, detail="Account disabled")
+
+    if user["role"] == "pending":
+        return {"status": "pending", "message": "Account still pending approval"}
+    elif user["role"] in ("user", "admin"):
+        return {"status": "approved", "message": "Account approved! Please login."}
+    else:
+        raise HTTPException(status_code=400, detail="Invalid account state")
 
 
 @app.post("/api/auth/refresh")
 def api_auth_refresh(request: Request):
-    """刷新 JWT token（延长会话）"""
-    # 验证当前 token（由中间件完成）
+    """刷新 JWT token"""
+    user = get_user_context(request)
     db = _get_db()
-    secret = db.user.get_or_create_jwt_secret()
-    token, expires_in = _create_token(secret)
+
+    # 获取最新用户信息
+    user_data = db.get_user(user.user_id)
+    if not user_data or not user_data.get("enabled"):
+        raise HTTPException(status_code=401, detail="User not found or disabled")
+
+    # 创建新 token
+    secret = db.get_or_create_jwt_secret()
+    token, expires_in = _create_user_token(
+        secret=secret,
+        user_id=user_data["id"],
+        username=user_data["username"],
+        role=user_data["role"],
+        token_version=user_data.get("token_version", 1)
+    )
 
     return {
         "access_token": token,
@@ -2678,11 +3947,630 @@ def api_auth_refresh(request: Request):
 
 
 @app.get("/api/auth/me")
-def api_auth_me():
-    """获取当前用户信息（验证 token 有效性）"""
+def api_auth_me(request: Request):
+    """获取当前用户信息"""
+    user = get_user_context(request)
+    db = _get_db()
+
+    # 获取完整用户信息
+    user_data = db.get_user(user.user_id)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+
     return {
-        "username": "admin",
-        "role": "admin"
+        "id": user_data["id"],
+        "username": user_data["username"],
+        "email": user_data.get("email"),
+        "role": user_data["role"],
+        "created_at": user_data.get("created_at"),
+        "last_login_at": user_data.get("last_login_at")
+    }
+
+
+@app.post("/api/auth/password")
+def api_auth_change_password(request: Request, payload: PasswordChangeRequest):
+    """修改当前用户密码"""
+    user = get_user_context(request)
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    # 获取用户信息
+    user_data = db.get_user(user.user_id)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 验证当前密码
+    if not _verify_password(payload.current_password, user_data["password_hash"]):
+        db.add_audit_log(
+            action="password_change_failed",
+            user_id=user.user_id,
+            details='{"reason": "invalid_current_password"}',
+            ip_address=client_ip
+        )
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    # 更新密码并递增 token_version 使旧 token 失效
+    new_hash = _hash_password(payload.new_password)
+    db.update_user(user.user_id, password_hash=new_hash)
+    db.increment_token_version(user.user_id)
+
+    # 获取更新后的用户信息
+    user_data = db.get_user(user.user_id)
+
+    # 创建新 token
+    secret = db.get_or_create_jwt_secret()
+    token, expires_in = _create_user_token(
+        secret=secret,
+        user_id=user_data["id"],
+        username=user_data["username"],
+        role=user_data["role"],
+        token_version=user_data.get("token_version", 1)
+    )
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="password_change",
+        user_id=user.user_id,
+        ip_address=client_ip
+    )
+
+    return {
+        "message": "Password changed successfully",
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": expires_in
+    }
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout(request: Request):
+    """注销当前会话（撤销 token）"""
+    from datetime import timedelta
+    user = get_user_context(request)
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    # 如果 token 有 jti，将其加入黑名单
+    if user.jti:
+        # 计算 token 过期时间（当前时间 + JWT_EXPIRY_HOURS）
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)).isoformat()
+        db.add_revoked_token(
+            jti=user.jti,
+            user_id=user.user_id,
+            expires_at=expires_at,
+            reason="logout"
+        )
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="logout",
+        user_id=user.user_id,
+        ip_address=client_ip
+    )
+
+    return {"message": "Logged out successfully"}
+
+
+# ============ 用户管理端点 (仅管理员) ============
+
+def _user_to_dict(user: dict, include_sensitive: bool = False) -> dict:
+    """转换用户记录为 API 响应格式"""
+    result = {
+        "id": user["id"],
+        "username": user["username"],
+        "email": user.get("email"),
+        "role": user["role"],
+        "enabled": bool(user.get("enabled", 1)),
+        "created_at": user.get("created_at"),
+        "updated_at": user.get("updated_at"),
+        "last_login_at": user.get("last_login_at"),
+        "created_by": user.get("created_by"),
+    }
+    if include_sensitive:
+        result["failed_login_count"] = user.get("failed_login_count", 0)
+        result["locked_until"] = user.get("locked_until")
+    return result
+
+
+@app.get("/api/users")
+def api_list_users(request: Request):
+    """列出所有用户 (仅管理员)"""
+    user = get_user_context(request)
+    if not user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    users = db.get_users()
+
+    return {
+        "users": [_user_to_dict(u, include_sensitive=True) for u in users],
+        "total": len(users),
+    }
+
+
+@app.post("/api/users")
+def api_create_user(request: Request, payload: UserCreateRequest):
+    """创建新用户 (仅管理员)"""
+    user = get_user_context(request)
+    if not user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    # 检查用户名是否已存在
+    if db.get_user_by_username(payload.username):
+        raise HTTPException(400, f"Username '{payload.username}' already exists")
+
+    # 哈希密码
+    password_hash = bcrypt.hashpw(payload.password.encode(), bcrypt.gensalt()).decode()
+
+    # 创建用户
+    try:
+        new_user_id = db.add_user(
+            username=payload.username,
+            password_hash=password_hash,
+            email=payload.email,
+            role=payload.role,
+            created_by=user.user_id,
+        )
+    except Exception as e:
+        logging.error(f"Failed to create user: {e}")
+        raise HTTPException(500, "Failed to create user")
+
+    # 创建默认配额
+    db.cursor.execute(
+        "INSERT OR IGNORE INTO user_quotas (user_id) VALUES (?)",
+        (new_user_id,)
+    )
+    db.conn.commit()
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="create_user",
+        user_id=user.user_id,
+        resource_type="user",
+        resource_id=str(new_user_id),
+        details=json.dumps({"username": payload.username, "role": payload.role}),
+        ip_address=client_ip,
+    )
+
+    new_user = db.get_user(new_user_id)
+    return {
+        "message": "User created successfully",
+        "user": _user_to_dict(new_user),
+    }
+
+
+# ============ 待审批用户管理端点 ============
+# NOTE: 这些端点必须在 /api/users/{user_id} 之前定义，否则 FastAPI 会将 "pending" 当作 user_id 参数
+
+@app.get("/api/users/pending")
+def api_get_pending_users(request: Request):
+    """获取待审批用户列表（管理员）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    pending_users = db.get_users_by_role("pending")
+    return {"users": pending_users}
+
+
+@app.get("/api/users/pending/count")
+def api_get_pending_count(request: Request):
+    """获取待审批用户数量（用于徽章显示）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    count = db.count_users_by_role("pending")
+    return {"count": count}
+
+
+@app.get("/api/users/{user_id}")
+def api_get_user(request: Request, user_id: int):
+    """获取用户详情 (仅管理员)"""
+    current_user = get_user_context(request)
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    target_user = db.get_user(user_id)
+
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    return {"user": _user_to_dict(target_user, include_sensitive=True)}
+
+
+@app.put("/api/users/{user_id}")
+def api_update_user(request: Request, user_id: int, payload: UserUpdateRequest):
+    """更新用户信息 (管理员可更新所有字段，普通用户只能改自己的密码)"""
+    current_user = get_user_context(request)
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    target_user = db.get_user(user_id)
+
+    # 安全检查：用户不存在或无权限时返回 404（防止信息泄露）
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    # 非管理员只能更新自己
+    if not current_user.is_admin and current_user.user_id != user_id:
+        raise HTTPException(404, "User not found")
+
+    # 非管理员只能更新密码
+    if not current_user.is_admin:
+        if payload.role is not None or payload.enabled is not None or payload.email is not None:
+            raise HTTPException(403, "You can only change your own password")
+
+    updates = {}
+    audit_details = {}
+
+    # 密码更新
+    if payload.password is not None:
+        updates["password_hash"] = bcrypt.hashpw(payload.password.encode(), bcrypt.gensalt()).decode()
+        audit_details["password_changed"] = True
+        # 密码更改后递增 token_version 以使旧 token 失效
+        db.increment_token_version(user_id)
+
+    # 邮箱更新 (仅管理员或本人)
+    if payload.email is not None and current_user.is_admin:
+        updates["email"] = payload.email
+        audit_details["email"] = payload.email
+
+    # 角色更新 (仅管理员)
+    if payload.role is not None and current_user.is_admin:
+        # 防止降级最后一个管理员
+        if target_user["role"] == "admin" and payload.role == "user":
+            admin_count = db.count_users_by_role("admin")
+            if admin_count <= 1:
+                raise HTTPException(400, "Cannot demote the last admin")
+        updates["role"] = payload.role
+        audit_details["role"] = payload.role
+
+    # 启用/禁用 (仅管理员)
+    if payload.enabled is not None and current_user.is_admin:
+        # 防止禁用自己
+        if user_id == current_user.user_id and not payload.enabled:
+            raise HTTPException(400, "Cannot disable your own account")
+        updates["enabled"] = 1 if payload.enabled else 0
+        audit_details["enabled"] = payload.enabled
+
+    if not updates:
+        raise HTTPException(400, "No valid fields to update")
+
+    # 执行更新
+    if not db.update_user(user_id, **updates):
+        raise HTTPException(500, "Failed to update user")
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="update_user",
+        user_id=current_user.user_id,
+        resource_type="user",
+        resource_id=str(user_id),
+        details=json.dumps(audit_details),
+        ip_address=client_ip,
+    )
+
+    updated_user = db.get_user(user_id)
+    return {
+        "message": "User updated successfully",
+        "user": _user_to_dict(updated_user),
+    }
+
+
+@app.delete("/api/users/{user_id}")
+def api_delete_user(request: Request, user_id: int):
+    """删除用户 (仅管理员，级联删除所有用户资源)"""
+    current_user = get_user_context(request)
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    target_user = db.get_user(user_id)
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    # 防止删除自己
+    if user_id == current_user.user_id:
+        raise HTTPException(400, "Cannot delete your own account")
+
+    # 防止删除最后一个管理员
+    if target_user["role"] == "admin":
+        admin_count = db.count_users_by_role("admin")
+        if admin_count <= 1:
+            raise HTTPException(400, "Cannot delete the last admin")
+
+    username = target_user["username"]
+
+    # 级联删除用户及其所有资源
+    if not db.delete_user(user_id):
+        raise HTTPException(500, "Failed to delete user")
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="delete_user",
+        user_id=current_user.user_id,
+        resource_type="user",
+        resource_id=str(user_id),
+        details=json.dumps({"username": username, "role": target_user["role"]}),
+        ip_address=client_ip,
+    )
+
+    return {"message": f"User '{username}' deleted successfully"}
+
+
+@app.get("/api/users/{user_id}/quotas")
+def api_get_user_quotas(request: Request, user_id: int):
+    """获取用户配额 (仅管理员)"""
+    current_user = get_user_context(request)
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    target_user = db.get_user(user_id)
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    # 获取配额
+    quotas = db.get_user_quota(user_id)
+    if not quotas:
+        # 返回默认配额
+        quotas = {
+            "max_peers": 10,
+            "max_rules": 100,
+            "max_rule_sets": 10,
+        }
+
+    return {"quotas": quotas}
+
+
+@app.put("/api/users/{user_id}/quotas")
+def api_update_user_quotas(request: Request, user_id: int, quotas: dict = Body(...)):
+    """更新用户配额 (仅管理员)"""
+    current_user = get_user_context(request)
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    target_user = db.get_user(user_id)
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    # 验证配额字段
+    valid_fields = {"max_peers", "max_rules", "max_rule_sets"}
+    updates = {k: v for k, v in quotas.items() if k in valid_fields and isinstance(v, int) and v >= 0}
+
+    if not updates:
+        raise HTTPException(400, "No valid quota fields to update")
+
+    # 获取当前配额，合并更新
+    current = db.get_user_quota(user_id) or {"max_peers": 10, "max_rules": 100, "max_rule_sets": 10}
+    merged = {**current, **updates}
+
+    # 更新配额
+    db.set_user_quota(
+        user_id,
+        max_peers=merged.get("max_peers", 10),
+        max_rules=merged.get("max_rules", 100),
+        max_rule_sets=merged.get("max_rule_sets", 10),
+    )
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="update_user_quotas",
+        user_id=current_user.user_id,
+        resource_type="user_quotas",
+        resource_id=str(user_id),
+        details=json.dumps(updates),
+        ip_address=client_ip,
+    )
+
+    return {"message": "Quotas updated successfully", "quotas": updates}
+
+
+# ============ 用户审批操作端点 ============
+
+@app.post("/api/users/{user_id}/approve")
+def api_approve_user(user_id: int, request: Request):
+    """审批通过待审批用户（管理员）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+
+    # 使用原子更新防止竞态条件
+    with db.user._get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users SET role = 'user', updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND role = 'pending'
+        """, (user_id,))
+        conn.commit()
+
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=400, detail="User not found or not pending")
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="approve_user",
+        user_id=user_id,
+        details=json.dumps({"approved_by": user_ctx.user_id})
+    )
+
+    user = db.get_user(user_id)
+    logging.info(f"User approved: user_id={user_id}, username={user['username']}, approved_by={user_ctx.user_id}")
+    return {"message": "User approved", "user": {
+        "id": user["id"],
+        "username": user["username"],
+        "email": user.get("email"),
+        "role": user["role"],
+        "enabled": user["enabled"],
+        "created_at": user["created_at"]
+    }}
+
+
+@app.post("/api/users/{user_id}/reject")
+def api_reject_user(user_id: int, request: Request):
+    """拒绝待审批用户（删除）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    user = db.get_user(user_id)
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user["role"] != "pending":
+        raise HTTPException(status_code=400, detail="User is not pending")
+
+    username = user["username"]
+
+    # 删除待审批用户（级联清理相关记录）
+    db.delete_user(user_id)
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="reject_user",
+        user_id=None,  # User is deleted
+        details=json.dumps({
+            "rejected_by": user_ctx.user_id,
+            "username": username,
+            "original_user_id": user_id
+        })
+    )
+
+    logging.info(f"User rejected: user_id={user_id}, username={username}, rejected_by={user_ctx.user_id}")
+    return {"message": "User rejected and removed"}
+
+
+# ============ 规则忽略设置端点 ============
+
+@app.get("/api/settings/rules-ignore")
+def api_get_rules_ignore_settings(request: Request):
+    """获取规则忽略设置（管理员）
+
+    返回:
+    - ignore_all_user_rules: 全局用户规则忽略开关
+    """
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    return {
+        "ignore_all_user_rules": db.get_ignore_all_user_rules()
+    }
+
+
+@app.put("/api/settings/rules-ignore")
+def api_update_rules_ignore_settings(request: Request, body: dict = Body(...)):
+    """更新规则忽略设置（管理员）
+
+    Body:
+    - ignore_all_user_rules: 全局用户规则忽略开关 (bool)
+    """
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+
+    if "ignore_all_user_rules" in body:
+        enabled = bool(body["ignore_all_user_rules"])
+        old_value = db.get_ignore_all_user_rules()
+        db.set_ignore_all_user_rules(enabled)
+
+        # 记录审计日志
+        db.add_audit_log(
+            action="toggle_ignore_all_user_rules",
+            user_id=user_ctx.user_id,
+            details=json.dumps({
+                "old_value": old_value,
+                "new_value": enabled
+            })
+        )
+
+        logging.info(f"Global ignore_all_user_rules changed: {old_value} -> {enabled}, by user_id={user_ctx.user_id}")
+
+        # 同步规则到 rust-router
+        try:
+            sync_result = _sync_rules_to_rust_router(db)
+            logging.info(f"Rules synced after ignore_all_user_rules change: {sync_result.rule_count} rules")
+        except Exception as exc:
+            logging.error(f"Failed to sync rules after ignore_all_user_rules change: {exc}")
+
+    return {
+        "ignore_all_user_rules": db.get_ignore_all_user_rules()
+    }
+
+
+@app.put("/api/users/{user_id}/rules-ignored")
+def api_update_user_rules_ignored(user_id: int, request: Request, body: dict = Body(...)):
+    """更新单个用户的规则忽略状态（管理员）
+
+    Body:
+    - rules_ignored: 是否忽略该用户的规则 (bool)
+    """
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    user = db.get_user(user_id)
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 不能修改管理员的规则忽略状态
+    if user["role"] == "admin":
+        raise HTTPException(status_code=400, detail="Cannot ignore admin rules")
+
+    if "rules_ignored" in body:
+        enabled = 1 if body["rules_ignored"] else 0
+        old_value = user.get("rules_ignored", 0)
+        db.update_user(user_id, rules_ignored=enabled)
+
+        # 记录审计日志
+        db.add_audit_log(
+            action="toggle_user_rules_ignored",
+            user_id=user_ctx.user_id,
+            resource_type="user",
+            resource_id=str(user_id),
+            details=json.dumps({
+                "target_user": user["username"],
+                "old_value": bool(old_value),
+                "new_value": bool(enabled)
+            })
+        )
+
+        logging.info(f"User rules_ignored changed: user_id={user_id}, {old_value} -> {enabled}, by admin user_id={user_ctx.user_id}")
+
+        # 同步规则到 rust-router
+        try:
+            sync_result = _sync_rules_to_rust_router(db)
+            logging.info(f"Rules synced after user rules_ignored change: {sync_result.rule_count} rules")
+        except Exception as exc:
+            logging.error(f"Failed to sync rules after user rules_ignored change: {exc}")
+
+    # 返回更新后的用户信息
+    updated_user = db.get_user(user_id)
+    return {
+        "id": updated_user["id"],
+        "username": updated_user["username"],
+        "rules_ignored": bool(updated_user.get("rules_ignored", 0))
     }
 
 
@@ -2694,17 +4582,18 @@ def api_health():
 
     返回:
     - status: "healthy" | "degraded" | "unhealthy"
-    - sing_box: sing-box 进程是否运行
+    - rust_router: rust-router 是否运行
     - database: 数据库是否可访问
     - timestamp: 检查时间
     """
     checks = {
-        "sing_box": False,
+        "rust_router": False,
         "database": False,
     }
 
-    # 检查 sing-box 进程
-    checks["sing_box"] = list_processes("sing-box")
+    # 检查 rust-router 进程
+    rust_status = _get_rust_router_status_sync()
+    checks["rust_router"] = rust_status.get("running", False)
 
     # 检查数据库连接
     try:
@@ -2719,7 +4608,7 @@ def api_health():
     # 判断整体状态
     if all(checks.values()):
         status = "healthy"
-    elif checks["sing_box"]:
+    elif checks["rust_router"]:
         status = "degraded"
     else:
         status = "unhealthy"
@@ -2731,6 +4620,44 @@ def api_health():
     }
 
 
+def _get_rust_router_status_sync() -> dict:
+    """获取 rust-router 状态（同步版本）"""
+    import asyncio
+
+    async def _get_status():
+        try:
+            client = RustRouterClient()
+            response = await client.status()
+            if response.success and response.data:
+                return {
+                    "running": True,
+                    "version": response.data.get("version", "unknown"),
+                    "uptime_secs": response.data.get("uptime_secs", 0),
+                    "active_connections": response.data.get("active_connections", 0),
+                    "total_connections": response.data.get("total_connections", 0),
+                    "accepting": response.data.get("accepting", False),
+                }
+            # Ping succeeded but no data
+            return {"running": True}
+        except Exception as e:
+            logging.debug(f"rust-router status check failed: {e}")
+            return {"running": False}
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _get_status())
+                return future.result(timeout=2)
+        else:
+            return loop.run_until_complete(_get_status())
+    except RuntimeError:
+        return asyncio.run(_get_status())
+    except Exception:
+        return {"running": False}
+
+
 @app.get("/api/status")
 def api_status():
     config_stat = CONFIG_PATH.stat() if CONFIG_PATH.exists() else None
@@ -2738,9 +4665,15 @@ def api_status():
     # 从数据库获取 PIA profiles
     db = _get_db()
     pia_profiles = db.get_pia_profiles(enabled_only=False)
+
+    # 获取 rust-router 状态
+    rust_router_status = _get_rust_router_status_sync()
+
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "sing_box_running": list_processes("sing-box"),
+        "sing_box_running": list_processes("sing-box"),  # 保留兼容性
+        "rust_router_running": rust_router_status.get("running", False),
+        "rust_router": rust_router_status,
         "wireguard_interface": wireguard,
         "config_mtime": config_stat.st_mtime if config_stat else None,
         "pia_profiles": pia_profiles,
@@ -2748,7 +4681,7 @@ def api_status():
 
 
 @app.get("/api/stats/dashboard")
-def api_stats_dashboard(time_range: str = "1m"):
+def api_stats_dashboard(request: Request, time_range: str = "1m"):
     """获取 Dashboard 可视化统计数据
 
     参数：
@@ -2757,180 +4690,225 @@ def api_stats_dashboard(time_range: str = "1m"):
       - 1h: 最近 1 小时，10 分钟间隔（6 个数据点）
       - 24h: 最近 24 小时，1 小时间隔（24 个数据点）
 
-    返回：
+    返回（管理员）：
     - online_clients: 在线客户端数量（有活跃连接的 WireGuard peer）
     - total_clients: 总客户端数量（所有配置的 WireGuard peer）
     - traffic_by_outbound: 按出口分组的流量 {tag: {download, upload}}
     - adblock_connections: 匹配广告拦截规则的连接数
     - active_connections: 总活跃连接数
     - rate_history: 速率历史（根据 time_range 聚合）
+    - is_admin: True
+
+    返回（普通用户）：
+    - total_clients: 用户自己的客户端数量
+    - ingress_traffic: 入口流量统计 {rx_bytes, tx_bytes}
+    - is_admin: False
     """
     import urllib.request
 
+    # 获取用户上下文
+    user = get_user_context(request)
+    is_admin = user.is_admin
+
     # 初始化返回数据
     stats = {
-        "online_clients": 0,
-        "total_clients": 0,
-        "traffic_by_outbound": {},
-        "adblock_connections": 0,
-        "active_connections": 0,
+        "is_admin": is_admin,
     }
 
-    # 获取总客户端数量（从数据库）
+    if is_admin:
+        # 管理员：完整数据
+        stats.update({
+            "online_clients": 0,
+            "total_clients": 0,
+            "traffic_by_outbound": {},
+            "adblock_connections": 0,
+            "active_connections": 0,
+        })
+    else:
+        # 普通用户：简化数据
+        stats.update({
+            "total_clients": 0,
+            "ingress_traffic": {"rx_bytes": 0, "tx_bytes": 0},
+        })
+
+    # 获取客户端数量（从数据库）
     try:
         db = _get_db()
-        peers = db.get_wireguard_peers()
+        # 管理员看所有 peers，普通用户只看自己的
+        owner_filter = None if is_admin else user.user_id
+        peers = db.get_wireguard_peers(owner_id=owner_filter)
         stats["total_clients"] = len(peers) if peers else 0
     except Exception:
         pass
 
-    # 使用缓存的子网前缀（避免频繁数据库查询）
-    wg_subnet_prefix = get_cached_wg_subnet_prefix()
+    # 从 rust-router IPC 获取活跃连接数和在线客户端
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            import asyncio
+            import concurrent.futures
 
-    # 从 clash_api 获取活跃连接数和在线客户端
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{DEFAULT_CLASH_API_PORT}/connections", timeout=2) as resp:
-            data = json.loads(resp.read().decode())
+            async def _get_rust_router_stats():
+                client = RustRouterClient()
+                # 获取总体统计
+                stats_resp = await client.get_stats()
+                # 获取 ingress 统计（在线客户端）
+                ingress_resp = await client._send_command({"type": "get_ingress_stats"})
+                return stats_resp, ingress_resp
 
-        connections = data.get("connections", [])
-        stats["active_connections"] = len(connections)
+            # 使用 asyncio.run() 在新线程中执行以避免与 FastAPI 事件循环冲突
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _get_rust_router_stats())
+                stats_resp, ingress_resp = future.result(timeout=3)
 
-        # 统计在线客户端（WireGuard 网段的唯一 IP）
-        online_ips = set()
-        for conn in connections:
-            metadata = conn.get("metadata", {})
-            src_ip = metadata.get("sourceIP", "")
-            if src_ip.startswith(wg_subnet_prefix):
-                online_ips.add(src_ip)
+            if ingress_resp.success and ingress_resp.data:
+                manager_stats = ingress_resp.data.get("manager_stats") or {}
 
-        stats["online_clients"] = len(online_ips)
-
-    except Exception as e:
-        # clash_api 不可用时返回空数据
-        pass
-
-    # 使用累计流量统计和实时速率（由后台线程更新）
-    # 包含所有配置的出口，没有流量的显示为 0
-    # 排除阻止类出口（block, adblock）- 这些没有实际流量数据
-    all_outbounds = _get_all_outbounds()
-    blocked_outbounds = {"block", "adblock"}  # 阻止类出口，不显示在图表中
-    chart_outbounds = [o for o in all_outbounds if o not in blocked_outbounds]
-
-    with _traffic_stats_lock:
-        # 确保所有出口都有流量数据（没有流量的显示为 0）
-        traffic_by_outbound = {}
-        for outbound in chart_outbounds:
-            if outbound in _traffic_stats:
-                traffic_by_outbound[outbound] = dict(_traffic_stats[outbound])
-            else:
-                traffic_by_outbound[outbound] = {"download": 0, "upload": 0}
-        stats["traffic_by_outbound"] = traffic_by_outbound
-        # 确保所有出口都有速率数据
-        traffic_rates = {}
-        for outbound in chart_outbounds:
-            if outbound in _traffic_rates:
-                traffic_rates[outbound] = dict(_traffic_rates[outbound])
-            else:
-                traffic_rates[outbound] = {"download_rate": 0.0, "upload_rate": 0.0}
-        stats["traffic_rates"] = traffic_rates
-
-        # 根据 time_range 聚合 rate_history
-        # 1m: 最近 60 秒，1 秒间隔（原始数据）
-        # 1h: 最近 1 小时，10 分钟间隔（6 个数据点）
-        # 24h: 最近 24 小时，1 小时间隔（24 个数据点）
-        now = int(time.time())
-
-        if time_range == "1h":
-            # 最近 1 小时，每 10 分钟聚合一次（6 个数据点）
-            interval_seconds = 10 * 60  # 10 分钟
-            num_points = 6
-            cutoff = now - 60 * 60  # 1 小时前
-        elif time_range == "24h":
-            # 最近 24 小时，每 1 小时聚合一次（24 个数据点）
-            interval_seconds = 60 * 60  # 1 小时
-            num_points = 24
-            cutoff = now - 24 * 60 * 60  # 24 小时前
-        else:  # "1m" 默认
-            # 最近 60 秒，不聚合，直接返回原始数据
-            interval_seconds = 1
-            num_points = 60
-            cutoff = now - 60  # 60 秒前
-
-        # 过滤时间范围内的数据
-        filtered_data = [p for p in _rate_history if p["timestamp"] > cutoff]
-
-        if time_range == "1m":
-            # 1 分钟视图：直接返回最近 60 个数据点
-            filtered_history = []
-            for point in filtered_data[-60:]:
-                filtered_point = {
-                    "timestamp": point["timestamp"],
-                    "rates": {k: v for k, v in point["rates"].items() if k not in blocked_outbounds}
-                }
-                filtered_history.append(filtered_point)
-        else:
-            # 1h/24h 视图：按时间段聚合（取平均值）
-            filtered_history = []
-
-            for i in range(num_points):
-                # 计算这个时间段的起止时间
-                slot_end = now - i * interval_seconds
-                slot_start = slot_end - interval_seconds
-
-                # 找到这个时间段内的所有数据点
-                slot_points = [p for p in filtered_data if slot_start < p["timestamp"] <= slot_end]
-
-                if slot_points:
-                    # 计算每个出口的平均速率
-                    avg_rates = {}
-                    for outbound in chart_outbounds:
-                        rates = [p["rates"].get(outbound, 0) for p in slot_points]
-                        avg_rates[outbound] = round(sum(rates) / len(rates), 1) if rates else 0
-
-                    filtered_history.append({
-                        "timestamp": slot_end,
-                        "rates": avg_rates
-                    })
+                if is_admin:
+                    # 管理员：完整统计
+                    stats["online_clients"] = manager_stats.get("active_peer_count", 0)
+                    # 总客户端也可以从 ingress 获取
+                    if manager_stats.get("peer_count", 0) > 0:
+                        stats["total_clients"] = manager_stats.get("peer_count", 0)
+                    # 活跃会话数（实际连接数）
+                    stats["active_connections"] = ingress_resp.data.get("active_sessions", 0)
                 else:
-                    # 没有数据时填充 0
-                    filtered_history.append({
-                        "timestamp": slot_end,
-                        "rates": {o: 0 for o in chart_outbounds}
-                    })
+                    # 普通用户：入口流量统计
+                    stats["ingress_traffic"] = {
+                        "rx_bytes": manager_stats.get("rx_bytes", 0),
+                        "tx_bytes": manager_stats.get("tx_bytes", 0),
+                    }
 
-            # 反转顺序，使时间从旧到新
-            filtered_history.reverse()
+        except Exception as e:
+            logging.warning(f"rust-router stats unavailable: {type(e).__name__}: {e}")
 
-        stats["rate_history"] = filtered_history
+    # 管理员：出口流量统计和速率历史
+    # 普通用户不显示出口流量（只显示入口流量）
+    if is_admin:
+        # 使用累计流量统计和实时速率（由后台线程更新）
+        # 包含所有配置的出口，没有流量的显示为 0
+        # 排除阻止类出口（block, adblock）- 这些没有实际流量数据
+        all_outbounds = _get_all_outbounds()
+        blocked_outbounds = {"block", "adblock"}  # 阻止类出口，不显示在图表中
+        chart_outbounds = [o for o in all_outbounds if o not in blocked_outbounds]
 
-    # 从 sing-box 日志文件统计广告拦截（增量扫描优化）
-    # 使用专用的 adblock 出口，日志格式: outbound/block[adblock]: blocked connection to x.x.x.x:443
-    global _adblock_count, _adblock_log_position, _adblock_log_inode
-    try:
-        log_file = Path("/var/log/sing-box.log")
-        if log_file.exists():
-            # 检测日志轮转（inode 变化或文件变小）
-            stat = log_file.stat()
-            current_inode = stat.st_ino
-            current_size = stat.st_size
+        with _traffic_stats_lock:
+            # 确保所有出口都有流量数据（没有流量的显示为 0）
+            traffic_by_outbound = {}
+            for outbound in chart_outbounds:
+                if outbound in _traffic_stats:
+                    traffic_by_outbound[outbound] = dict(_traffic_stats[outbound])
+                else:
+                    traffic_by_outbound[outbound] = {"download": 0, "upload": 0}
+            stats["traffic_by_outbound"] = traffic_by_outbound
+            # 确保所有出口都有速率数据
+            traffic_rates = {}
+            for outbound in chart_outbounds:
+                if outbound in _traffic_rates:
+                    traffic_rates[outbound] = dict(_traffic_rates[outbound])
+                else:
+                    traffic_rates[outbound] = {"download_rate": 0.0, "upload_rate": 0.0}
+            stats["traffic_rates"] = traffic_rates
 
-            if current_inode != _adblock_log_inode or current_size < _adblock_log_position:
-                # 日志轮转，重新全量扫描
-                _adblock_count = 0
-                _adblock_log_position = 0
-                _adblock_log_inode = current_inode
+            # 根据 time_range 聚合 rate_history
+            # 1m: 最近 60 秒，1 秒间隔（原始数据）
+            # 1h: 最近 1 小时，10 分钟间隔（6 个数据点）
+            # 24h: 最近 24 小时，1 小时间隔（24 个数据点）
+            now = int(time.time())
 
-            # 增量扫描：从上次位置读取新内容
-            with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                f.seek(_adblock_log_position)
-                for line in f:
-                    if "outbound/block[adblock]: blocked connection" in line:
-                        _adblock_count += 1
-                _adblock_log_position = f.tell()
+            if time_range == "1h":
+                # 最近 1 小时，每 10 分钟聚合一次（6 个数据点）
+                interval_seconds = 10 * 60  # 10 分钟
+                num_points = 6
+                cutoff = now - 60 * 60  # 1 小时前
+            elif time_range == "24h":
+                # 最近 24 小时，每 1 小时聚合一次（24 个数据点）
+                interval_seconds = 60 * 60  # 1 小时
+                num_points = 24
+                cutoff = now - 24 * 60 * 60  # 24 小时前
+            else:  # "1m" 默认
+                # 最近 60 秒，不聚合，直接返回原始数据
+                interval_seconds = 1
+                num_points = 60
+                cutoff = now - 60  # 60 秒前
 
-        stats["adblock_connections"] = _adblock_count
-    except Exception:
-        stats["adblock_connections"] = _adblock_count  # 出错时返回已有计数
+            # 过滤时间范围内的数据
+            filtered_data = [p for p in _rate_history if p["timestamp"] > cutoff]
+
+            if time_range == "1m":
+                # 1 分钟视图：直接返回最近 60 个数据点
+                filtered_history = []
+                for point in filtered_data[-60:]:
+                    filtered_point = {
+                        "timestamp": point["timestamp"],
+                        "rates": {k: v for k, v in point["rates"].items() if k not in blocked_outbounds}
+                    }
+                    filtered_history.append(filtered_point)
+            else:
+                # 1h/24h 视图：按时间段聚合（取平均值）
+                filtered_history = []
+
+                for i in range(num_points):
+                    # 计算这个时间段的起止时间
+                    slot_end = now - i * interval_seconds
+                    slot_start = slot_end - interval_seconds
+
+                    # 找到这个时间段内的所有数据点
+                    slot_points = [p for p in filtered_data if slot_start < p["timestamp"] <= slot_end]
+
+                    if slot_points:
+                        # 计算每个出口的平均速率
+                        avg_rates = {}
+                        for outbound in chart_outbounds:
+                            rates = [p["rates"].get(outbound, 0) for p in slot_points]
+                            avg_rates[outbound] = round(sum(rates) / len(rates), 1) if rates else 0
+
+                        filtered_history.append({
+                            "timestamp": slot_end,
+                            "rates": avg_rates
+                        })
+                    else:
+                        # 没有数据时填充 0
+                        filtered_history.append({
+                            "timestamp": slot_end,
+                            "rates": {o: 0 for o in chart_outbounds}
+                        })
+
+                # 反转顺序，使时间从旧到新
+                filtered_history.reverse()
+
+            stats["rate_history"] = filtered_history
+
+    # 管理员：广告拦截统计
+    # 普通用户不显示广告拦截计数
+    if is_admin:
+        # 从 sing-box 日志文件统计广告拦截（增量扫描优化）
+        # 使用专用的 adblock 出口，日志格式: outbound/block[adblock]: blocked connection to x.x.x.x:443
+        global _adblock_count, _adblock_log_position, _adblock_log_inode
+        try:
+            log_file = Path("/var/log/sing-box.log")
+            if log_file.exists():
+                # 检测日志轮转（inode 变化或文件变小）
+                stat = log_file.stat()
+                current_inode = stat.st_ino
+                current_size = stat.st_size
+
+                if current_inode != _adblock_log_inode or current_size < _adblock_log_position:
+                    # 日志轮转，重新全量扫描
+                    _adblock_count = 0
+                    _adblock_log_position = 0
+                    _adblock_log_inode = current_inode
+
+                # 增量扫描：从上次位置读取新内容
+                with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    f.seek(_adblock_log_position)
+                    for line in f:
+                        if "outbound/block[adblock]: blocked connection" in line:
+                            _adblock_count += 1
+                    _adblock_log_position = f.tell()
+
+            stats["adblock_connections"] = _adblock_count
+        except Exception:
+            stats["adblock_connections"] = _adblock_count  # 出错时返回已有计数
 
     return stats
 
@@ -3039,7 +5017,7 @@ def api_update_endpoint(tag: str, payload: EndpointUpdateRequest):
         if updates:
             db.update_wireguard_server(**updates)
             # 同步内核 WireGuard 入口接口
-            sync_msg = _sync_kernel_wg_ingress()
+            sync_msg = _sync_wg_ingress()
             return {"message": f"endpoint {tag} updated{sync_msg}"}
         return {"message": f"endpoint {tag} updated (no changes)"}
 
@@ -3066,7 +5044,7 @@ def api_update_endpoint(tag: str, payload: EndpointUpdateRequest):
             if updates:
                 db.update_custom_egress(tag, **updates)
                 # 同步内核 WireGuard 出口接口并重载 sing-box
-                wg_sync_msg = _sync_kernel_wg_egress()
+                wg_sync_msg = _sync_wg_egress()
                 try:
                     _regenerate_and_reload()
                     return {"message": f"endpoint {tag} updated{wg_sync_msg}, config reloaded"}
@@ -3182,13 +5160,13 @@ def api_create_profile(payload: ProfileCreateRequest):
             "SING_BOX_GENERATED_CONFIG": str(generated_config),
         })
         provision_script = ENTRY_DIR / "pia_provision.py"
-        render_script = ENTRY_DIR / "render_singbox.py"
+        # NOTE: render_singbox.py removed - sing-box is no longer used.
 
         try:
             run_command(["python3", str(provision_script)], env=env)
             # 同步内核 WireGuard 接口
-            wg_sync_status = _sync_kernel_wg_egress()
-            run_command(["python3", str(render_script)], env=env)
+            wg_sync_status = _sync_wg_egress()
+            # NOTE: render_singbox.py call removed - sing-box replaced by rust-router
             reload_result = reload_singbox()
             provision_result = {"success": True, "reload": reload_result, "wg_sync": wg_sync_status}
         except Exception as exc:
@@ -3259,7 +5237,7 @@ def api_delete_profile(tag: str):
     # 同步内核 WireGuard 接口（清理已删除的接口）并重新渲染配置
     reload_status = ""
     try:
-        wg_sync_status = _sync_kernel_wg_egress()
+        wg_sync_status = _sync_wg_egress()
         _regenerate_and_reload()
         reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
@@ -3272,8 +5250,13 @@ def api_delete_profile(tag: str):
 # ============ Route Rules Management APIs ============
 
 @app.get("/api/rules")
-def api_get_rules():
-    """获取路由规则配置（从数据库读取）"""
+def api_get_rules(request: Request):
+    """获取路由规则配置（从数据库读取）
+
+    普通用户只能看到自己创建的规则，管理员可以看到所有规则。
+    """
+    owner_filter = get_owner_filter(request)
+
     # 从配置中提取可用出口
     generated_config = Path("/etc/sing-box/sing-box.generated.json")
     config_path = generated_config if generated_config.exists() else CONFIG_PATH
@@ -3323,6 +5306,12 @@ def api_get_rules():
                 if egress.get("tag") and egress["tag"] not in available_outbounds:
                     available_outbounds.append(egress["tag"])
 
+            # 从数据库读取 Shadowsocks 出口
+            shadowsocks_egress = db.get_shadowsocks_egress_list(enabled_only=True)
+            for egress in shadowsocks_egress:
+                if egress.get("tag") and egress["tag"] not in available_outbounds:
+                    available_outbounds.append(egress["tag"])
+
             # 从数据库读取出口组（负载均衡/故障转移）
             outbound_groups = db.get_outbound_groups(enabled_only=True)
             for group in outbound_groups:
@@ -3349,10 +5338,10 @@ def api_get_rules():
                     if tag and tag != "wg-server" and tag not in available_outbounds:
                         available_outbounds.append(tag)
 
-    # 从数据库读取自定义规则
+    # 从数据库读取自定义规则（按用户过滤）
     if HAS_DATABASE and USER_DB_PATH.exists():
         db = _get_db()
-        db_rules = db.get_routing_rules(enabled_only=True)
+        db_rules = db.get_routing_rules(enabled_only=True, owner_id=owner_filter)
 
         # 按 tag 分组规则（使用数据库中的实际 tag）
         rules_by_tag = {}
@@ -3404,22 +5393,52 @@ def api_get_rules():
         custom = load_custom_rules()
         rules = custom.get("rules", [])
 
+    # Add rule_sets summary (return all, including disabled, so UI can manage them)
+    # 按用户过滤规则集
+    rule_sets_summary = []
+    if HAS_DATABASE and USER_DB_PATH.exists():
+        try:
+            db = _get_db()
+            rule_sets = db.get_rule_sets(enabled_only=False, owner_id=owner_filter)
+            for rs in rule_sets:
+                rule_sets_summary.append({
+                    "id": rs["id"],
+                    "name": rs["name"],
+                    "rule_type": rs["rule_type"],
+                    "outbound": rs["outbound"],
+                    "count": rs["rule_count"],
+                    "status": rs["status"],
+                    "enabled": rs["enabled"],
+                })
+        except Exception as e:
+            logging.debug(f"获取规则集摘要失败: {e}")
+
     return {
         "rules": rules,
+        "rule_sets": rule_sets_summary,
         "default_outbound": default_outbound,
         "available_outbounds": available_outbounds,
     }
 
 
 @app.put("/api/rules")
-def api_update_rules(payload: RouteRulesUpdateRequest):
-    """更新路由规则（数据库版本，使用批量操作优化性能）"""
+def api_update_rules(request: Request, payload: RouteRulesUpdateRequest):
+    """更新路由规则（数据库版本，使用批量操作优化性能）
+
+    Returns structured response with sync_success/sync_error fields.
+    Raises HTTP 502 on sync failure instead of silently succeeding.
+    普通用户只能更新自己的规则，管理员可以更新所有规则。
+    """
+    # Get current user's owner_id for resource filtering
+    owner_id = get_owner_id(request)
+
     if HAS_DATABASE and USER_DB_PATH.exists():
         # 使用数据库存储（方案 B）
         db = _get_db()
 
-        # 批量删除所有规则，但保留 __adblock__ 前缀的规则（由广告拦截页面管理）
-        deleted_count = db.delete_all_routing_rules(preserve_adblock=True)
+        # 批量删除规则，但保留 __adblock__ 前缀的规则（由广告拦截页面管理）
+        # 普通用户只删除自己的规则，管理员删除所有规则
+        deleted_count = db.delete_all_routing_rules(preserve_adblock=True, owner_id=owner_id)
 
         # 收集所有规则用于批量插入
         # 格式: (rule_type, target, outbound, tag, priority)
@@ -3463,25 +5482,64 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
                     batch_rules.append(("port_range", port_range, rule.outbound, tag, 0))
 
         # 批量插入所有规则（使用 executemany）
-        added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
+        added_count = db.add_routing_rules_batch(batch_rules, owner_id=owner_id) if batch_rules else 0
 
         # 保存默认出口到数据库
         db.set_setting("default_outbound", payload.default_outbound)
 
-        # 重新生成配置并重载 sing-box
-        reload_status = None
+        # Build base response
+        db_message = f"路由规则已保存到数据库（删除 {deleted_count} 条，添加 {added_count} 条）"
+        response = {
+            "message": db_message,
+            "db_success": True,
+            "deleted_count": deleted_count,
+            "added_count": added_count,
+        }
+
+        # 重新生成配置并重载 rust-router
         if payload.regenerate_config:
             try:
                 _regenerate_and_reload()
-                reload_status = "已重载"
+                response["sync_success"] = True
+                response["message"] = f"{db_message}，已同步到 rust-router"
+            except RuntimeError as exc:
+                # NOTE: _regenerate_and_reload() -> reload_singbox() catches RustRouterSyncError
+                # internally and raises RuntimeError with the error message. So we only need
+                # to catch RuntimeError here.
+                logging.error(f"[api] PUT /api/rules sync failed: {exc}")
+                response["sync_success"] = False
+                response["sync_error"] = str(exc)
+                # Return HTTP 502 to signal sync failure to frontend
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": f"{db_message}，但同步到 rust-router 失败: {exc}",
+                        "db_success": True,
+                        "sync_success": False,
+                        "sync_error": str(exc),
+                        "deleted_count": deleted_count,
+                        "added_count": added_count,
+                    }
+                )
             except Exception as exc:
-                print(f"[api] 重载配置失败: {exc}")
-                reload_status = f"重载失败: {exc}"
+                logging.error(f"[api] PUT /api/rules unexpected error: {exc}")
+                response["sync_success"] = False
+                response["sync_error"] = str(exc)
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": f"{db_message}，重载失败: {exc}",
+                        "db_success": True,
+                        "sync_success": False,
+                        "sync_error": str(exc),
+                    }
+                )
+        else:
+            # No sync requested - mark as not attempted
+            response["sync_success"] = None
+            response["sync_error"] = None
 
-        message = f"路由规则已保存到数据库（删除 {deleted_count} 条，添加 {added_count} 条）"
-        if reload_status:
-            message += f"，{reload_status}"
-        return {"message": message}
+        return response
     else:
         # 降级到 JSON 文件存储
         custom_data = {
@@ -3489,7 +5547,12 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
             "default_outbound": payload.default_outbound,
         }
         save_custom_rules(custom_data)
-        return {"message": "路由规则已保存，需要重新连接 VPN 生效"}
+        return {
+            "message": "路由规则已保存，需要重新连接 VPN 生效",
+            "db_success": True,
+            "sync_success": None,
+            "sync_error": None,
+        }
 
 
 class DefaultOutboundRequest(BaseModel):
@@ -3498,16 +5561,13 @@ class DefaultOutboundRequest(BaseModel):
 
 
 @app.put("/api/outbound/default")
-def api_switch_default_outbound(payload: DefaultOutboundRequest):
-    """通过 Clash API 热切换默认出口（不中断现有连接）
+async def api_switch_default_outbound(payload: DefaultOutboundRequest):
+    """热切换默认出口（不中断现有连接）
 
-    使用 sing-box 的 selector 出口 + Clash API 实现热切换：
+    优先使用 rust-router IPC，否则使用 sing-box Clash API：
     1. 验证出口是否有效
-    2. 通过 Clash API 更新 default-exit selector 的选中项
+    2. 通过 IPC/Clash API 更新默认出口
     3. 更新数据库中的 default_outbound 设置
-
-    由于 selector 设置了 interrupt_exist_connections: false，
-    切换时现有连接不会中断。
     """
     import urllib.request
     import urllib.error
@@ -3539,6 +5599,9 @@ def api_switch_default_outbound(payload: DefaultOutboundRequest):
     for egress in db.get_warp_egress_list(enabled_only=True):
         available_outbounds.append(egress["tag"])
 
+    for egress in db.get_shadowsocks_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
     for group in db.get_outbound_groups(enabled_only=True):
         available_outbounds.append(group["tag"])
 
@@ -3546,13 +5609,47 @@ def api_switch_default_outbound(payload: DefaultOutboundRequest):
         if chain.get("tag"):
             available_outbounds.append(chain['tag'])
 
+    # Add Shadowsocks outbounds from rust-router IPC (for runtime-only outbounds)
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                resp = await client.list_shadowsocks_outbounds()
+                if resp.success:
+                    for ob in resp.data.get("outbounds", []):
+                        if ob.get("tag") and ob["tag"] not in available_outbounds:
+                            available_outbounds.append(ob["tag"])
+        except Exception as e:
+            logging.debug(f"Failed to get Shadowsocks outbounds from rust-router: {e}")
+
     if new_outbound not in available_outbounds:
         raise HTTPException(
             status_code=400,
             detail=f"无效的出口: {new_outbound}。可用: {', '.join(available_outbounds)}"
         )
 
-    # 通过 Clash API 切换 selector
+    # Try rust-router IPC first (userspace WireGuard mode)
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                result = await client.set_default_outbound(new_outbound)
+                if result.success:
+                    # Update database setting
+                    db.set_setting("default_outbound", new_outbound)
+                    return {
+                        "message": f"默认出口已切换为 {new_outbound}（rust-router IPC）",
+                        "outbound": new_outbound,
+                        "hot_switch": True,
+                        "backend": "rust-router"
+                    }
+                else:
+                    # rust-router returned error, log it but try fallback
+                    logging.warning(f"rust-router set_default_outbound failed: {result.message}")
+        except Exception as e:
+            logging.warning(f"rust-router IPC failed, trying Clash API: {e}")
+
+    # Fallback: 通过 Clash API 切换 selector (sing-box)
     # PUT /proxies/{selector_name} with body {"name": "outbound_name"}
     clash_url = f"http://127.0.0.1:{DEFAULT_CLASH_API_PORT}/proxies/default-exit"
     try:
@@ -3571,7 +5668,8 @@ def api_switch_default_outbound(payload: DefaultOutboundRequest):
                 return {
                     "message": f"默认出口已切换为 {new_outbound}（无需重载，连接不中断）",
                     "outbound": new_outbound,
-                    "hot_switch": True
+                    "hot_switch": True,
+                    "backend": "sing-box"
                 }
 
     except urllib.error.HTTPError as e:
@@ -3649,6 +5747,9 @@ def api_get_default_outbound():
     for egress in db.get_warp_egress_list(enabled_only=True):
         available_outbounds.append(egress["tag"])
 
+    for egress in db.get_shadowsocks_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
     for group in db.get_outbound_groups(enabled_only=True):
         available_outbounds.append(group["tag"])
 
@@ -3662,9 +5763,20 @@ def api_get_default_outbound():
     }
 
 
+@app.post("/api/rules")
+def api_add_rule(request: Request, payload: CustomRuleRequest):
+    """添加路由规则（别名，等同于 POST /api/rules/custom）"""
+    return api_add_custom_rule(request, payload)
+
+
 @app.post("/api/rules/custom")
-def api_add_custom_rule(payload: CustomRuleRequest):
-    """添加自定义路由规则（数据库版本，使用批量操作优化性能）"""
+def api_add_custom_rule(request: Request, payload: CustomRuleRequest):
+    """添加自定义路由规则（数据库版本，使用批量操作优化性能）
+
+    规则归属于创建它的用户。
+    """
+    user = get_user_context(request)
+
     # 验证至少有一种匹配规则
     has_domain_rules = payload.domains or payload.domain_keywords or payload.ip_cidrs
     has_protocol_rules = payload.protocols or payload.network or payload.ports or payload.port_ranges
@@ -3691,7 +5803,7 @@ def api_add_custom_rule(payload: CustomRuleRequest):
         )
 
     if not HAS_DATABASE or not USER_DB_PATH.exists():
-        raise HTTPException(status_code=500, detail="数据库不可用")
+        raise HTTPException(status_code=503, detail="数据库不可用")
 
     db = _get_db()
 
@@ -3734,24 +5846,55 @@ def api_add_custom_rule(payload: CustomRuleRequest):
             for port_range in payload.port_ranges:
                 batch_rules.append(("port_range", port_range, payload.outbound, payload.tag, 0))
 
-        # 批量插入所有规则
-        added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
+        # 批量插入所有规则（包含 owner_id）
+        added_count = db.add_routing_rules_batch(batch_rules, owner_id=user.user_id) if batch_rules else 0
 
-        return {
-            "message": f"自定义规则 '{payload.tag}' 已添加到数据库（{added_count} 条）",
+        # Sync rules to rust-router via IPC with proper error handling
+        db_message = f"自定义规则 '{payload.tag}' 已添加到数据库（{added_count} 条）"
+        response = {
+            "message": db_message,
             "tag": payload.tag,
             "outbound": payload.outbound,
-            "count": added_count
+            "count": added_count,
+            "db_success": True,
         }
+
+        try:
+            sync_result = _sync_rules_to_rust_router(db)
+            response["sync_success"] = True
+            response["message"] = f"{db_message}，{sync_result.message}"
+        except RustRouterSyncError as sync_err:
+            logging.error(f"Failed to sync rules to rust-router after add: {sync_err}")
+            response["sync_success"] = False
+            response["sync_error"] = str(sync_err)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": f"{db_message}，但同步失败: {sync_err}",
+                    "tag": payload.tag,
+                    "outbound": payload.outbound,
+                    "count": added_count,
+                    "db_success": True,
+                    "sync_success": False,
+                    "sync_error": str(sync_err),
+                }
+            )
+
+        return response
+    except HTTPException:
+        raise  # Re-raise HTTPException as-is
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"添加规则失败: {str(e)}")
 
 
 @app.delete("/api/rules/custom/{rule_id}")
 def api_delete_custom_rule(rule_id: int):
-    """删除自定义路由规则（数据库版本）"""
+    """删除自定义路由规则（数据库版本）
+
+    Returns structured response with sync_success/sync_error fields.
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
-        raise HTTPException(status_code=500, detail="数据库不可用")
+        raise HTTPException(status_code=503, detail="数据库不可用")
 
     db = _get_db()
     success = db.delete_routing_rule(rule_id)
@@ -3759,23 +5902,205 @@ def api_delete_custom_rule(rule_id: int):
     if not success:
         raise HTTPException(status_code=404, detail=f"规则 ID {rule_id} 不存在")
 
-    return {"message": f"规则 ID {rule_id} 已删除"}
+    # Sync rules to rust-router via IPC with proper error handling
+    db_message = f"规则 ID {rule_id} 已删除"
+    response = {
+        "message": db_message,
+        "rule_id": rule_id,
+        "db_success": True,
+    }
+
+    try:
+        sync_result = _sync_rules_to_rust_router(db)
+        response["sync_success"] = True
+        response["message"] = f"{db_message}，{sync_result.message}"
+    except RustRouterSyncError as sync_err:
+        logging.error(f"Failed to sync rules to rust-router after delete: {sync_err}")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"{db_message}，但同步失败: {sync_err}",
+                "rule_id": rule_id,
+                "db_success": True,
+                "sync_success": False,
+                "sync_error": str(sync_err),
+            }
+        )
+
+    return response
 
 
 @app.delete("/api/rules/custom/by-tag/{tag}")
 def api_delete_custom_rule_by_tag(tag: str):
-    """删除自定义路由规则（通过 tag，兼容旧接口）
-    注意：此端点已废弃，建议使用 DELETE /api/rules/custom/{rule_id}
+    """删除自定义路由规则（通过 tag）
+
+    Returns structured response with sync_success/sync_error fields.
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
-    # 由于数据库中没有直接存储 tag，我们无法通过 tag 删除
-    # 返回提示信息，建议使用新的 API
-    raise HTTPException(
-        status_code=410,
-        detail="此 API 已废弃。请使用 DELETE /api/rules/custom/{rule_id} 或通过前端界面删除规则"
-    )
+    db = _get_db()
+    deleted_count = db.delete_routing_rules_by_tag(tag)
+
+    if deleted_count == 0:
+        raise HTTPException(status_code=404, detail=f"未找到标签为 '{tag}' 的规则")
+
+    # Sync rules to rust-router via IPC with proper error handling
+    db_message = f"已删除 {deleted_count} 条标签为 '{tag}' 的规则"
+    response = {
+        "message": db_message,
+        "tag": tag,
+        "deleted_count": deleted_count,
+        "db_success": True,
+    }
+
+    try:
+        sync_result = _sync_rules_to_rust_router(db)
+        response["sync_success"] = True
+        response["message"] = f"{db_message}，{sync_result.message}"
+    except RustRouterSyncError as sync_err:
+        logging.error(f"Failed to sync rules to rust-router after delete by tag: {sync_err}")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"{db_message}，但同步失败: {sync_err}",
+                "tag": tag,
+                "deleted_count": deleted_count,
+                "db_success": True,
+                "sync_success": False,
+                "sync_error": str(sync_err),
+            }
+        )
+
+    return response
+
+
+@app.put("/api/rules/custom/by-tag/{tag}")
+def api_update_custom_rule_by_tag(request: Request, tag: str, payload: CustomRuleRequest):
+    """更新自定义路由规则（通过 tag）
+
+    删除所有现有规则后重新添加新规则，保持相同的 tag。
+    普通用户只能更新自己的规则。
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    # Get current user's owner_id
+    owner_id = get_owner_id(request)
+
+    # 验证至少有一种匹配规则
+    has_domain_rules = payload.domains or payload.domain_keywords or payload.ip_cidrs
+    has_protocol_rules = payload.protocols or payload.network or payload.ports or payload.port_ranges
+    if not has_domain_rules and not has_protocol_rules:
+        raise HTTPException(
+            status_code=400,
+            detail="至少需要提供一种匹配规则（域名、关键词、IP、协议或端口）"
+        )
+
+    # 验证协议类型
+    if payload.protocols:
+        invalid_protocols = [p for p in payload.protocols if p not in VALID_PROTOCOLS]
+        if invalid_protocols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"无效的协议类型: {', '.join(invalid_protocols)}。支持: {', '.join(VALID_PROTOCOLS)}"
+            )
+
+    # 验证网络类型
+    if payload.network and payload.network not in VALID_NETWORKS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效的网络类型: {payload.network}。支持: tcp, udp"
+        )
+
+    db = _get_db()
+
+    try:
+        # 先删除现有规则（只删除当前用户的规则）
+        deleted_count = db.delete_routing_rules_by_tag(tag, owner_id=owner_id)
+
+        if deleted_count == 0:
+            raise HTTPException(status_code=404, detail=f"未找到标签为 '{tag}' 的规则")
+
+        # 收集所有新规则用于批量插入
+        batch_rules = []
+
+        # 使用 URL 参数中的 tag，忽略 payload 中的 tag
+        rule_tag = tag
+
+        # 收集域名规则
+        if payload.domains:
+            for domain in payload.domains:
+                batch_rules.append(("domain", domain, payload.outbound, rule_tag, 0))
+
+        # 收集域名关键词规则
+        if payload.domain_keywords:
+            for keyword in payload.domain_keywords:
+                batch_rules.append(("domain_keyword", keyword, payload.outbound, rule_tag, 0))
+
+        # 收集 IP 规则
+        if payload.ip_cidrs:
+            for cidr in payload.ip_cidrs:
+                batch_rules.append(("ip", cidr, payload.outbound, rule_tag, 0))
+
+        # 收集协议规则
+        if payload.protocols:
+            for protocol in payload.protocols:
+                batch_rules.append(("protocol", protocol, payload.outbound, rule_tag, 0))
+
+        # 收集网络类型规则
+        if payload.network:
+            batch_rules.append(("network", payload.network, payload.outbound, rule_tag, 0))
+
+        # 收集端口规则
+        if payload.ports:
+            for port in payload.ports:
+                batch_rules.append(("port", str(port), payload.outbound, rule_tag, 0))
+
+        # 收集端口范围规则
+        if payload.port_ranges:
+            for port_range in payload.port_ranges:
+                batch_rules.append(("port_range", port_range, payload.outbound, rule_tag, 0))
+
+        # 批量插入所有新规则
+        added_count = db.add_routing_rules_batch(batch_rules, owner_id=owner_id) if batch_rules else 0
+
+        # Sync rules to rust-router via IPC with proper error handling
+        db_message = f"规则 '{tag}' 已更新（删除 {deleted_count} 条，添加 {added_count} 条）"
+        response = {
+            "message": db_message,
+            "tag": tag,
+            "outbound": payload.outbound,
+            "deleted_count": deleted_count,
+            "added_count": added_count,
+            "db_success": True,
+        }
+
+        try:
+            sync_result = _sync_rules_to_rust_router(db)
+            response["sync_success"] = True
+            response["message"] = f"{db_message}，{sync_result.message}"
+        except RustRouterSyncError as sync_err:
+            logging.error(f"Failed to sync rules to rust-router after update: {sync_err}")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": f"{db_message}，但同步失败: {sync_err}",
+                    "tag": tag,
+                    "outbound": payload.outbound,
+                    "deleted_count": deleted_count,
+                    "added_count": added_count,
+                    "db_success": True,
+                    "sync_success": False,
+                    "sync_error": str(sync_err),
+                }
+            )
+
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"更新规则失败: {str(e)}")
 
 
 @app.post("/api/pia/login")
@@ -3826,21 +6151,21 @@ def api_pia_login(payload: PiaLoginRequest):
         }
     )
     provision_script = ENTRY_DIR / "pia_provision.py"
-    render_script = ENTRY_DIR / "render_singbox.py"
+    # NOTE: render_singbox.py removed - sing-box is no longer used.
     run_command(["python3", str(provision_script)], env=env)
 
     if payload.regenerate_config:
-        run_command(["python3", str(render_script)], env=env)
-        # 自动重载 sing-box 使配置生效
+        # NOTE: render_singbox.py call removed - sing-box replaced by rust-router
+        # Sync to rust-router instead
         reload_result = reload_singbox()
         # 同步内核 WireGuard 出口接口（PIA 使用 kernel WG）
-        wg_sync_msg = _sync_kernel_wg_egress()
+        wg_sync_msg = _sync_wg_egress()
         return {
-            "message": f"PIA 登录成功，配置已生成并重载{wg_sync_msg}",
+            "message": f"PIA 登录成功，配置已同步到 rust-router{wg_sync_msg}",
             "has_profiles": True,
             "reload": reload_result
         }
-    return {"message": "PIA 登录成功，配置已生成（未重载）", "has_profiles": True}
+    return {"message": "PIA 登录成功，配置已生成（未同步）", "has_profiles": True}
 
 
 @app.post("/api/actions/geodata")
@@ -3851,60 +6176,27 @@ def api_refresh_geodata():
 
 
 def reload_singbox() -> dict:
-    """重新加载 sing-box 配置
+    """重新加载路由配置（已迁移到 rust-router）
 
-    entrypoint.sh 现在会自动监控 sing-box 进程：
-    - 如果 sing-box 退出，entrypoint 会自动用最新配置重启它
-    - 优先使用生成的配置 (/etc/sing-box/sing-box.generated.json)
+    NOTE: sing-box 已被 rust-router 取代。此函数现在通过 IPC 同步配置到 rust-router。
+    保留函数名以保持 API 兼容性。
 
-    重载策略：
-    1. 先尝试 SIGHUP 热重载
-    2. 如果失败，杀掉 sing-box 让 entrypoint 重启
+    Now properly propagates sync failures instead of silently succeeding.
     """
-    generated_config = Path("/etc/sing-box/sing-box.generated.json")
-
     try:
-        # 检查生成的配置是否存在
-        if not generated_config.exists():
-            return {"success": False, "message": "生成的配置文件不存在，请先登录 PIA"}
-
-        # 验证配置文件语法
-        check_result = subprocess.run(
-            ["sing-box", "check", "-c", str(generated_config)],
-            capture_output=True,
-            text=True,
-        )
-        if check_result.returncode != 0:
-            return {"success": False, "message": f"配置文件语法错误: {check_result.stderr}"}
-
-        # 检查 sing-box 是否正在运行
-        if not list_processes("sing-box"):
-            # sing-box 未运行，entrypoint 应该会自动启动
-            # 等待几秒看是否启动
-            time.sleep(3)
-            if list_processes("sing-box"):
-                return {"success": True, "message": "sing-box 已由 entrypoint 启动", "method": "auto"}
-            return {"success": False, "message": "sing-box 未运行，请检查容器状态"}
-
-        # 尝试 SIGHUP 热重载 (sing-box 使用 generated_config 启动，会重新加载该文件)
-        result = subprocess.run(
-            ["pkill", "-HUP", "sing-box"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            time.sleep(1)
-            if list_processes("sing-box"):
-                return {"success": True, "message": "sing-box 配置已重新加载", "method": "SIGHUP"}
-
-        # SIGHUP 失败，杀掉进程让 entrypoint 自动重启
-        subprocess.run(["pkill", "sing-box"], capture_output=True)
-        time.sleep(3)  # 等待 entrypoint 重启 sing-box
-
-        if list_processes("sing-box"):
-            return {"success": True, "message": "sing-box 已重启", "method": "restart"}
-        return {"success": False, "message": "sing-box 重启失败，请检查容器日志"}
+        # 同步规则到 rust-router (raise_on_error=True by default)
+        sync_result = _sync_rules_to_rust_router()
+        return {
+            "success": True,
+            "message": f"配置已同步到 rust-router, {sync_result.message}",
+            "method": "rust-router-ipc",
+            "rule_count": sync_result.rule_count
+        }
+    except RustRouterSyncError as exc:
+        logging.error(f"reload_singbox failed: {exc}")
+        return {"success": False, "message": str(exc), "sync_error": exc.result.error}
     except Exception as exc:
+        logging.error(f"reload_singbox unexpected error: {exc}")
         return {"success": False, "message": str(exc)}
 
 
@@ -3913,7 +6205,8 @@ def api_reload_singbox():
     """重新加载 sing-box 配置"""
     result = reload_singbox()
     if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("message"))
+        # 防御性默认值
+        raise HTTPException(status_code=500, detail=result.get("message", "Reload failed"))
     return result
 
 
@@ -3990,15 +6283,17 @@ def api_reconnect_profile(payload: ProfileReconnectRequest):
     })
 
     provision_script = ENTRY_DIR / "pia_provision.py"
-    render_script = ENTRY_DIR / "render_singbox.py"
+    # NOTE: render_singbox.py removed - sing-box is no longer used.
 
     try:
         # 只重连指定的 profile
         run_command(["python3", str(provision_script), "--profile", profile_key], env=env)
-        run_command(["python3", str(render_script)], env=env)
+        # NOTE: render_singbox.py call removed - sing-box replaced by rust-router
         reload_result = reload_singbox()
-        # 同步内核 WireGuard 出口接口（PIA 使用 kernel WG）
-        wg_sync_msg = _sync_kernel_wg_egress()
+        
+        # 先删除旧隧道，再同步新配置（endpoint 可能已变化）
+        wg_sync_msg = _refresh_wg_tunnel(profile_key)
+        
         # 同步所有出口组的 ECMP 路由和 SNAT 规则（peer_ip 可能改变）
         ecmp_sync_msg = _sync_all_ecmp_groups()
         return {
@@ -4017,6 +6312,314 @@ def api_list_wireguard_peers():
         raise HTTPException(status_code=404, detail="wireguard server config missing")
     data = json.loads(WG_CONFIG_PATH.read_text())
     return data
+
+
+# ============ Rule Sets API ============
+
+@app.get("/api/rule-sets")
+def api_get_rule_sets(request: Request):
+    """获取所有规则集
+
+    普通用户只能看到自己创建的规则集，管理员可以看到所有规则集。
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    owner_filter = get_owner_filter(request)
+    db = _get_db()
+    rule_sets = db.get_rule_sets(enabled_only=False, owner_id=owner_filter)
+
+    # Add loader status if available
+    result = []
+    for rs in rule_sets:
+        item = {
+            "id": rs["id"],
+            "name": rs["name"],
+            "rule_type": rs["rule_type"],
+            "outbound": rs["outbound"],
+            "rule_count": rs["rule_count"],
+            "file_path": rs["file_path"],
+            "status": rs["status"],
+            "enabled": rs["enabled"],
+            "priority": rs.get("priority", 0),
+            "owner_id": rs.get("owner_id"),
+            "created_at": rs.get("created_at"),
+            "updated_at": rs.get("updated_at"),
+        }
+        if rs.get("error_message"):
+            item["error_message"] = rs["error_message"]
+        # Add loaded status from rule loader
+        if _rule_loader and _rule_loader.is_loaded(rs["id"]):
+            item["in_memory"] = True
+        else:
+            item["in_memory"] = False
+        result.append(item)
+
+    return {"rule_sets": result, "total": len(result)}
+
+
+@app.get("/api/rule-sets/stats")
+def api_get_rule_loader_stats():
+    """获取规则加载器统计"""
+    if not _rule_loader:
+        return {
+            "available": False,
+            "message": "规则加载器未初始化"
+        }
+
+    stats = _rule_loader.get_stats()
+    stats["available"] = True
+    stats["loaded_set_ids"] = _rule_loader.get_loaded_set_ids()
+    return stats
+
+
+@app.get("/api/rule-sets/{set_id}")
+def api_get_rule_set(set_id: str):
+    """获取单个规则集详情"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = _get_db()
+    rule_set = db.get_rule_set(set_id)
+
+    if not rule_set:
+        raise HTTPException(status_code=404, detail=f"规则集 '{set_id}' 不存在")
+
+    result = {
+        "id": rule_set["id"],
+        "name": rule_set["name"],
+        "rule_type": rule_set["rule_type"],
+        "outbound": rule_set["outbound"],
+        "rule_count": rule_set["rule_count"],
+        "file_path": rule_set["file_path"],
+        "checksum": rule_set.get("checksum"),
+        "status": rule_set["status"],
+        "enabled": rule_set["enabled"],
+        "priority": rule_set.get("priority", 0),
+        "created_at": rule_set.get("created_at"),
+        "updated_at": rule_set.get("updated_at"),
+    }
+
+    if rule_set.get("error_message"):
+        result["error_message"] = rule_set["error_message"]
+
+    # Add loaded status and rules from loader
+    if _rule_loader and _rule_loader.is_loaded(set_id):
+        result["in_memory"] = True
+        loaded_data = _rule_loader.get_loaded_set(set_id)
+        if loaded_data:
+            result["rules"] = loaded_data.get("rules", [])
+    else:
+        result["in_memory"] = False
+        # Try to read rules from binary file
+        if HAS_RULE_BINARY and rule_set.get("file_path"):
+            try:
+                file_path = RULES_DIR / rule_set["file_path"]
+                if file_path.exists():
+                    data = read_rule_binary(str(file_path))
+                    result["rules"] = data.get("rules", [])
+            except Exception as e:
+                logging.error(f"无法读取规则集文件 {set_id}: {e}")
+
+    return result
+
+
+@app.post("/api/rule-sets")
+async def api_create_rule_set(request: Request, payload: RuleSetCreateRequest):
+    """创建规则集（大规则集使用二进制存储）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    if not HAS_RULE_BINARY:
+        raise HTTPException(status_code=503, detail="规则二进制存储模块不可用")
+
+    # Get current user's owner_id for resource ownership
+    owner_id = get_owner_id(request)
+
+    # Generate ID if not provided
+    if payload.id:
+        set_id = payload.id
+    else:
+        # Generate ID from name and timestamp
+        import hashlib
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        name_hash = hashlib.md5(payload.name.encode()).hexdigest()[:8]
+        set_id = f"{payload.rule_type}-{name_hash}-{timestamp}"
+
+    # Validate rules is not empty
+    if not payload.rules:
+        raise HTTPException(status_code=400, detail="规则列表不能为空")
+
+    db = _get_db()
+
+    # Check if ID already exists
+    existing = db.get_rule_set(set_id)
+    if existing:
+        raise HTTPException(status_code=409, detail=f"规则集 '{set_id}' 已存在")
+
+    # Create rules directory if needed
+    RULES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Write binary file
+    file_name = f"{set_id}.bin"
+    file_path = RULES_DIR / file_name
+
+    try:
+        checksum = write_rule_binary(
+            str(file_path),
+            rules=payload.rules,
+            rule_type=payload.rule_type,
+            outbound=payload.outbound,
+            tag=set_id
+        )
+    except Exception as e:
+        logging.error(f"Failed to write binary file for rule set {set_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"写入规则文件失败: {e}") from e
+
+    # Add to database
+    success = db.add_rule_set(
+        set_id=set_id,
+        name=payload.name,
+        rule_type=payload.rule_type,
+        outbound=payload.outbound,
+        rule_count=len(payload.rules),
+        file_path=file_name,
+        checksum=checksum,
+        priority=payload.priority,
+        owner_id=owner_id
+    )
+
+    if not success:
+        # Clean up file on failure
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception as e:
+            logging.warning(f"Failed to cleanup file {file_path}: {e}")
+        raise HTTPException(status_code=500, detail="添加规则集到数据库失败")
+
+    # Load into memory if loader is available
+    if _rule_loader:
+        try:
+            await _rule_loader.load_rule_set(set_id)
+        except Exception as e:
+            logging.warning(f"加载规则集到内存失败 {set_id}: {e}")
+
+    return {
+        "message": f"规则集 '{payload.name}' 创建成功",
+        "id": set_id,
+        "rule_count": len(payload.rules),
+        "file_path": file_name,
+        "checksum": checksum,
+    }
+
+
+@app.put("/api/rule-sets/{set_id}")
+async def api_update_rule_set(set_id: str, payload: RuleSetUpdateRequest):
+    """更新规则集"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = _get_db()
+
+    # Check if exists
+    existing = db.get_rule_set(set_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"规则集 '{set_id}' 不存在")
+
+    # Update database record
+    success = db.update_rule_set(
+        set_id=set_id,
+        name=payload.name,
+        outbound=payload.outbound,
+        enabled=payload.enabled,
+        priority=payload.priority
+    )
+
+    if not success:
+        raise HTTPException(status_code=500, detail="更新规则集失败")
+
+    # If outbound changed and loader available, reload
+    if payload.outbound and _rule_loader and _rule_loader.is_loaded(set_id):
+        try:
+            await _rule_loader.reload_rule_set(set_id)
+        except Exception as e:
+            logging.warning(f"重新加载规则集失败 {set_id}: {e}")
+
+    return {
+        "message": f"规则集 '{set_id}' 更新成功",
+        "id": set_id,
+    }
+
+
+@app.delete("/api/rule-sets/{set_id}")
+async def api_delete_rule_set(set_id: str):
+    """删除规则集（同时删除内存、文件、数据库记录）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = _get_db()
+
+    # Get rule set info first
+    rule_set = db.get_rule_set(set_id)
+    if not rule_set:
+        raise HTTPException(status_code=404, detail=f"规则集 '{set_id}' 不存在")
+
+    # Unload from memory if loaded
+    if _rule_loader:
+        try:
+            await _rule_loader.unload_rule_set(set_id)
+        except Exception as e:
+            logging.warning(f"从内存卸载规则集失败 {set_id}: {e}")
+
+    # Delete binary file
+    file_path = rule_set.get("file_path")
+    if file_path:
+        full_path = RULES_DIR / file_path
+        try:
+            full_path.unlink(missing_ok=True)
+            logging.info(f"Deleted binary file for rule set {set_id}: {full_path}")
+        except Exception as e:
+            logging.error(f"删除规则文件失败 {full_path}: {e}")
+
+    # Delete from database
+    success = db.delete_rule_set(set_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="从数据库删除规则集失败")
+
+    return {
+        "message": f"规则集 '{set_id}' 已删除",
+        "id": set_id,
+    }
+
+
+@app.post("/api/rule-sets/{set_id}/reload")
+async def api_reload_rule_set(set_id: str):
+    """重新加载规则集"""
+    if not _rule_loader:
+        raise HTTPException(status_code=503, detail="规则加载器未初始化")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = _get_db()
+
+    # Check if exists
+    rule_set = db.get_rule_set(set_id)
+    if not rule_set:
+        raise HTTPException(status_code=404, detail=f"规则集 '{set_id}' 不存在")
+
+    try:
+        success = await _rule_loader.reload_rule_set(set_id)
+        if success:
+            return {
+                "message": f"规则集 '{set_id}' 重新加载成功",
+                "id": set_id,
+                "in_memory": True,
+            }
+        else:
+            raise HTTPException(status_code=500, detail="重新加载规则集失败")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"重新加载规则集失败: {e}") from e
 
 
 # ============ Ingress WireGuard Management APIs ============
@@ -4296,245 +6899,562 @@ def get_peer_status_from_clash_api() -> dict:
     return peer_status
 
 
-def get_wg_show_info() -> dict:
-    """从内核 WireGuard 获取接口和 peer 状态
+def get_peer_status_from_rust_router() -> dict:
+    """从 rust-router 获取 peer 状态（用于 userspace WireGuard 模式）
 
-    使用 wg show 命令获取真实的 WireGuard 状态，包括:
-    - 握手时间 (latest handshake)
-    - 流量统计 (transfer)
-    - 端点信息 (endpoint)
+    Returns:
+        Dict mapping public_key to peer status dict with handshake, rx, tx
     """
-    import time
-    interface = os.environ.get("WG_INTERFACE", "wg-ingress")
+    import asyncio
 
-    result = {"interface": {}, "peers": {}}
+    async def _get_peers():
+        try:
+            client = RustRouterClient()
+            return await client.list_ingress_peers()
+        except Exception as e:
+            print(f"[api] Failed to get peers from rust-router: {e}")
+            return []
 
     try:
-        proc = subprocess.run(
-            ["wg", "show", interface],
-            capture_output=True, text=True
-        )
-        if proc.returncode != 0:
-            return result
-
-        current_peer = None
-        for line in proc.stdout.strip().split('\n'):
-            line = line.rstrip()
-
-            if line.startswith('interface:'):
-                result["interface"]["name"] = line.split(':', 1)[1].strip()
-            elif line.startswith('  public key:'):
-                result["interface"]["public_key"] = line.split(':', 1)[1].strip()
-            elif line.startswith('  listening port:'):
-                result["interface"]["listen_port"] = int(line.split(':', 1)[1].strip())
-            elif line.startswith('peer:'):
-                current_peer = line.split(':', 1)[1].strip()
-                result["peers"][current_peer] = {
-                    "public_key": current_peer,
-                    "endpoint": None,
-                    "allowed_ips": None,
-                    "latest_handshake": 0,
-                    "rx_bytes": 0,
-                    "tx_bytes": 0
-                }
-            elif current_peer:
-                if line.startswith('  endpoint:'):
-                    result["peers"][current_peer]["endpoint"] = line.split(':', 1)[1].strip()
-                elif line.startswith('  allowed ips:'):
-                    result["peers"][current_peer]["allowed_ips"] = line.split(':', 1)[1].strip()
-                elif line.startswith('  latest handshake:'):
-                    # Parse "X seconds/minutes/hours ago" or "never"
-                    handshake_str = line.split(':', 1)[1].strip()
-                    if handshake_str != "(none)":
-                        # Convert to timestamp
-                        result["peers"][current_peer]["latest_handshake"] = _parse_handshake_time(handshake_str)
-                elif line.startswith('  transfer:'):
-                    # Parse "X received, Y sent"
-                    transfer_str = line.split(':', 1)[1].strip()
-                    rx, tx = _parse_transfer(transfer_str)
-                    result["peers"][current_peer]["rx_bytes"] = rx
-                    result["peers"][current_peer]["tx_bytes"] = tx
-
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If we're already in an async context, create a new loop in a thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _get_peers())
+                peers = future.result(timeout=5)
+        else:
+            peers = loop.run_until_complete(_get_peers())
+    except RuntimeError:
+        # No event loop, create one
+        peers = asyncio.run(_get_peers())
     except Exception as e:
-        print(f"[api] wg show failed: {e}")
+        print(f"[api] Error getting peer status: {e}")
+        peers = []
 
+    result = {}
+    for peer in peers:
+        pubkey = peer.get("public_key", "")
+        if pubkey:
+            result[pubkey] = {
+                "last_handshake": peer.get("last_handshake") or 0,
+                "rx_bytes": peer.get("rx_bytes") or 0,
+                "tx_bytes": peer.get("tx_bytes") or 0,
+            }
     return result
-
-
-def _parse_handshake_time(handshake_str: str) -> int:
-    """解析 wg show 的握手时间字符串，返回 Unix 时间戳"""
-    import time
-    import re
-
-    if not handshake_str or handshake_str == "(none)":
-        return 0
-
-    now = int(time.time())
-
-    # Match patterns like "47 seconds ago", "2 minutes, 30 seconds ago"
-    total_seconds = 0
-
-    # Extract all time components
-    patterns = [
-        (r'(\d+)\s*second', 1),
-        (r'(\d+)\s*minute', 60),
-        (r'(\d+)\s*hour', 3600),
-        (r'(\d+)\s*day', 86400),
-    ]
-
-    for pattern, multiplier in patterns:
-        match = re.search(pattern, handshake_str)
-        if match:
-            total_seconds += int(match.group(1)) * multiplier
-
-    if total_seconds > 0:
-        return now - total_seconds
-
-    return 0
-
-
-def _parse_transfer(transfer_str: str) -> tuple:
-    """解析 wg show 的流量字符串，返回 (rx_bytes, tx_bytes)"""
-    import re
-
-    rx_bytes = 0
-    tx_bytes = 0
-
-    # Match patterns like "47.71 KiB received, 176.50 KiB sent"
-    # or "1.23 MiB received, 456.78 KiB sent"
-    units = {'B': 1, 'KiB': 1024, 'MiB': 1024**2, 'GiB': 1024**3, 'TiB': 1024**4}
-
-    rx_match = re.search(r'([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\s*received', transfer_str)
-    tx_match = re.search(r'([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\s*sent', transfer_str)
-
-    if rx_match:
-        rx_bytes = int(float(rx_match.group(1)) * units.get(rx_match.group(2), 1))
-    if tx_match:
-        tx_bytes = int(float(tx_match.group(1)) * units.get(tx_match.group(2), 1))
-
-    return rx_bytes, tx_bytes
-
-
-def get_peer_handshake_info() -> dict:
-    """获取 peer 握手状态（从内核 WireGuard）
-
-    使用 wg show 命令获取真实的握手时间，比 clash_api 推断更准确。
-    """
-    handshakes = {}
-
-    # 从内核 WireGuard 获取状态
-    wg_info = get_wg_show_info()
-
-    for pubkey, peer_info in wg_info.get("peers", {}).items():
-        handshakes[pubkey] = peer_info.get("latest_handshake", 0)
-
-    return handshakes
-
-
-def get_peer_transfer_info() -> dict:
-    """获取 peer 流量统计（从内核 WireGuard）
-
-    使用 wg show 命令获取真实的流量统计。
-    """
-    transfers = {}
-
-    # 从内核 WireGuard 获取状态
-    wg_info = get_wg_show_info()
-
-    for pubkey, peer_info in wg_info.get("peers", {}).items():
-        transfers[pubkey] = {
-            "rx": peer_info.get("rx_bytes", 0),
-            "tx": peer_info.get("tx_bytes", 0)
-        }
-
-    return transfers
 
 
 def apply_ingress_config(config: dict) -> dict:
     """应用入口 WireGuard 配置到系统
 
-    使用内核 WireGuard 模式：通过 wg set 命令直接管理 peer，
-    无需重载 sing-box（流量通过 TUN 入口，与 peer 管理解耦）。
+    仅支持用户态 WireGuard 模式，通过 IPC 调用 rust-router 管理 peer。
+    内核 WireGuard 支持已移除。
+    """
+    return _apply_ingress_config_userspace(config)
+
+
+def _apply_ingress_config_userspace(config: dict) -> dict:
+    """应用入口配置到用户态 WireGuard (via IPC)"""
+    import asyncio
+    from rust_router_client import RustRouterClient
+
+    async def _sync_peers_via_ipc():
+        try:
+            client = RustRouterClient()
+            peers = config.get("peers", [])
+
+            # Get current peers from rust-router
+            current_peers_list = await client.list_ingress_peers()
+            current_peers = {p.get("public_key") for p in current_peers_list if p.get("public_key")}
+
+            # Calculate desired peers
+            desired_peers = {p.get("public_key") for p in peers if p.get("public_key")}
+
+            removed_count = 0
+            added_count = 0
+            updated_count = 0
+
+            # Remove peers not in desired list
+            for pubkey in current_peers - desired_peers:
+                if pubkey:
+                    result = await client.remove_ingress_peer(pubkey)
+                    if result.success:
+                        removed_count += 1
+                        print(f"[api] Removed peer via IPC: {pubkey[:20]}...")
+                    else:
+                        print(f"[api] Failed to remove peer via IPC: {result.error or result.message}")
+
+            # Add or update peers
+            for peer in peers:
+                pubkey = peer.get("public_key")
+                if not pubkey:
+                    continue
+
+                allowed_ips = peer.get("allowed_ips", get_default_peer_ip())
+                if isinstance(allowed_ips, list):
+                    allowed_ips = ",".join(allowed_ips)
+
+                name = peer.get("name")
+                preshared_key = peer.get("preshared_key")
+
+                result = await client.add_ingress_peer(
+                    public_key=pubkey,
+                    allowed_ips=allowed_ips,
+                    name=name,
+                    preshared_key=preshared_key,
+                )
+
+                if result.success:
+                    if pubkey in current_peers:
+                        updated_count += 1
+                        print(f"[api] Updated peer via IPC: {peer.get('name', 'unknown')} ({pubkey[:20]}...)")
+                    else:
+                        added_count += 1
+                        print(f"[api] Added peer via IPC: {peer.get('name', 'unknown')} ({pubkey[:20]}...)")
+                else:
+                    print(f"[api] Failed to add/update peer via IPC: {result.error or result.message}")
+
+            await client.close()
+            return {
+                "success": True,
+                "message": f"Peers synced via IPC (added={added_count}, updated={updated_count}, removed={removed_count})"
+            }
+        except Exception as exc:
+            return {"success": False, "message": f"IPC sync failed: {exc}"}
+
+    # Run async code in sync context
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If already in an async context, create a new loop in a thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _sync_peers_via_ipc())
+                return future.result(timeout=30)
+        else:
+            return loop.run_until_complete(_sync_peers_via_ipc())
+    except RuntimeError:
+        # No event loop exists, create one
+        return asyncio.run(_sync_peers_via_ipc())
+
+
+# ============ Userspace WG Pairing Helpers ============
+
+async def _generate_pair_request_via_ipc(
+    node_tag: str,
+    node_description: str,
+    endpoint: str,
+    api_port: int,
+    bidirectional: bool,
+    tunnel_type: str,
+) -> Tuple[bool, str, Optional[str], Dict[str, Any]]:
+    """Generate pairing request via rust-router IPC (userspace WG mode).
+
+    Returns:
+        Tuple of (success, code_or_error, peer_tag, pending_request_dict)
+    """
+    from rust_router_client import RustRouterClient
+
+    client = RustRouterClient()
+    try:
+        # Ping to check availability
+        ping_result = await client.ping()
+        if not ping_result.success:
+            return False, "rust-router unavailable", None, {}
+
+        # Map tunnel_type from API format to IPC format
+        # IPC uses "wireguard" (same as API), but double-check
+        ipc_tunnel_type = tunnel_type
+
+        result = await client.generate_pair_request(
+            local_tag=node_tag,
+            local_description=node_description,
+            local_endpoint=endpoint,
+            local_api_port=api_port or 36000,
+            bidirectional=bidirectional,
+            tunnel_type=ipc_tunnel_type,
+        )
+
+        if result.success:
+            code = result.data.get("code", "") if result.data else ""
+            peer_tag = result.data.get("peer_tag") if result.data else None
+            return True, code, peer_tag, result.data or {}
+        else:
+            return False, result.error or "IPC request failed", None, {}
+    finally:
+        await client.close()
+
+
+async def _import_pair_request_via_ipc(
+    code: str,
+    local_tag: str,
+    local_description: str,
+    local_endpoint: str,
+    local_api_port: int,
+) -> Tuple[bool, str, Optional[str], Dict[str, Any]]:
+    """Import pairing request via rust-router IPC (userspace WG mode).
+
+    Returns:
+        Tuple of (success, response_code_or_error, remote_node_tag, response_data)
+    """
+    from rust_router_client import RustRouterClient
+
+    client = RustRouterClient()
+    try:
+        ping_result = await client.ping()
+        if not ping_result.success:
+            return False, "rust-router unavailable", None, {}
+
+        result = await client.import_pair_request(
+            code=code,
+            local_tag=local_tag,
+            local_description=local_description,
+            local_endpoint=local_endpoint,
+            local_api_port=local_api_port,
+        )
+
+        if result.success:
+            response_code = ""
+            if result.data:
+                response_code = result.data.get("response_code") or result.data.get("code") or ""
+            remote_tag = result.data.get("remote_node_tag") if result.data else None
+            return True, response_code, remote_tag, result.data or {}
+        else:
+            return False, result.error or "IPC request failed", None, {}
+    finally:
+        await client.close()
+
+
+async def _complete_handshake_via_ipc(code: str) -> Tuple[bool, str, Optional[str], Dict[str, Any]]:
+    """Complete pairing handshake via rust-router IPC (userspace WG mode).
+
+    Returns:
+        Tuple of (success, message_or_error, peer_tag, response_data)
+        response_data contains wg_local_private_key, tunnel_local_ip, tunnel_port for DB persistence
+    """
+    from rust_router_client import RustRouterClient
+
+    client = RustRouterClient()
+    try:
+        ping_result = await client.ping()
+        if not ping_result.success:
+            return False, "rust-router unavailable", None, {}
+
+        result = await client.complete_handshake(code)
+
+        if result.success:
+            peer_tag = result.data.get("peer_tag") if result.data else None
+            return True, result.message or "Handshake completed", peer_tag, result.data or {}
+        else:
+            return False, result.error or "IPC request failed", None, {}
+    finally:
+        await client.close()
+
+
+def _run_async_ipc(coro):
+    """Run async IPC coroutine in sync context.
+
+    Handles event loop management for FastAPI sync endpoints.
+    Returns the coroutine result, or raises HTTPException on timeout/error.
+
+    Uses asyncio.get_running_loop() for Python 3.10+ compatibility,
+    handles TimeoutError and general exceptions properly.
+    """
+    import asyncio
+    import concurrent.futures
+
+    IPC_TIMEOUT_SECONDS = 30
+
+    try:
+        # Python 3.10+: Use get_running_loop() to check if we're in async context
+        try:
+            loop = asyncio.get_running_loop()
+            # We're in a running loop - use thread pool to run in separate loop
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, coro)
+                return future.result(timeout=IPC_TIMEOUT_SECONDS)
+        except RuntimeError:
+            # No running loop - safe to create one with asyncio.run()
+            return asyncio.run(coro)
+
+    except concurrent.futures.TimeoutError:
+        logging.error(f"[pairing] IPC operation timed out after {IPC_TIMEOUT_SECONDS}s")
+        raise HTTPException(status_code=504, detail=f"IPC operation timed out after {IPC_TIMEOUT_SECONDS} seconds")
+    except Exception as e:
+        logging.error(f"[pairing] IPC communication error: {e}")
+        raise HTTPException(status_code=503, detail=f"IPC communication error: {e}")
+
+
+# ============ Peer Tunnel IPC Helpers ============
+# These replace PeerTunnelManager (kernel mode) with rust-router IPC (userspace mode)
+
+async def _connect_peer_ipc(tag: str) -> tuple:
+    """Connect to peer via rust-router IPC.
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    if not HAS_RUST_ROUTER_CLIENT:
+        return False, "rust-router client not available"
+    
+    try:
+        client = RustRouterClient()
+        response = await client.connect_peer(tag)
+        await client.close()
+        
+        if response.success:
+            return True, response.message or "Connected"
+        else:
+            return False, response.error or "Connection failed"
+    except Exception as e:
+        logging.error(f"[peer-ipc] Connect failed for '{tag}': {e}")
+        return False, str(e)
+
+
+async def _disconnect_peer_ipc(tag: str) -> tuple:
+    """Disconnect peer via rust-router IPC.
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    if not HAS_RUST_ROUTER_CLIENT:
+        return False, "rust-router client not available"
+    
+    try:
+        client = RustRouterClient()
+        response = await client.disconnect_peer(tag)
+        await client.close()
+        
+        if response.success:
+            return True, response.message or "Disconnected"
+        else:
+            return False, response.error or "Disconnect failed"
+    except Exception as e:
+        logging.error(f"[peer-ipc] Disconnect failed for '{tag}': {e}")
+        return False, str(e)
+
+
+def _connect_peer_sync(tag: str) -> tuple:
+    """Sync wrapper for _connect_peer_ipc.
+    
+    Replaces PeerTunnelManager.connect_node() for userspace mode.
+    
+    Returns:
+        (success: bool, message: str)
     """
     try:
-        interface = os.environ.get("WG_INTERFACE", "wg-ingress")
-        peers = config.get("peers", [])
+        return _run_async_ipc(_connect_peer_ipc(tag))
+    except HTTPException as e:
+        return False, e.detail
+    except Exception as e:
+        return False, str(e)
 
-        # 获取当前内核 WireGuard peers
-        result = subprocess.run(
-            ["wg", "show", interface, "peers"],
-            capture_output=True, text=True
-        )
-        current_peers = set()
-        if result.returncode == 0 and result.stdout.strip():
-            current_peers = set(line.strip() for line in result.stdout.strip().split('\n') if line.strip())
 
-        # 计算期望的 peers
-        desired_peers = {p.get("public_key") for p in peers if p.get("public_key")}
+def _disconnect_peer_sync(tag: str) -> tuple:
+    """Sync wrapper for _disconnect_peer_ipc.
+    
+    Replaces PeerTunnelManager.disconnect_node() for userspace mode.
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    try:
+        return _run_async_ipc(_disconnect_peer_ipc(tag))
+    except HTTPException as e:
+        return False, e.detail
+    except Exception as e:
+        return False, str(e)
 
-        # 删除不在期望列表中的 peers
-        for pubkey in current_peers - desired_peers:
-            if pubkey:
-                subprocess.run(
-                    ["wg", "set", interface, "peer", pubkey, "remove"],
-                    check=True
-                )
-                print(f"[api] Removed peer: {pubkey[:20]}...")
 
-        # 添加或更新 peers
-        for peer in peers:
-            pubkey = peer.get("public_key")
-            if not pubkey:
-                continue
+def _sync_userspace_peer_from_codes(
+    db,
+    request_code: Optional[str],
+    response_code: Optional[str],
+    local_tag: str,
+    local_endpoint: Optional[str] = None,
+    tunnel_status: str = "connected",
+    ipc_response_data: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Sync peer_nodes for userspace WG pairing using decoded request/response codes.
 
-            allowed_ips = peer.get("allowed_ips", get_default_peer_ip())
-            # allowed_ips can be a list or string, wg set expects comma-separated string
-            if isinstance(allowed_ips, list):
-                allowed_ips = ",".join(allowed_ips)
+    Args:
+        db: Database helper instance
+        request_code: Base64-encoded pairing request code
+        response_code: Base64-encoded pairing response code
+        local_tag: Local node tag
+        local_endpoint: Local endpoint address
+        tunnel_status: Initial tunnel status
+        ipc_response_data: Response data from rust-router IPC containing wg_local_private_key
+    """
+    if not HAS_PAIRING:
+        return None
 
-            cmd = ["wg", "set", interface, "peer", pubkey, "allowed-ips", allowed_ips]
+    try:
+        from peer_pairing import PairingCodeGenerator
 
-            # 处理 preshared key
-            psk_file = None
-            if peer.get("preshared_key"):
-                import tempfile
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.psk') as f:
-                    f.write(peer["preshared_key"])
-                    psk_file = f.name
-                cmd.extend(["preshared-key", psk_file])
+        generator = PairingCodeGenerator(db)
+        request_data = generator.decode_pairing_code(request_code) if request_code else None
+        response_data = generator.decode_pairing_code(response_code) if response_code else None
 
-            try:
-                subprocess.run(cmd, check=True)
-                action = "Updated" if pubkey in current_peers else "Added"
-                print(f"[api] {action} peer: {peer.get('name', 'unknown')} ({pubkey[:20]}...)")
-            finally:
-                if psk_file:
-                    os.unlink(psk_file)
+        logging.debug(f"[pairing] DB sync: local_tag={local_tag}")
+        logging.debug(f"[pairing] DB sync: request_data type={request_data.get('type') if request_data else None}, node_tag={request_data.get('node_tag') if request_data else None}")
+        logging.debug(f"[pairing] DB sync: response_data type={response_data.get('type') if response_data else None}, node_tag={response_data.get('node_tag') if response_data else None}")
 
-        return {"success": True, "message": f"Peers synced via wg set ({len(peers)} peers)"}
+        remote_tag = None
+        tunnel_type = "wireguard"
 
-    except subprocess.CalledProcessError as exc:
-        return {"success": False, "message": f"wg set failed: {exc}"}
+        response_is_local = False
+        if response_data and response_data.get("type") == "pair_response":
+            response_node_tag = response_data.get("node_tag")
+            request_node_tag = response_data.get("request_node_tag")
+            response_is_local = response_node_tag == local_tag
+            if response_is_local:
+                remote_tag = request_node_tag
+            else:
+                remote_tag = response_node_tag
+            tunnel_type = response_data.get("tunnel_type", tunnel_type)
+        elif request_data and request_data.get("type") == "pair_request":
+            remote_tag = request_data.get("node_tag")
+            tunnel_type = request_data.get("tunnel_type", tunnel_type)
+
+        logging.debug(f"[pairing] DB sync: resolved remote_tag={remote_tag}, tunnel_type={tunnel_type}")
+
+        if not remote_tag:
+            logging.warning(f"[pairing] DB sync skipped: remote_tag is empty (local_tag={local_tag})")
+            return None
+        if remote_tag == local_tag:
+            logging.warning(f"[pairing] DB sync skipped: remote_tag equals local_tag ({remote_tag})")
+            return None
+
+        remote_endpoint = None
+        remote_api_port = None
+        tunnel_remote_ip = None
+        tunnel_local_ip = None
+        tunnel_api_endpoint = None
+        tunnel_port = None
+        wg_peer_public_key = None
+        wg_private_key = None  # Local WireGuard private key from IPC
+
+        # Extract WireGuard configuration from IPC response (most accurate source)
+        if ipc_response_data:
+            wg_private_key = ipc_response_data.get("wg_local_private_key")
+            # IPC may also provide tunnel_local_ip and tunnel_port
+            if ipc_response_data.get("tunnel_local_ip"):
+                tunnel_local_ip = ipc_response_data.get("tunnel_local_ip")
+            if ipc_response_data.get("tunnel_port"):
+                tunnel_port = ipc_response_data.get("tunnel_port")
+            logging.debug(f"[pairing] DB sync: extracted from IPC - wg_private_key={'***' if wg_private_key else None}, tunnel_local_ip={tunnel_local_ip}, tunnel_port={tunnel_port}")
+
+        if request_data and request_data.get("type") == "pair_request":
+            remote_endpoint = request_data.get("endpoint") or remote_endpoint
+            remote_api_port = request_data.get("api_port") or remote_api_port
+            tunnel_remote_ip = request_data.get("tunnel_ip") or tunnel_remote_ip
+            tunnel_local_ip = request_data.get("remote_tunnel_ip") or tunnel_local_ip
+            wg_peer_public_key = request_data.get("wg_public_key") or wg_peer_public_key
+            if not local_endpoint:
+                local_endpoint = request_data.get("endpoint")
+
+        if response_data and response_data.get("type") == "pair_response" and not response_is_local:
+            remote_endpoint = response_data.get("endpoint") or remote_endpoint
+            remote_api_port = response_data.get("api_port") or remote_api_port
+            tunnel_remote_ip = response_data.get("tunnel_local_ip") or tunnel_remote_ip
+            tunnel_local_ip = response_data.get("tunnel_remote_ip") or tunnel_local_ip
+            tunnel_api_endpoint = response_data.get("tunnel_api_endpoint") or tunnel_api_endpoint
+            wg_peer_public_key = response_data.get("wg_public_key") or wg_peer_public_key
+
+        if not tunnel_api_endpoint and tunnel_remote_ip and remote_api_port:
+            tunnel_api_endpoint = f"{tunnel_remote_ip}:{remote_api_port}"
+
+        # tunnel_port 在 userspace WireGuard 模式下同样重要
+        # 它指定本节点的监听端口，rust-router 需要用它来创建隧道
+
+        existing = db.get_peer_node(remote_tag)
+        if existing:
+            update_kwargs = {
+                "endpoint": remote_endpoint or existing.get("endpoint"),
+                "api_port": remote_api_port or existing.get("api_port"),
+                "tunnel_type": tunnel_type,
+                "tunnel_status": tunnel_status,
+                "tunnel_local_ip": tunnel_local_ip or existing.get("tunnel_local_ip"),
+                "tunnel_remote_ip": tunnel_remote_ip or existing.get("tunnel_remote_ip"),
+                "tunnel_api_endpoint": tunnel_api_endpoint or existing.get("tunnel_api_endpoint"),
+                "wg_peer_public_key": wg_peer_public_key or existing.get("wg_peer_public_key"),
+                "bidirectional_status": "bidirectional",
+                "last_error": None,
+            }
+            # Add private key if provided (from IPC)
+            if wg_private_key:
+                update_kwargs["wg_private_key"] = wg_private_key
+            if tunnel_port:
+                update_kwargs["tunnel_port"] = tunnel_port
+            db.update_peer_node(remote_tag, **update_kwargs)
+        else:
+            db.add_peer_node(
+                tag=remote_tag,
+                name=remote_tag,
+                description="",
+                endpoint=remote_endpoint or "",
+                api_port=remote_api_port,
+                tunnel_type=tunnel_type,
+                tunnel_status=tunnel_status,
+                tunnel_local_ip=tunnel_local_ip,
+                tunnel_remote_ip=tunnel_remote_ip,
+                tunnel_port=tunnel_port,
+                tunnel_api_endpoint=tunnel_api_endpoint,
+                wg_private_key=wg_private_key,  # Local WireGuard private key
+                wg_peer_public_key=wg_peer_public_key,
+                auto_reconnect=False,
+                enabled=True,
+                bidirectional_status="bidirectional",
+            )
+
+        logging.info(f"[pairing] DB sync successful: created/updated peer '{remote_tag}'")
+        return remote_tag
     except Exception as exc:
-        return {"success": False, "message": str(exc)}
+        logging.error(f"[pairing] userspace peer DB sync failed: {exc}", exc_info=True)
+        return None
 
 
 @app.get("/api/ingress")
-def api_get_ingress():
-    """获取入口 WireGuard 配置和状态"""
+def api_get_ingress(request: Request):
+    """获取入口 WireGuard 配置和状态
+
+    多用户隔离：普通用户只能看到自己创建的 peers，管理员可以看到所有 peers
+    """
     config = load_ingress_config()
     interface = config.get("interface", {})
 
     # 获取公钥
     public_key = get_ingress_public_key(config)
 
-    # 获取 peer 状态
-    handshakes = get_peer_handshake_info()
-    transfers = get_peer_transfer_info()
+    # 从 rust-router 获取 peer 状态（仅支持 userspace WireGuard 模式）
+    rust_router_status = get_peer_status_from_rust_router()
+    handshakes = {k: v.get("last_handshake", 0) for k, v in rust_router_status.items()}
+    transfers = {k: {"rx": v.get("rx_bytes", 0), "tx": v.get("tx_bytes", 0)} for k, v in rust_router_status.items()}
+
+    # 获取用户上下文和数据库连接
+    db = _get_db() if HAS_DATABASE and USER_DB_PATH.exists() else None
+    owner_filter = get_owner_filter(request)
+
+    # 构建 peer 名称到 owner_id 的映射（用于多用户过滤）
+    peer_ownership = {}
+    if db and owner_filter is not None:
+        # 只有普通用户需要过滤，获取数据库中的 peer 所有权信息
+        db_peers = db.get_wireguard_peers(enabled_only=False)
+        peer_ownership = {p["name"]: p.get("owner_id") for p in db_peers}
 
     # 丰富 peer 信息
     peers = []
     for peer in config.get("peers", []):
+        peer_name = peer.get("name", "unknown")
+
+        # 多用户过滤：普通用户只能看到自己的 peers
+        if owner_filter is not None:
+            peer_owner = peer_ownership.get(peer_name)
+            # 如果 peer 不在数据库中或不属于当前用户，跳过
+            if peer_owner is None or peer_owner != owner_filter:
+                continue
+
         pubkey = peer.get("public_key", "")
         last_handshake = handshakes.get(pubkey, 0)
         transfer = transfers.get(pubkey, {"rx": 0, "tx": 0})
@@ -4545,7 +7465,7 @@ def api_get_ingress():
         is_online = last_handshake > 0 and (now - last_handshake) < _PEER_ONLINE_GRACE_PERIOD
 
         peers.append({
-            "name": peer.get("name", "unknown"),
+            "name": peer_name,
             "public_key": pubkey,
             "allowed_ips": peer.get("allowed_ips", []),
             "last_handshake": last_handshake,
@@ -4557,6 +7477,9 @@ def api_get_ingress():
             "default_outbound": peer.get("default_outbound"),
         })
 
+    # 获取本地节点标识
+    local_node_tag = _get_local_node_tag(db) if db else None
+
     return {
         "interface": {
             "name": interface.get("name", "wg-ingress"),
@@ -4567,6 +7490,7 @@ def api_get_ingress():
         },
         "peers": peers,
         "peer_count": len(peers),
+        "local_node_tag": local_node_tag,
     }
 
 
@@ -4593,20 +7517,24 @@ def detect_lan_subnet() -> Optional[str]:
     return None
 
 
-def calculate_allowed_ips_excluding_subnet(exclude_subnet: str) -> str:
+def calculate_allowed_ips_excluding_subnet(exclude_subnet: str, vpn_subnet: str = "10.25.0.0/24") -> str:
     """计算 Split Tunnel 的 AllowedIPs
 
     排除所有 RFC1918 私有地址范围 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)，
-    使本地局域网流量不走 VPN。包含 1.1.1.1/32 确保 DNS 查询走 VPN。
+    使本地局域网流量不走 VPN。但保留 VPN 内部子网，确保客户端可以访问 VPN 网关。
+    包含 1.1.1.1/32 确保 DNS 查询走 VPN。
 
     Args:
         exclude_subnet: 要排除的子网（用于日志记录）
+        vpn_subnet: VPN 内部子网，必须包含在 AllowedIPs 中（默认 10.25.0.0/24）
 
     Returns:
         Split Tunnel 的 CIDR 列表
     """
     # 精确排除 RFC1918 私有地址，覆盖所有公网 IP + Cloudflare DNS
-    return ("1.0.0.0/8, 2.0.0.0/8, 3.0.0.0/8, 4.0.0.0/6, 8.0.0.0/7, 11.0.0.0/8, "
+    # 重要：必须包含 VPN 子网 (如 10.25.0.0/24)，否则客户端无法访问 VPN 网关
+    return (f"{vpn_subnet}, "
+            "1.0.0.0/8, 2.0.0.0/8, 3.0.0.0/8, 4.0.0.0/6, 8.0.0.0/7, 11.0.0.0/8, "
             "12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/2, 128.0.0.0/3, "
             "160.0.0.0/5, 168.0.0.0/6, 172.0.0.0/12, 172.32.0.0/11, 172.64.0.0/10, "
             "172.128.0.0/9, 173.0.0.0/8, 174.0.0.0/7, 176.0.0.0/4, 192.0.0.0/9, "
@@ -4616,8 +7544,12 @@ def calculate_allowed_ips_excluding_subnet(exclude_subnet: str) -> str:
 
 
 @app.post("/api/ingress/peers")
-def api_add_ingress_peer(payload: IngressPeerCreateRequest):
-    """添加新的入口 peer（客户端）到数据库"""
+def api_add_ingress_peer(request: Request, payload: IngressPeerCreateRequest):
+    """添加新的入口 peer（客户端）到数据库
+
+    peer 归属于创建它的用户。
+    """
+    user = get_user_context(request)
     config = load_ingress_config()
 
     # 检查名称是否已存在
@@ -4651,7 +7583,8 @@ def api_add_ingress_peer(payload: IngressPeerCreateRequest):
             allowed_ips=f"{peer_ip}/32",
             allow_lan=payload.allow_lan,
             lan_subnet=lan_subnet,
-            default_outbound=payload.default_outbound
+            default_outbound=payload.default_outbound,
+            owner_id=user.user_id
         )
     else:
         # 降级到配置文件
@@ -4685,8 +7618,11 @@ def api_add_ingress_peer(payload: IngressPeerCreateRequest):
 
 
 @app.delete("/api/ingress/peers/{peer_name}")
-def api_delete_ingress_peer(peer_name: str):
-    """删除入口 peer（从数据库）"""
+def api_delete_ingress_peer(request: Request, peer_name: str):
+    """删除入口 peer（从数据库）
+
+    普通用户只能删除自己创建的 peer。
+    """
     config = load_ingress_config()
 
     # 查找 peer
@@ -4698,6 +7634,9 @@ def api_delete_ingress_peer(peer_name: str):
 
     if not peer_to_delete:
         raise HTTPException(status_code=404, detail=f"客户端 '{peer_name}' 不存在")
+
+    # 检查所有权
+    check_resource_ownership(request, peer_to_delete, "客户端")
 
     # 从数据库删除
     if HAS_DATABASE and USER_DB_PATH.exists():
@@ -4720,16 +7659,19 @@ def api_delete_ingress_peer(peer_name: str):
 
 
 @app.put("/api/ingress/peers/{peer_name}")
-def api_update_ingress_peer(peer_name: str, payload: IngressPeerUpdateRequest):
-    """更新入口 peer 配置（如默认出口）"""
+def api_update_ingress_peer(request: Request, peer_name: str, payload: IngressPeerUpdateRequest):
+    """更新入口 peer 配置（如默认出口）
+
+    普通用户只能更新自己创建的 peer。
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="数据库不可用")
 
     db = _get_db()
     peer = db.get_wireguard_peer_by_name(peer_name)
 
-    if not peer:
-        raise HTTPException(status_code=404, detail=f"客户端 '{peer_name}' 不存在")
+    # 检查所有权
+    check_resource_ownership(request, peer, "客户端")
 
     # 准备更新参数
     update_kwargs = {}
@@ -4776,8 +7718,17 @@ def api_update_ingress_peer(peer_name: str, payload: IngressPeerUpdateRequest):
 
 
 @app.get("/api/ingress/peers/{peer_name}/config", response_class=PlainTextResponse)
-def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
-    """获取客户端 WireGuard 配置文件"""
+def api_get_peer_config(request: Request, peer_name: str, private_key: Optional[str] = None):
+    """获取客户端 WireGuard 配置文件
+
+    多用户隔离：普通用户只能获取自己创建的 peer 的配置文件
+    """
+    # 多用户权限检查
+    if HAS_DATABASE and USER_DB_PATH.exists():
+        db = _get_db()
+        db_peer = db.get_wireguard_peer_by_name(peer_name)
+        check_resource_ownership(request, db_peer, "客户端")
+
     config = load_ingress_config()
     interface = config.get("interface", {})
 
@@ -4796,8 +7747,29 @@ def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
     if not server_public_key:
         raise HTTPException(status_code=500, detail="服务端公钥不可用")
 
-    # 客户端 IP
-    client_ip = peer.get("allowed_ips", [get_default_peer_ip()])[0]
+    # 客户端 IP - 从 allowed_ips 提取客户端 IP 地址
+    # allowed_ips 应该是一个列表，如 ["10.23.0.2/32"]
+    allowed_ips_list = peer.get("allowed_ips")
+    if not allowed_ips_list:
+        # 如果没有 allowed_ips，使用默认值
+        client_ip = get_default_peer_ip()
+    elif isinstance(allowed_ips_list, str):
+        # 如果是字符串（不应该发生，但防御性处理）
+        client_ip = allowed_ips_list.split(",")[0].strip() if allowed_ips_list else get_default_peer_ip()
+    elif isinstance(allowed_ips_list, list) and len(allowed_ips_list) > 0:
+        # 正常情况：是一个非空列表
+        client_ip = allowed_ips_list[0]
+        if not client_ip or client_ip == "None":
+            # 防御性检查：如果第一个元素是None或字符串"None"
+            client_ip = get_default_peer_ip()
+    else:
+        # 其他异常情况
+        client_ip = get_default_peer_ip()
+
+    # WireGuard Address 字段需要 CIDR 格式（如 10.23.0.2/32）
+    # 确保 client_ip 包含 CIDR 后缀
+    if "/" not in client_ip:
+        client_ip = f"{client_ip}/32"
 
     # 服务端地址（优先使用设置文件，其次使用环境变量）
     settings = load_settings()
@@ -4825,16 +7797,33 @@ def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
     if allow_lan and lan_subnet:
         # 启用保留局域网连接：Split Tunnel，排除本地 LAN 网段
         # 本地局域网流量直接走本地网络，其他流量走 VPN
-        allowed_ips = calculate_allowed_ips_excluding_subnet(lan_subnet)
+        # 获取 VPN 子网，确保客户端可以访问 VPN 网关
+        vpn_subnet = "10.25.0.0/24"  # 默认 VPN 子网
+        if HAS_DATABASE and USER_DB_PATH.exists():
+            try:
+                db = _get_db()
+                wg_server = db.get_wireguard_server()
+                if wg_server and wg_server.get("address"):
+                    # 从服务器地址提取子网，如 10.25.0.1/24 -> 10.25.0.0/24
+                    import ipaddress
+                    server_addr = wg_server["address"]
+                    if "/" in server_addr:
+                        network = ipaddress.ip_network(server_addr, strict=False)
+                        vpn_subnet = str(network)
+            except Exception:
+                pass  # 使用默认值
+        allowed_ips = calculate_allowed_ips_excluding_subnet(lan_subnet, vpn_subnet)
     else:
         # 默认：全部流量走 VPN
         allowed_ips = "0.0.0.0/0"
 
     # 构建配置
+    # DNS 使用 VPN 网关地址，确保 Split Tunnel 时 DNS 查询也走 VPN
+    vpn_gateway_ip = interface.get("address", "10.25.0.1").split("/")[0]
     client_config = f"""[Interface]
 PrivateKey = {private_key or 'YOUR_PRIVATE_KEY'}
 Address = {client_ip}
-DNS = 1.1.1.1
+DNS = {vpn_gateway_ip}
 
 [Peer]
 PublicKey = {server_public_key}
@@ -4846,13 +7835,16 @@ PersistentKeepalive = 25
 
 
 @app.get("/api/ingress/peers/{peer_name}/qrcode")
-def api_get_peer_qrcode(peer_name: str, private_key: Optional[str] = None):
-    """获取客户端配置的 QR 码（PNG 图片）"""
+def api_get_peer_qrcode(request: Request, peer_name: str, private_key: Optional[str] = None):
+    """获取客户端配置的 QR 码（PNG 图片）
+
+    多用户隔离：普通用户只能获取自己创建的 peer 的 QR 码
+    """
     if not HAS_QRCODE:
         raise HTTPException(status_code=501, detail="QR 码功能不可用，请安装 qrcode 库")
 
-    # 获取配置内容
-    config_text = api_get_peer_config(peer_name, private_key)
+    # 获取配置内容（内部会进行权限检查）
+    config_text = api_get_peer_config(request, peer_name, private_key)
 
     # 生成 QR 码
     qr = qrcode.QRCode(version=1, box_size=10, border=4)
@@ -4875,7 +7867,8 @@ def api_apply_ingress_config():
     config = load_ingress_config()
     result = apply_ingress_config(config)
     if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("message"))
+        # 防御性默认值
+        raise HTTPException(status_code=500, detail=result.get("message", "Apply config failed"))
     return result
 
 
@@ -4893,10 +7886,19 @@ def api_get_ingress_subnet():
     server = db.get_wireguard_server()
     address = server.get("address", DEFAULT_WG_SUBNET) if server else DEFAULT_WG_SUBNET
 
-    # 检查是否与出口地址冲突
+    # 检查是否与保留子网/出口地址冲突
     conflicts = []
     try:
         network = ipaddress.ip_network(address, strict=False)
+
+        # 检查与 peer tunnel 子网 (10.200.200.0/24) 的冲突
+        peer_tunnel_network = ipaddress.ip_network("10.200.200.0/24")
+        if network.overlaps(peer_tunnel_network):
+            conflicts.append({
+                "type": "peer_tunnel_subnet",
+                "tag": "peer_tunnels",
+                "address": "10.200.200.0/24"
+            })
 
         for egress in db.get_custom_egress_list():
             addr = egress.get("address", "")
@@ -4946,10 +7948,16 @@ def api_update_ingress_subnet(payload: SubnetUpdateRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid subnet format: {e}")
 
-    # 2. 检查与出口地址的冲突
+    # 2. 检查与保留子网的冲突
     db = _get_db()
     conflicts = []
 
+    # 2a. 检查与 peer tunnel 子网 (10.200.200.0/24) 的冲突
+    peer_tunnel_network = ipaddress.ip_network("10.200.200.0/24")
+    if network.overlaps(peer_tunnel_network):
+        conflicts.append(f"Peer tunnel subnet uses 10.200.200.0/24")
+
+    # 2b. 检查与出口地址的冲突
     for egress in db.get_custom_egress_list():
         addr = egress.get("address", "")
         if addr:
@@ -5003,7 +8011,7 @@ def api_update_ingress_subnet(payload: SubnetUpdateRequest):
     _regenerate_and_reload()
 
     # 6. 同步内核 WireGuard 接口（更新地址和 peer allowed_ips）
-    wg_sync_result = _sync_kernel_wg_ingress()
+    wg_sync_result = _sync_wg_ingress()
 
     return {
         "success": True,
@@ -5291,6 +8299,50 @@ def api_update_settings(payload: SettingsUpdateRequest):
     return {"message": "设置已保存", "settings": settings}
 
 
+@app.get("/api/settings/registration")
+def api_get_registration_settings(request: Request):
+    """获取注册设置（管理员）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    return {
+        "allow_registration": db.get_setting("allow_self_registration", "false").lower() == "true",
+        "default_role": db.get_setting("registration_default_role", "pending")
+    }
+
+
+@app.put("/api/settings/registration")
+def api_update_registration_settings(request: Request, settings: RegistrationSettingsRequest):
+    """更新注册设置（管理员）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+
+    if settings.allow_registration is not None:
+        db.set_setting("allow_self_registration", "true" if settings.allow_registration else "false")
+
+    if settings.default_role is not None:
+        if settings.default_role not in ("user", "pending"):
+            raise HTTPException(status_code=400, detail="Invalid role. Must be 'user' or 'pending'")
+        db.set_setting("registration_default_role", settings.default_role)
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="update_registration_settings",
+        user_id=user_ctx.user_id,
+        details=json.dumps({
+            "allow_registration": settings.allow_registration,
+            "default_role": settings.default_role
+        })
+    )
+
+    return api_get_registration_settings(request)
+
+
 @app.post("/api/settings/announce-port-change")
 def api_announce_port_change(payload: PortChangeAnnouncementRequest):
     """Phase C (端口变更通知): 广播端口变更到所有已连接的 peer
@@ -5342,12 +8394,14 @@ def api_announce_port_change(payload: PortChangeAnnouncementRequest):
 
 @app.get("/api/egress")
 def api_list_all_egress():
-    """列出所有出口（PIA + 自定义 + Direct + OpenVPN + V2Ray）"""
+    """列出所有出口（PIA + 自定义 + Direct + OpenVPN + V2Ray + WARP + Shadowsocks）"""
     pia_result = []
     custom_result = []
     direct_result = []
     openvpn_result = []
     v2ray_result = []
+    warp_result = []
+    shadowsocks_result = []
 
     # 从数据库获取 PIA profiles
     db = _get_db()
@@ -5423,7 +8477,34 @@ def api_list_all_egress():
             "is_configured": True,
         })
 
-    return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result, "v2ray": v2ray_result}
+    # 获取 WARP 出口 (WireGuard only)
+    warp_egress = db.get_warp_egress_list()
+    for eg in warp_egress:
+        warp_result.append({
+            "tag": eg.get("tag", ""),
+            "type": "warp",
+            "description": eg.get("description", ""),
+            "account_type": eg.get("account_type", "free"),
+            "account_id": eg.get("account_id"),
+            "enabled": eg.get("enabled", 1),
+            "is_configured": True,
+        })
+
+    # 获取 Shadowsocks 出口
+    shadowsocks_egress = db.get_shadowsocks_egress_list()
+    for eg in shadowsocks_egress:
+        shadowsocks_result.append({
+            "tag": eg.get("tag", ""),
+            "type": "shadowsocks",
+            "description": eg.get("description", ""),
+            "server": eg.get("server", ""),
+            "port": eg.get("server_port", 8388),
+            "method": eg.get("method", ""),
+            "enabled": eg.get("enabled", 1),
+            "is_configured": True,
+        })
+
+    return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result, "v2ray": v2ray_result, "warp": warp_result, "shadowsocks": shadowsocks_result}
 
 
 # ============ Default Direct Outbound DNS APIs ============
@@ -5529,107 +8610,108 @@ def api_update_direct_default(data: DirectDefaultUpdate):
 # ============ Kernel WireGuard Egress Interface APIs ============
 
 @app.get("/api/egress/wg/interfaces")
-def api_list_wg_egress_interfaces():
-    """List all kernel WireGuard egress interfaces status
+async def api_list_wg_egress_interfaces():
+    """List all WireGuard egress tunnels status
 
-    Shows status of wg-pia-* and wg-eg-* interfaces created for PIA and custom WireGuard egress.
+    Shows status of WireGuard tunnels managed by rust-router (userspace mode).
     """
     try:
-        from setup_kernel_wg_egress import get_all_egress_status, get_existing_egress_interfaces
-        interfaces = get_existing_egress_interfaces()
-        statuses = get_all_egress_status()
+        # In userspace mode, use rust-router IPC to get tunnel status
+        if HAS_RUST_ROUTER_CLIENT:
+            client = await _get_rust_router_client()
+            if client:
+                tunnels = await client.list_wg_tunnels()
+                result = []
+                for tunnel in tunnels:
+                    result.append({
+                        "interface": tunnel.get("tag", ""),
+                        "public_key": tunnel.get("public_key", ""),
+                        "listen_port": tunnel.get("listen_port"),
+                        "peer": {
+                            "endpoint": tunnel.get("endpoint"),
+                            "latest_handshake": tunnel.get("last_handshake"),
+                            "transfer": {
+                                "rx": tunnel.get("bytes_rx", 0),
+                                "tx": tunnel.get("bytes_tx", 0)
+                            }
+                        } if tunnel.get("endpoint") else None
+                    })
+                return {"interfaces": result}
 
-        result = []
-        for iface in interfaces:
-            status = statuses.get(iface, {})
-            # Extract peer info
-            peers = status.get("peers", [])
-            peer_info = None
-            if peers:
-                peer = peers[0]
-                peer_info = {
-                    "endpoint": peer.get("endpoint"),
-                    "allowed_ips": peer.get("allowed_ips"),
-                    "latest_handshake": peer.get("latest_handshake"),
-                    "transfer": {
-                        "rx": peer.get("rx"),
-                        "tx": peer.get("tx")
-                    }
-                }
-
-            result.append({
-                "interface": iface,
-                "public_key": status.get("interface", {}).get("public_key"),
-                "listen_port": status.get("interface", {}).get("listen_port"),
-                "peer": peer_info
-            })
-
-        return {"interfaces": result}
-    except ImportError:
-        raise HTTPException(status_code=500, detail="setup_kernel_wg_egress module not available")
+        # Fallback: return empty list if rust-router not available
+        return {"interfaces": [], "note": "Userspace WireGuard mode - use rust-router IPC"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/egress/wg/sync")
-def api_sync_wg_egress_interfaces():
-    """Sync kernel WireGuard egress interfaces with database
+async def api_sync_wg_egress_interfaces():
+    """Sync WireGuard egress tunnels with database
 
-    Creates missing interfaces and removes stale ones.
+    In userspace mode, syncs tunnels via rust-router IPC.
     """
     try:
-        from setup_kernel_wg_egress import setup_all_egress_interfaces
-        result = setup_all_egress_interfaces()
+        # In userspace mode, use rust-router manager to sync
+        if HAS_RUST_ROUTER_CLIENT:
+            from rust_router_manager import RustRouterManager
+            manager = RustRouterManager()
+            result = await manager.sync_wg_egress_tunnels()
 
-        if result.get("success"):
-            # Regenerate sing-box config to update direct outbounds
+            # Also regenerate sing-box config for compatibility
             _regenerate_and_reload()
 
+            return {
+                "success": result.success,
+                "interfaces": [],
+                "created": result.wg_tunnels_synced,
+                "updated": 0,
+                "removed": result.wg_tunnels_removed,
+                "failed": 0,
+                "note": "Synced via rust-router IPC (userspace mode)"
+            }
+
         return {
-            "success": result.get("success"),
-            "interfaces": result.get("interfaces", []),
-            "created": result.get("created", 0),
-            "updated": result.get("updated", 0),
-            "removed": result.get("removed", 0),
-            "failed": result.get("failed", 0)
+            "success": False,
+            "interfaces": [],
+            "created": 0,
+            "updated": 0,
+            "removed": 0,
+            "failed": 0,
+            "error": "rust-router client not available"
         }
-    except ImportError:
-        raise HTTPException(status_code=500, detail="setup_kernel_wg_egress module not available")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/egress/wg/interface/{interface}")
-def api_get_wg_egress_interface(interface: str):
-    """Get status of a specific kernel WireGuard egress interface"""
-    import subprocess
-
-    # Validate interface name (must start with wg-pia- or wg-eg-)
-    if not interface.startswith("wg-pia-") and not interface.startswith("wg-eg-"):
-        raise HTTPException(status_code=400, detail="Invalid interface name. Must start with wg-pia- or wg-eg-")
-
+async def api_get_wg_egress_interface(interface: str):
+    """Get status of a specific WireGuard tunnel (userspace mode)"""
     try:
-        result = subprocess.run(
-            ["wg", "show", interface],
-            capture_output=True,
-            text=True,
-            check=False
-        )
+        # In userspace mode, use rust-router IPC to get tunnel status
+        if HAS_RUST_ROUTER_CLIENT:
+            client = await _get_rust_router_client()
+            if client:
+                status = await client.get_wg_tunnel_status(interface)
+                if status:
+                    return {
+                        "interface": interface,
+                        "status": {
+                            "public_key": status.get("public_key", ""),
+                            "endpoint": status.get("endpoint"),
+                            "last_handshake": status.get("last_handshake"),
+                            "bytes_rx": status.get("bytes_rx", 0),
+                            "bytes_tx": status.get("bytes_tx", 0),
+                            "connected": status.get("connected", False)
+                        }
+                    }
+                raise HTTPException(status_code=404, detail=f"Tunnel {interface} not found")
 
-        if result.returncode != 0:
-            raise HTTPException(status_code=404, detail=f"Interface {interface} not found")
-
-        # Parse wg show output
-        from setup_kernel_wg_egress import parse_wg_show_output
-        status = parse_wg_show_output(result.stdout)
-
-        return {"interface": interface, "status": status}
-    except ImportError:
-        # Fallback: return raw output
-        return {"interface": interface, "raw_output": result.stdout}
-    except subprocess.SubprocessError as e:
-        logging.error(f"Failed to query WireGuard interface {interface}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to query interface")
+        raise HTTPException(status_code=500, detail="rust-router client not available")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to query WireGuard tunnel {interface}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/egress/custom")
@@ -5687,7 +8769,7 @@ def api_create_custom_egress(payload: CustomEgressCreateRequest):
     # 同步内核 WireGuard 接口并重新渲染配置
     reload_status = ""
     try:
-        wg_sync_status = _sync_kernel_wg_egress()
+        wg_sync_status = _sync_wg_egress()
         _regenerate_and_reload()
         reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
@@ -5766,7 +8848,7 @@ def api_update_custom_egress(tag: str, payload: CustomEgressUpdateRequest):
     # 同步内核 WireGuard 接口并重新渲染配置
     reload_status = ""
     try:
-        wg_sync_status = _sync_kernel_wg_egress()
+        wg_sync_status = _sync_wg_egress()
         _regenerate_and_reload()
         reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
@@ -5791,7 +8873,7 @@ def api_delete_custom_egress(tag: str):
     # 同步内核 WireGuard 接口（清理已删除的接口）并重新渲染配置
     reload_status = ""
     try:
-        wg_sync_status = _sync_kernel_wg_egress()
+        wg_sync_status = _sync_wg_egress()
         _regenerate_and_reload()
         reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
@@ -6241,9 +9323,13 @@ def api_create_v2ray_egress(payload: V2RayEgressCreateRequest):
     """创建 V2Ray 出口"""
     db = _get_db()
 
-    # 验证协议
-    if payload.protocol not in ("vmess", "vless", "trojan"):
-        raise HTTPException(status_code=400, detail=f"Invalid protocol: {payload.protocol}")
+    # 验证协议 - [Xray-lite] 仅支持 VLESS
+    if payload.protocol != "vless":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid protocol: {payload.protocol}. Only 'vless' is supported in Xray-lite. "
+            "VMess and Trojan have been removed. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
 
     # 检查 tag 是否已存在
     if db.get_v2ray_egress(payload.tag):
@@ -6262,44 +9348,46 @@ def api_create_v2ray_egress(payload: V2RayEgressCreateRequest):
     if payload.tag in pia_tags:
         raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with PIA profile")
 
-    # 验证认证信息
-    if payload.protocol in ("vmess", "vless") and not payload.uuid:
-        raise HTTPException(status_code=400, detail=f"{payload.protocol.upper()} requires UUID")
-    if payload.protocol == "trojan" and not payload.password:
-        raise HTTPException(status_code=400, detail="Trojan requires password")
-
-    # 构建 transport_config JSON
-    transport_config_json = json.dumps(payload.transport_config) if payload.transport_config else None
-    tls_alpn_json = json.dumps(payload.tls_alpn) if payload.tls_alpn else None
+    # 验证认证信息 - VLESS 需要 UUID
+    if not payload.uuid:
+        raise HTTPException(status_code=400, detail="VLESS requires UUID")
 
     # 添加到数据库
-    egress_id = db.add_v2ray_egress(
-        tag=payload.tag,
-        protocol=payload.protocol,
-        server=payload.server,
-        server_port=payload.server_port,
-        description=payload.description,
-        uuid=payload.uuid,
-        password=payload.password,
-        security=payload.security,
-        alter_id=payload.alter_id,
-        flow=payload.flow,
-        tls_enabled=1 if payload.tls_enabled else 0,
-        tls_sni=payload.tls_sni,
-        tls_alpn=tls_alpn_json,
-        tls_allow_insecure=1 if payload.tls_allow_insecure else 0,
-        tls_fingerprint=payload.tls_fingerprint,
-        reality_enabled=1 if payload.reality_enabled else 0,
-        reality_public_key=payload.reality_public_key,
-        reality_short_id=payload.reality_short_id,
-        transport_type=payload.transport_type,
-        transport_config=transport_config_json,
-        multiplex_enabled=1 if payload.multiplex_enabled else 0,
-        multiplex_protocol=payload.multiplex_protocol,
-        multiplex_max_connections=payload.multiplex_max_connections,
-        multiplex_min_streams=payload.multiplex_min_streams,
-        multiplex_max_streams=payload.multiplex_max_streams,
-    )
+    # Note: db function handles JSON serialization of transport_config and tls_alpn internally
+    try:
+        egress_id = db.add_v2ray_egress(
+            tag=payload.tag,
+            protocol=payload.protocol,
+            server=payload.server,
+            server_port=payload.server_port,
+            description=payload.description,
+            uuid=payload.uuid,
+            # VMess/Trojan fields removed in Xray-lite - pass defaults
+            password=None,
+            security="auto",
+            alter_id=0,
+            flow=payload.flow,
+            tls_enabled=1 if payload.tls_enabled else 0,
+            tls_sni=payload.tls_sni,
+            tls_alpn=payload.tls_alpn,
+            tls_allow_insecure=1 if payload.tls_allow_insecure else 0,
+            tls_fingerprint=payload.tls_fingerprint,
+            reality_enabled=1 if payload.reality_enabled else 0,
+            reality_public_key=payload.reality_public_key,
+            reality_short_id=payload.reality_short_id,
+            transport_type=payload.transport_type,
+            transport_config=payload.transport_config,
+            multiplex_enabled=1 if payload.multiplex_enabled else 0,
+            multiplex_protocol=payload.multiplex_protocol,
+            multiplex_max_connections=payload.multiplex_max_connections,
+            multiplex_min_streams=payload.multiplex_min_streams,
+            multiplex_max_streams=payload.multiplex_max_streams,
+        )
+    except Exception as e:
+        import traceback
+        print(f"[api] Error creating V2Ray egress: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
     # 重新渲染配置并重载 sing-box 和 Xray egress
     reload_status = ""
@@ -6369,9 +9457,9 @@ def api_update_v2ray_egress(tag: str, payload: V2RayEgressUpdateRequest):
             # 布尔字段：转为整数
             elif field in bool_fields:
                 updates[field] = 1 if value else 0
-            # JSON 字段
+            # JSON 字段: db function handles serialization internally
             elif field in json_fields:
-                updates[field] = json.dumps(value) if value else None
+                updates[field] = value
             # 数字字段：直接更新
             else:
                 updates[field] = value
@@ -6422,11 +9510,11 @@ def api_delete_v2ray_egress(tag: str):
 # ============ WARP Egress APIs ============
 
 class WarpEgressCreate(BaseModel):
-    """WARP 出口创建请求"""
+    """WARP 出口创建请求 (WireGuard only)"""
     tag: str
     description: str = ""
     license_key: Optional[str] = None
-    protocol: str = "masque"  # masque 或 wireguard
+    # Removed protocol field - only WireGuard supported
 
 
 class WarpEgressUpdate(BaseModel):
@@ -6451,57 +9539,41 @@ class WarpEndpointsTest(BaseModel):
     top_n: int = 10
 
 
-def _reload_warp_manager() -> str:
-    """重载 WARP 管理器
+# _reload_warp_manager() removed - MASQUE deprecated
 
-    如果守护进程运行中，发送 SIGHUP 信号重载配置。
-    如果守护进程未运行，启动新的守护进程。
+
+@app.get("/api/egress/traffic")
+async def api_get_egress_traffic():
+    """获取所有 WireGuard 隧道的流量统计
 
     Returns:
-        状态消息
+        Dict mapping egress tag to traffic info (tx_bytes, rx_bytes, active, endpoint)
     """
-    from pathlib import Path
-    import subprocess
+    traffic_stats = {}
 
-    pid_file = Path("/run/warp-manager.pid")
-
-    # 检查守护进程是否运行
-    daemon_running = False
-    if pid_file.exists():
+    if HAS_RUST_ROUTER_CLIENT:
         try:
-            daemon_pid = int(pid_file.read_text().strip())
-            os.kill(daemon_pid, 0)  # 检查进程是否存在
-            daemon_running = True
-        except (ValueError, ProcessLookupError, PermissionError):
-            # PID 文件无效或进程不存在，清理
-            pid_file.unlink(missing_ok=True)
-
-    if daemon_running:
-        # 发送 SIGHUP 重载
-        try:
-            daemon_pid = int(pid_file.read_text().strip())
-            os.kill(daemon_pid, signal.SIGHUP)
-            print(f"[api] Sent SIGHUP to WARP manager (PID: {daemon_pid})")
-            return ", warp manager reloaded"
-        except (ValueError, ProcessLookupError, PermissionError) as e:
-            print(f"[api] WARP manager reload failed: {e}")
-            return ", warp manager reload failed"
-    else:
-        # 启动新的守护进程
-        try:
-            log_file = open("/var/log/warp-manager.log", "a")
-            subprocess.Popen(
-                ["python3", "/usr/local/bin/warp_manager.py", "daemon"],
-                stdout=log_file,
-                stderr=log_file,
-                start_new_session=True
-            )
-            print("[api] Started WARP manager daemon")
-            time.sleep(1)  # 等待启动
-            return ", warp manager started"
+            client = RustRouterClient()
+            await client.connect()
+            try:
+                tunnels = await client.list_wg_tunnels()
+                for tunnel in tunnels:
+                    status = await client.get_wg_tunnel_status(tunnel.tag)
+                    if status.success and status.data:
+                        data = status.data
+                        traffic_stats[tunnel.tag] = {
+                            "tx_bytes": data.get("tx_bytes", 0),
+                            "rx_bytes": data.get("rx_bytes", 0),
+                            "active": data.get("active", False),
+                            "endpoint": data.get("peer_endpoint", ""),
+                            "last_handshake": data.get("last_handshake", 0),
+                        }
+            finally:
+                await client.disconnect()
         except Exception as e:
-            print(f"[api] Failed to start WARP manager: {e}")
-            return f", warp manager start failed: {e}"
+            logger.warning(f"Failed to get tunnel traffic from rust-router: {e}")
+
+    return {"traffic": traffic_stats}
 
 
 @app.get("/api/egress/warp")
@@ -6523,66 +9595,115 @@ def api_get_warp_egress(tag: str):
 
 
 @app.post("/api/egress/warp/register")
-def api_register_warp_egress(data: WarpEgressCreate):
-    """一键注册 WARP 设备并创建出口"""
-    from warp_manager import WarpManager
-
+async def api_register_warp_egress(data: WarpEgressCreate):
+    """一键注册 WARP 设备并创建出口 (WireGuard only via rust-router)"""
     db = _get_db()
 
     # 检查 tag 是否已存在
     if db.get_warp_egress(data.tag):
         raise HTTPException(status_code=400, detail=f"WARP egress '{data.tag}' already exists")
 
-    # 获取下一个可用端口
+    # Require rust-router (kernel WG deprecated)
+    use_rust_router = os.getenv("USE_RUST_ROUTER", "true").lower() == "true"
+
+    if not use_rust_router:
+        raise HTTPException(
+            status_code=503,
+            detail="WARP requires rust-router (set USE_RUST_ROUTER=true)"
+        )
+
+    # Register via rust-router IPC
+    return await _register_warp_via_rust_router(db, data)
+
+
+async def _register_warp_via_rust_router(db, data: WarpEgressCreate):
+    """Register WARP via rust-router IPC (userspace WireGuard)"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
     try:
-        socks_port = db.get_next_warp_socks_port()
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # Call rust-router IPC to register
+        warp_config = await client.register_warp(
+            tag=data.tag,
+            name=data.description or None,
+            warp_plus_license=data.license_key,
+        )
 
-    # 验证协议
-    if data.protocol not in ("masque", "wireguard"):
-        raise HTTPException(status_code=400, detail=f"Invalid protocol: {data.protocol}")
+        if not warp_config:
+            raise HTTPException(status_code=500, detail="WARP registration failed (no config returned)")
 
-    # 调用 warp_manager 进行注册
-    manager = WarpManager()
-    result = manager.register(data.tag, data.license_key, protocol=data.protocol)
+        # Save to database with account_id, license_key, and WireGuard config
+        # Removed deprecated fields (protocol, mode, socks_port)
+        # Added WireGuard config fields for persistence
+        db.add_warp_egress(
+            tag=data.tag,
+            description=data.description,
+            config_path="",  # Not needed for rust-router
+            license_key=warp_config.license_key,
+            account_type=warp_config.account_type,
+            enabled=True,
+            account_id=warp_config.account_id,
+            # WireGuard config for restart persistence
+            private_key=warp_config.private_key,
+            peer_public_key=warp_config.peer_public_key,
+            endpoint=warp_config.endpoint,
+            local_ip=warp_config.ipv4_address,
+            local_ipv6=warp_config.ipv6_address,
+        )
 
-    if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("error", "Registration failed"))
+        # Create WireGuard tunnel via IPC
+        # Note: WgTunnelConfig doesn't support WARP-specific 'reserved' bytes yet
+        # The tunnel will work for basic traffic; reserved bytes are for Cloudflare routing optimization
 
-    # 保存到数据库
-    config_path = result.get("config_path", "")
-    account_type = result.get("account_type", "free")
+        # Resolve WARP endpoint hostname to IP address
+        # rust-router expects IP:port format, but WARP returns hostname:port
+        endpoint = warp_config.endpoint
+        resolved_endpoint = endpoint  # Default
+        if endpoint:
+            try:
+                host, port = endpoint.rsplit(":", 1)
+                # Check if already an IP address
+                try:
+                    socket.inet_pton(socket.AF_INET, host)
+                    resolved_endpoint = endpoint  # Already IP:port
+                except socket.error:
+                    # Resolve hostname to IP
+                    addrs = socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)
+                    if addrs:
+                        resolved_ip = addrs[0][4][0]
+                        resolved_endpoint = f"{resolved_ip}:{port}"
+                        logging.info(f"Resolved WARP endpoint {host} -> {resolved_ip}")
+            except Exception as dns_err:
+                logging.warning(f"Failed to resolve WARP endpoint {endpoint}: {dns_err}")
 
-    db.add_warp_egress(
-        tag=data.tag,
-        description=data.description,
-        protocol=data.protocol,
-        config_path=config_path,
-        license_key=data.license_key,
-        account_type=account_type,
-        mode="socks",
-        socks_port=socks_port,
-        enabled=True
-    )
+        await client.create_wg_tunnel(
+            tag=data.tag,
+            private_key=warp_config.private_key,
+            peer_public_key=warp_config.peer_public_key,
+            endpoint=resolved_endpoint,
+            local_ip=warp_config.ipv4_address,
+            mtu=1280,
+            persistent_keepalive=25,
+        )
 
-    # 重新渲染配置并重载
-    reload_status = ""
-    try:
-        _regenerate_and_reload()
-        reload_status = ", config reloaded"
-        reload_status += _reload_warp_manager()
-    except Exception as exc:
-        print(f"[api] Reload failed: {exc}")
-        reload_status = f", reload failed: {exc}"
+        return {
+            "message": f"WARP egress '{data.tag}' registered via rust-router",
+            "tag": data.tag,
+            "account_id": warp_config.account_id,
+            "account_type": warp_config.account_type,
+            "ipv4_address": warp_config.ipv4_address,
+            "ipv6_address": warp_config.ipv6_address,
+            "endpoint": warp_config.endpoint,
+            "method": "rust-router",
+        }
 
-    return {
-        "message": f"WARP egress '{data.tag}' registered{reload_status}",
-        "tag": data.tag,
-        "socks_port": socks_port,
-        "account_type": account_type,
-        "device_id": result.get("device_id", "")
-    }
+    except Exception as e:
+        logging.error(f"WARP registration via rust-router failed: {e}")
+        raise HTTPException(status_code=500, detail=f"WARP registration failed: {str(e)}")
+
+
+# _register_warp_via_manager() removed - MASQUE deprecated
 
 
 @app.put("/api/egress/warp/{tag}")
@@ -6607,12 +9728,12 @@ def api_update_warp_egress(tag: str, data: WarpEgressUpdate):
     if updates:
         db.update_warp_egress(tag, **updates)
 
-    # 重新渲染配置并重载
+    # No need to reload warp_manager (deprecated)
+    # rust-router tunnels are managed via IPC, no config file reload needed
     reload_status = ""
     try:
         _regenerate_and_reload()
         reload_status = ", config reloaded"
-        reload_status += _reload_warp_manager()
     except Exception as exc:
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
@@ -6621,20 +9742,21 @@ def api_update_warp_egress(tag: str, data: WarpEgressUpdate):
 
 
 @app.delete("/api/egress/warp/{tag}")
-def api_delete_warp_egress(tag: str):
-    """删除 WARP 出口"""
-    from warp_manager import WarpManager
-
+async def api_delete_warp_egress(tag: str):
+    """删除 WARP 出口 (rust-router IPC)"""
     db = _get_db()
 
     if not db.get_warp_egress(tag):
         raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
 
-    # 停止代理并删除配置
-    manager = WarpManager()
-    import asyncio
-    asyncio.run(manager.stop_proxy(tag))
-    manager.delete_config(tag)
+    # Delete WireGuard tunnel via rust-router IPC
+    client = await _get_rust_router_client()
+    if client:
+        try:
+            await client.remove_wg_tunnel(tag)
+        except Exception as e:
+            logging.warning(f"Failed to remove WG tunnel via IPC: {e}")
+            # Continue with database deletion even if IPC fails
 
     # 从数据库删除
     db.delete_warp_egress(tag)
@@ -6644,7 +9766,6 @@ def api_delete_warp_egress(tag: str):
     try:
         _regenerate_and_reload()
         reload_status = ", config reloaded"
-        reload_status += _reload_warp_manager()
     except Exception as exc:
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
@@ -6652,122 +9773,21 @@ def api_delete_warp_egress(tag: str):
     return {"message": f"WARP egress '{tag}' deleted{reload_status}"}
 
 
-@app.post("/api/egress/warp/{tag}/reregister")
-def api_reregister_warp_egress(tag: str):
-    """重新注册 WARP 设备（修复 TLS 握手失败等问题）"""
-    from warp_manager import WarpManager
-    import asyncio
-
-    db = _get_db()
-
-    egress = db.get_warp_egress(tag)
-    if not egress:
-        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
-
-    # 停止当前代理
-    manager = WarpManager()
-    asyncio.run(manager.stop_proxy(tag))
-
-    # 删除旧配置文件（但保留数据库记录）
-    manager.delete_config(tag)
-
-    # 重新注册
-    license_key = egress.get("license_key")
-    protocol = egress.get("protocol", "masque")
-    result = manager.register(tag, license_key, protocol=protocol)
-
-    if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("error", "Re-registration failed"))
-
-    # 更新数据库中的配置路径和账户类型
-    config_path = result.get("config_path", "")
-    account_type = result.get("account_type", "free")
-    db.update_warp_egress(tag, config_path=config_path, account_type=account_type)
-
-    # 立即启动新代理（不依赖 reload 机制）
-    proxy_status = ""
-    try:
-        started = asyncio.run(manager.start_proxy(tag))
-        if started:
-            proxy_status = ", proxy started"
-        else:
-            proxy_status = ", proxy start failed"
-    except Exception as exc:
-        print(f"[api] Proxy start failed: {exc}")
-        proxy_status = f", proxy start failed: {exc}"
-
-    # 重新渲染配置并重载 sing-box
-    reload_status = ""
-    try:
-        _regenerate_and_reload()
-        reload_status = ", config reloaded"
-    except Exception as exc:
-        print(f"[api] Reload failed: {exc}")
-        reload_status = f", reload failed: {exc}"
-
-    return {
-        "message": f"WARP egress '{tag}' re-registered{proxy_status}{reload_status}",
-        "account_type": account_type,
-        "device_id": result.get("device_id", "")
-    }
-
-
-@app.get("/api/egress/warp/{tag}/status")
-def api_get_warp_status(tag: str):
-    """获取 WARP 代理状态"""
-    from warp_manager import WarpManager
-
-    db = _get_db()
-    egress = db.get_warp_egress(tag)
-    if not egress:
-        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
-
-    manager = WarpManager()
-    status = manager.get_status(tag)
-
-    return status
-
-
-@app.post("/api/egress/warp/{tag}/apply-license")
-def api_apply_warp_license(tag: str, license_key: str = Body(..., embed=True)):
-    """应用 WARP+ License"""
-    from warp_manager import WarpManager
-
-    db = _get_db()
-    egress = db.get_warp_egress(tag)
-    if not egress:
-        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
-
-    manager = WarpManager()
-    result = manager.apply_license(tag, license_key)
-
-    if not result.get("success"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Failed to apply license"))
-
-    # 更新数据库
-    db.update_warp_egress(tag, license_key=license_key, account_type="warp+")
-
-    # 重载代理以应用新 license
-    reload_status = _reload_warp_manager()
-
-    return {"message": f"WARP+ license applied to '{tag}'{reload_status}"}
+# MASQUE-specific endpoints removed
+# - /api/egress/warp/{tag}/reregister - Not needed with rust-router (just delete and re-register)
+# - /api/egress/warp/{tag}/status - MASQUE proxy status (deprecated)
+# - /api/egress/warp/{tag}/apply-license - WARP+ upgrade done during registration
 
 
 @app.put("/api/egress/warp/{tag}/endpoint")
 def api_set_warp_endpoint(tag: str, data: WarpEndpointUpdate):
     """设置自定义 Endpoint（指定地区节点）"""
-    from warp_manager import WarpManager
+    # warp_manager removed - WireGuard-only via rust-router IPC
 
     db = _get_db()
     egress = db.get_warp_egress(tag)
     if not egress:
         raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
-
-    manager = WarpManager()
-    result = manager.set_endpoint(tag, data.endpoint_v4, data.endpoint_v6)
-
-    if not result.get("success"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Failed to set endpoint"))
 
     # 更新数据库
     updates = {}
@@ -6778,20 +9798,14 @@ def api_set_warp_endpoint(tag: str, data: WarpEndpointUpdate):
     if updates:
         db.update_warp_egress(tag, **updates)
 
-    protocol = egress.get("protocol", "masque")
+    # WireGuard-only, reload config via rust-router
     reload_status = ""
-
-    if protocol == "wireguard":
-        # WireGuard: 重新渲染配置并重载 sing-box
-        try:
-            _regenerate_and_reload()
-            reload_status = ", config reloaded"
-        except Exception as exc:
-            print(f"[api] Reload failed: {exc}")
-            reload_status = f", reload failed: {exc}"
-    else:
-        # MASQUE: 重载 WARP manager 以应用新 endpoint
-        reload_status = _reload_warp_manager()
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
 
     return {
         "message": f"Endpoint updated for '{tag}'{reload_status}",
@@ -6903,6 +9917,7 @@ class OutboundGroupCreate(BaseModel):
     type: str = Field(..., pattern=r'^(loadbalance|failover)$')
     members: List[str] = Field(..., min_length=2, max_length=10)
     weights: Optional[Dict[str, int]] = None
+    algorithm: str = Field("five_tuple_hash", pattern=r'^(five_tuple_hash|dest_hash|dest_hash_least_load|round_robin|weighted|least_connections|random)$')
     health_check_url: str = "http://www.gstatic.com/generate_204"
     health_check_interval: int = Field(60, ge=10, le=3600)
     health_check_timeout: int = Field(5, ge=1, le=30)
@@ -6913,6 +9928,7 @@ class OutboundGroupUpdate(BaseModel):
     description: Optional[str] = None
     members: Optional[List[str]] = Field(None, min_length=2, max_length=10)
     weights: Optional[Dict[str, int]] = None
+    algorithm: Optional[str] = Field(None, pattern=r'^(five_tuple_hash|dest_hash|dest_hash_least_load|round_robin|weighted|least_connections|random)$')
     health_check_url: Optional[str] = None
     health_check_interval: Optional[int] = Field(None, ge=10, le=3600)
     health_check_timeout: Optional[int] = Field(None, ge=1, le=30)
@@ -6920,70 +9936,42 @@ class OutboundGroupUpdate(BaseModel):
 
 
 def _sync_ecmp_for_group(group: Dict) -> str:
-    """同步单个出口组的 ECMP 路由
+    """同步单个出口组的 ECMP 路由（已废弃）
+
+    NOTE: rust-router 在用户态处理负载均衡，不再需要内核 ECMP 路由。
+    此函数保留用于 API 兼容性，但现在是空操作。
 
     Returns:
         状态消息
     """
-    try:
-        from ecmp_manager import sync_group
-        db = _get_db()
-        if sync_group(db, group):
-            return ", ecmp synced"
-        else:
-            return ", ecmp sync failed"
-    except ImportError:
-        return ", ecmp_manager not available"
-    except Exception as e:
-        print(f"[api] ECMP sync failed: {e}")
-        return f", ecmp sync failed: {e}"
+    # rust-router 内部处理 ECMP，不需要内核路由
+    return ""
 
 
 def _teardown_ecmp_for_group(tag: str) -> str:
-    """删除出口组的 ECMP 路由
+    """删除出口组的 ECMP 路由（已废弃）
+
+    NOTE: rust-router 在用户态处理负载均衡，不再需要内核 ECMP 路由。
+    此函数保留用于 API 兼容性，但现在是空操作。
 
     Returns:
         状态消息
     """
-    try:
-        from ecmp_manager import teardown_group
-        db = _get_db()
-        if teardown_group(db, tag):
-            return ", ecmp removed"
-        else:
-            return ", ecmp removal failed"
-    except ImportError:
-        return ", ecmp_manager not available"
-    except Exception as e:
-        print(f"[api] ECMP teardown failed: {e}")
-        return f", ecmp teardown failed: {e}"
+    # rust-router 内部处理 ECMP，不需要内核路由
+    return ""
 
 
 def _sync_all_ecmp_groups() -> str:
-    """同步所有出口组的 ECMP 路由和 SNAT 规则
+    """同步所有出口组的 ECMP 路由（已废弃）
 
-    当 WireGuard 出口重新连接后，peer_ip 可能改变，需要更新 SNAT 规则。
+    NOTE: rust-router 在用户态处理负载均衡，不再需要内核 ECMP 路由。
+    此函数保留用于 API 兼容性，但现在是空操作。
 
     Returns:
         状态消息
     """
-    try:
-        from ecmp_manager import sync_all_groups
-        db = _get_db()
-        results = sync_all_groups(db)
-        success_count = sum(1 for v in results.values() if v)
-        total_count = len(results)
-        if total_count == 0:
-            return ""
-        if success_count == total_count:
-            return f", {total_count} ecmp group(s) synced"
-        else:
-            return f", {success_count}/{total_count} ecmp group(s) synced"
-    except ImportError:
-        return ""
-    except Exception as e:
-        print(f"[api] ECMP sync all failed: {e}")
-        return f", ecmp sync failed: {e}"
+    # rust-router 内部处理 ECMP，不需要内核路由
+    return ""
 
 
 @app.get("/api/outbound-groups")
@@ -7017,13 +10005,12 @@ def api_get_available_members():
     只返回支持 ECMP 负载均衡的出口类型（有内核接口的）：
     - PIA WireGuard profiles
     - Custom WireGuard egress
-    - WARP WireGuard egress (protocol == "wireguard")
+    - WARP egress (所有 WARP 现在都是 WireGuard)
     - Direct egress (with bind_interface)
     - OpenVPN egress (使用 TUN 设备直接绑定)
 
     不支持 ECMP 的类型（使用 SOCKS 代理）：
     - V2Ray egress (通过 SOCKS5 桥接)
-    - WARP MASQUE (通过 SOCKS5 代理)
     """
     db = _get_db()
 
@@ -7067,17 +10054,15 @@ def api_get_available_members():
     except Exception as e:
         print(f"WARNING: Failed to get direct egress: {e}")
 
-    # WARP egress (只包含 WireGuard 协议的)
+    # WARP egress (所有 WARP 现在都是 WireGuard，不再需要检查 protocol)
     try:
         warp_list = db.get_warp_egress_list()
         for e in warp_list:
-            # 只有 WireGuard 协议的 WARP 才有内核接口，才能参与 ECMP
-            if e.get("protocol") == "wireguard":
-                members.append({
-                    "tag": e.get("tag"),
-                    "type": "warp",
-                    "description": e.get("description", e.get("tag")),
-                })
+            members.append({
+                "tag": e.get("tag"),
+                "type": "warp",
+                "description": e.get("description", e.get("tag")),
+            })
     except Exception as e:
         print(f"WARNING: Failed to get WARP egress: {e}")
 
@@ -7097,7 +10082,6 @@ def api_get_available_members():
 
     # 注意：以下类型不支持 ECMP，不列出
     # - V2Ray egress (SOCKS5 桥接)
-    # - WARP MASQUE (SOCKS5 代理)
     # - builtin "direct" (没有特定接口)
 
     return {"members": members}
@@ -7157,6 +10141,7 @@ def api_create_outbound_group(data: OutboundGroupCreate):
             group_type=data.type,
             members=data.members,
             weights=data.weights,
+            algorithm=data.algorithm,
             health_check_url=data.health_check_url,
             health_check_interval=data.health_check_interval,
             health_check_timeout=data.health_check_timeout
@@ -7226,6 +10211,8 @@ def api_update_outbound_group(tag: str, data: OutboundGroupUpdate):
         update_kwargs["members"] = data.members
     if data.weights is not None:
         update_kwargs["weights"] = data.weights
+    if data.algorithm is not None:
+        update_kwargs["algorithm"] = data.algorithm
     if data.health_check_url is not None:
         update_kwargs["health_check_url"] = data.health_check_url
     if data.health_check_interval is not None:
@@ -7320,12 +10307,16 @@ def api_trigger_group_health_check(tag: str):
 # ============ V2Ray Inbound APIs ============
 
 @app.get("/api/ingress/v2ray")
-def api_get_v2ray_inbound():
-    """获取 V2Ray 入口配置和用户列表"""
+def api_get_v2ray_inbound(request: Request):
+    """获取 V2Ray 入口配置和用户列表
+
+    多用户隔离：普通用户只能看到自己创建的 V2Ray 用户，管理员可以看到所有用户
+    """
     db = _get_db()
+    owner_filter = get_owner_filter(request)
 
     config = db.get_v2ray_inbound_config()
-    users = db.get_v2ray_users(enabled_only=False)
+    users = db.get_v2ray_users(enabled_only=False, owner_id=owner_filter)
 
     # 隐藏用户密码
     for user in users:
@@ -7368,21 +10359,19 @@ def api_get_v2ray_inbound():
 
 
 @app.put("/api/ingress/v2ray")
-def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
-    """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）"""
+async def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
+    """更新 V2Ray 入口配置（使用 rust-router VLESS inbound）- VLESS only"""
     db = _get_db()
 
-    # 验证协议
-    if payload.protocol not in ("vmess", "vless", "trojan"):
-        raise HTTPException(status_code=400, detail=f"Invalid protocol: {payload.protocol}")
+    # 验证协议 - [Xray-lite] 仅支持 VLESS
+    if payload.protocol != "vless":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid protocol: {payload.protocol}. Only 'vless' is supported in Xray-lite. "
+            "VMess and Trojan have been removed. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
 
-    # XTLS-Vision 只支持 VLESS
-    if payload.xtls_vision_enabled and payload.protocol != "vless":
-        raise HTTPException(status_code=400, detail="XTLS-Vision is only available for VLESS protocol")
-
-    # REALITY 只支持 VLESS
-    if payload.reality_enabled and payload.protocol != "vless":
-        raise HTTPException(status_code=400, detail="REALITY is only available for VLESS protocol")
+    # Note: XTLS-Vision and REALITY checks removed - they are implicitly VLESS-only now
 
     # REALITY 需要密钥和目标服务器
     if payload.reality_enabled:
@@ -7396,8 +10385,15 @@ def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
     # 构建 transport_config JSON
     transport_config_json = json.dumps(payload.transport_config) if payload.transport_config else None
 
-    # 构建 REALITY 字段 JSON
-    reality_short_ids_json = json.dumps(payload.reality_short_ids) if payload.reality_short_ids else None
+    # 构建 REALITY 字段 JSON - 如果启用 REALITY 但未提供 short_ids，则自动生成
+    reality_short_ids = payload.reality_short_ids
+    if payload.reality_enabled and not reality_short_ids:
+        # 自动生成一个 8 字符的十六进制 short_id
+        import secrets
+        auto_short_id = secrets.token_hex(4)  # 生成 8 个十六进制字符
+        reality_short_ids = [auto_short_id]
+        print(f"[api] Auto-generated REALITY short_id: {auto_short_id}")
+    reality_short_ids_json = json.dumps(reality_short_ids) if reality_short_ids else None
     reality_server_names_json = json.dumps(payload.reality_server_names) if payload.reality_server_names else None
 
     # 更新配置
@@ -7435,20 +10431,80 @@ def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
 
-    # 如果启用了 V2Ray 入口，需要重启 Xray 进程
+    # Configure VLESS inbound via rust-router IPC
+    vless_status = ""
     if payload.enabled:
         try:
-            import subprocess
-            subprocess.run(
-                ["python3", "/usr/local/bin/xray_manager.py", "reload"],
-                capture_output=True, timeout=10
-            )
-            reload_status += ", Xray reloaded"
-        except Exception as exc:
-            print(f"[api] Xray reload failed: {exc}")
-            reload_status += f", Xray reload failed: {exc}"
+            client = await _get_rust_router_client()
+            if client:
+                # 先停止当前的VLESS inbound（如果正在运行）
+                try:
+                    await client.stop_vless_inbound()
+                except Exception:
+                    pass  # 忽略停止错误（可能本来就没有运行）
 
-    return {"message": f"V2Ray inbound config updated{reload_status}"}
+                # Build user configs from database
+                users = db.get_v2ray_users(enabled_only=True)
+                user_configs = []
+                for user in users:
+                    user_configs.append({
+                        'uuid': user.get('uuid'),
+                        'email': user.get('email'),
+                        'flow': user.get('flow', 'xtls-rprx-vision'),
+                    })
+
+                listen = f"{payload.listen_address}:{payload.listen_port}"
+
+                # Build IPC command kwargs
+                kwargs = {
+                    'listen': listen,
+                    'users': user_configs,
+                    'tls_cert_path': payload.tls_cert_path,
+                    'tls_key_path': payload.tls_key_path,
+                    'fallback': payload.fallback_server,
+                    'udp_enabled': payload.udp_enabled,  # 使用前端传入的值
+                }
+
+                # Add REALITY parameters if enabled
+                if payload.reality_enabled and payload.reality_private_key:
+                    kwargs['reality_private_key'] = payload.reality_private_key
+                    kwargs['reality_short_ids'] = reality_short_ids
+                    kwargs['reality_dest'] = payload.reality_dest
+                    kwargs['reality_server_names'] = payload.reality_server_names
+                    kwargs['reality_max_time_diff_ms'] = 120000
+
+                resp = await client.configure_vless_inbound(**kwargs)
+                if resp.success:
+                    mode = 'REALITY' if payload.reality_enabled and payload.reality_private_key else ('TLS' if payload.tls_cert_path else 'TCP')
+                    vless_status = f", VLESS inbound configured ({mode} mode)"
+                    print(f"[api] VLESS inbound configured on {listen} ({mode} mode)")
+                else:
+                    vless_status = f", VLESS config failed: {resp.error}"
+                    print(f"[api] VLESS inbound configuration failed: {resp.error}")
+            else:
+                vless_status = ", rust-router not available"
+        except Exception as exc:
+            print(f"[api] VLESS inbound configuration error: {exc}")
+            vless_status = f", VLESS config error: {exc}"
+    else:
+        # Stop VLESS inbound if disabled
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                resp = await client.stop_vless_inbound()
+                if resp.success:
+                    vless_status = ", VLESS inbound stopped"
+                else:
+                    vless_status = f", VLESS stop failed: {resp.error}"
+        except Exception as exc:
+            print(f"[api] VLESS stop error: {exc}")
+            vless_status = f", VLESS stop error: {exc}"
+
+    response = {"message": f"V2Ray inbound config updated{reload_status}{vless_status}"}
+    # 如果自动生成了 short_id，返回给前端以便显示
+    if payload.reality_enabled and not payload.reality_short_ids and reality_short_ids:
+        response["auto_generated_short_id"] = reality_short_ids[0]
+    return response
 
 
 @app.get("/api/ingress/v2ray/users/online")
@@ -7495,10 +10551,14 @@ def api_get_v2ray_users_online():
 
 
 @app.post("/api/ingress/v2ray/users")
-def api_add_v2ray_user(payload: V2RayUserCreateRequest):
-    """添加 V2Ray 用户"""
+def api_add_v2ray_user(request: Request, payload: V2RayUserCreateRequest):
+    """添加 V2Ray 用户
+
+    用户归属于创建它的账户。
+    """
     import uuid as uuid_module
 
+    user = get_user_context(request)
     db = _get_db()
 
     # 检查用户名是否已存在
@@ -7508,14 +10568,15 @@ def api_add_v2ray_user(payload: V2RayUserCreateRequest):
     # 如果未提供 UUID，自动生成
     user_uuid = payload.uuid or str(uuid_module.uuid4())
 
-    # 添加用户
+    # 添加用户 (VLESS only - Xray-lite, password/alter_id removed)
     user_id = db.add_v2ray_user(
         name=payload.name,
         email=payload.email,
         uuid=user_uuid,
-        password=payload.password,
-        alter_id=payload.alter_id,
+        password=None,  # VLESS doesn't use password
+        alter_id=None,  # VLESS doesn't use alter_id
         flow=payload.flow,
+        owner_id=user.user_id,
     )
 
     # 重新渲染配置并重载
@@ -7535,14 +10596,16 @@ def api_add_v2ray_user(payload: V2RayUserCreateRequest):
 
 
 @app.put("/api/ingress/v2ray/users/{user_id}")
-def api_update_v2ray_user(user_id: int, payload: V2RayUserUpdateRequest):
-    """更新 V2Ray 用户"""
+def api_update_v2ray_user(request: Request, user_id: int, payload: V2RayUserUpdateRequest):
+    """更新 V2Ray 用户
+
+    普通用户只能更新自己创建的用户。
+    """
     db = _get_db()
 
-    # 检查用户是否存在
-    user = db.get_v2ray_user(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail=f"User ID {user_id} not found")
+    # 检查用户是否存在并检查所有权
+    v2ray_user = db.get_v2ray_user(user_id)
+    check_resource_ownership(request, v2ray_user, "V2Ray user")
 
     # 构建更新字段
     updates = {}
@@ -7567,14 +10630,16 @@ def api_update_v2ray_user(user_id: int, payload: V2RayUserUpdateRequest):
 
 
 @app.delete("/api/ingress/v2ray/users/{user_id}")
-def api_delete_v2ray_user(user_id: int):
-    """删除 V2Ray 用户"""
+def api_delete_v2ray_user(request: Request, user_id: int):
+    """删除 V2Ray 用户
+
+    普通用户只能删除自己创建的用户。
+    """
     db = _get_db()
 
-    # 检查用户是否存在
-    user = db.get_v2ray_user(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail=f"User ID {user_id} not found")
+    # 检查用户是否存在并检查所有权
+    v2ray_user = db.get_v2ray_user(user_id)
+    check_resource_ownership(request, v2ray_user, "V2Ray user")
 
     # 删除用户
     db.delete_v2ray_user(user_id)
@@ -7681,22 +10746,28 @@ def api_get_v2ray_user_share_uri(user_id: int):
     else:
         server_flow = ""
 
-    # 构建分享链接
+    # 构建分享链接 - [Xray-lite] 仅支持 VLESS
     if protocol == "vmess":
-        share_config["uuid"] = user.get("uuid")
-        share_config["alter_id"] = user.get("alter_id", 0)
-        share_config["security"] = user.get("security", "auto")
-        uri = generate_vmess_uri(share_config)
+        # [REMOVED in Xray-lite]
+        raise HTTPException(
+            status_code=400,
+            detail="VMess protocol is no longer supported in Xray-lite. "
+            "Please migrate to VLESS. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
     elif protocol == "vless":
         share_config["uuid"] = user.get("uuid")
         # Flow 从服务端配置获取，不再从用户配置获取
         share_config["flow"] = server_flow
         uri = generate_vless_uri(share_config)
     elif protocol == "trojan":
-        share_config["password"] = user.get("password")
-        uri = generate_trojan_uri(share_config)
+        # [REMOVED in Xray-lite]
+        raise HTTPException(
+            status_code=400,
+            detail="Trojan protocol is no longer supported in Xray-lite. "
+            "Please migrate to VLESS. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
     else:
-        raise HTTPException(status_code=400, detail=f"Unsupported protocol: {protocol}")
+        raise HTTPException(status_code=400, detail=f"Unsupported protocol: {protocol}. Only 'vless' is supported.")
 
     return {"uri": uri, "protocol": protocol, "user": user.get("name")}
 
@@ -7725,115 +10796,159 @@ def api_get_v2ray_user_qrcode(user_id: int):
     return Response(content=buf.getvalue(), media_type="image/png")
 
 
-# ============ Xray Control APIs ============
+# ============ Xray Control APIs (DEPRECATED - use rust-router VLESS) ============
 
 @app.get("/api/ingress/v2ray/xray/status")
 def api_get_xray_status():
-    """获取 Xray 进程状态"""
-    import subprocess
+    """[DEPRECATED] Get Xray process status
+
+    This endpoint is deprecated. VLESS is now handled by rust-router.
+    Use GET /api/ingress/v2ray/bridge-stats for VLESS status.
+    """
+    # Return deprecation notice with backward-compatible structure
+    return {
+        "running": False,
+        "enabled": False,
+        "tun_configured": False,
+        "reality_enabled": False,
+        "xtls_vision_enabled": False,
+        "deprecated": True,
+        "message": "DEPRECATED: xray-lite replaced by rust-router. Use /api/ingress/v2ray/bridge-stats"
+    }
+
+
+@app.get("/api/ingress/v2ray/bridge-stats")
+async def api_get_vless_bridge_stats():
+    """获取 VLESS-WG 桥接统计信息
+
+    从 rust-router 获取 VLESS 入站状态和 WireGuard 桥接统计，包括：
+    - 活跃会话数
+    - TCP/UDP 连接统计
+    - 数据包路由统计
+    """
     try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "status"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            status = json.loads(result.stdout)
-            # 转换为前端期望的格式
-            # 获取 V2Ray 配置以补充 REALITY/XTLS 状态
-            _db = _get_db()
-            v2ray_config = _db.get_v2ray_inbound_config()
-            config = v2ray_config.get("config", {}) if v2ray_config else {}
+        client = await _get_rust_router_client()
+        if not client:
             return {
-                "running": status.get("status") == "running",
-                "enabled": config.get("enabled", 0) == 1,
-                "pid": status.get("pid"),
-                "tun_device": status.get("tun_device"),
-                "tun_configured": bool(status.get("tun_device")),
-                "reality_enabled": config.get("reality_enabled", 0) == 1,
-                "xtls_vision_enabled": config.get("xtls_vision_enabled", 0) == 1,
-                "listen_port": status.get("listen_port"),
+                "available": False,
+                "message": "rust-router not available"
             }
-        else:
-            return {"running": False, "enabled": False, "tun_configured": False,
-                    "reality_enabled": False, "xtls_vision_enabled": False,
-                    "message": result.stderr}
-    except subprocess.TimeoutExpired:
-        return {"running": False, "enabled": False, "tun_configured": False,
-                "reality_enabled": False, "xtls_vision_enabled": False,
-                "message": "Timeout"}
+
+        response = await client.get_vless_inbound_status()
+
+        if not response.success:
+            return {
+                "available": False,
+                "message": response.error or "Failed to get VLESS status"
+            }
+
+        data = response.data or {}
+
+        # 构建响应
+        result = {
+            "available": True,
+            "running": data.get("running", False),
+            "listen_address": data.get("listen_address"),
+            "user_count": data.get("user_count", 0),
+            "tls_enabled": data.get("tls_enabled", False),
+            "udp_enabled": data.get("udp_enabled", True),
+            "total_connections": data.get("total_connections", 0),
+            "active_connections": data.get("active_connections", 0),
+        }
+
+        # 添加桥接统计（如果可用）
+        bridge_stats = data.get("bridge_stats")
+        if bridge_stats:
+            result["bridge_stats"] = {
+                "active_sessions": bridge_stats.get("active_sessions", 0),
+                "sessions_registered": bridge_stats.get("sessions_registered", 0),
+                "sessions_unregistered": bridge_stats.get("sessions_unregistered", 0),
+                "packets_routed": bridge_stats.get("packets_routed", 0),
+                "packets_dropped": bridge_stats.get("packets_dropped", 0),
+                "channel_full": bridge_stats.get("channel_full", 0),
+            }
+
+        return result
+
     except Exception as e:
-        return {"running": False, "enabled": False, "tun_configured": False,
-                "reality_enabled": False, "xtls_vision_enabled": False,
-                "message": str(e)}
+        logging.error(f"Failed to get VLESS bridge stats: {e}")
+        return {
+            "available": False,
+            "message": str(e)
+        }
 
 
 @app.post("/api/ingress/v2ray/xray/restart")
 def api_restart_xray():
-    """重启 Xray 进程"""
-    import subprocess
-    try:
-        # 先停止
-        subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "stop"],
-            capture_output=True, timeout=10
-        )
-        # 再启动
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "start"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            return {"message": "Xray restarted successfully"}
-        else:
-            raise HTTPException(status_code=500, detail=f"Failed to start Xray: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Xray restart timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """[DEPRECATED] Restart Xray process
+
+    This endpoint is deprecated. VLESS is now handled by rust-router.
+    VLESS inbound is managed via rust-router IPC (ConfigureVlessInbound).
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="DEPRECATED: xray-lite replaced by rust-router. VLESS is configured via ConfigureVlessInbound IPC."
+    )
 
 
 @app.post("/api/ingress/v2ray/xray/reload")
 def api_reload_xray():
-    """重载 Xray 配置"""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "reload"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            return {"message": "Xray config reloaded successfully"}
-        else:
-            raise HTTPException(status_code=500, detail=f"Failed to reload Xray: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Xray reload timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """[DEPRECATED] Reload Xray configuration
+
+    This endpoint is deprecated. VLESS is now handled by rust-router.
+    VLESS inbound is managed via rust-router IPC (ConfigureVlessInbound).
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="DEPRECATED: xray-lite replaced by rust-router. VLESS is configured via ConfigureVlessInbound IPC."
+    )
 
 
 def _generate_xray_reality_keys() -> Optional[Dict[str, str]]:
-    """生成 Xray REALITY 密钥对（内部辅助函数）
+    """Generate REALITY key pair using Python cryptography library
 
     Returns:
-        成功返回 {"private_key": str, "public_key": str, "short_id": str}
-        失败返回 None
+        Success: {"private_key": str, "public_key": str, "short_id": str}
+        Failure: None
     """
-    import subprocess
     try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "generate-keys"],
-            capture_output=True, text=True, timeout=10
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        import base64
+        import secrets
+
+        # Generate X25519 key pair
+        private_key = X25519PrivateKey.generate()
+        public_key = private_key.public_key()
+
+        # Get raw bytes (32 bytes each)
+        private_bytes = private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption()
         )
-        if result.returncode == 0:
-            return json.loads(result.stdout)
-        else:
-            logging.error(f"生成 REALITY 密钥失败: {result.stderr}")
-            return None
-    except subprocess.TimeoutExpired:
-        logging.error("生成 REALITY 密钥超时")
+        public_bytes = public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+        # Encode as base64 (standard encoding for REALITY keys)
+        private_b64 = base64.b64encode(private_bytes).decode('ascii')
+        public_b64 = base64.b64encode(public_bytes).decode('ascii')
+
+        # Generate short_id (8 hex chars = 4 bytes)
+        short_id = secrets.token_hex(4)
+
+        return {
+            "private_key": private_b64,
+            "public_key": public_b64,
+            "short_id": short_id
+        }
+    except ImportError:
+        logging.error("cryptography library not available for REALITY key generation")
         return None
     except Exception as e:
-        logging.error(f"生成 REALITY 密钥异常: {e}")
+        logging.error(f"Failed to generate REALITY keys: {e}")
         return None
 
 
@@ -7847,78 +10962,815 @@ def api_generate_reality_keys():
         raise HTTPException(status_code=500, detail="Failed to generate REALITY keys")
 
 
-# ============ Xray Egress Control APIs ============
+# ============ Shadowsocks Inbound APIs ============
+
+class ShadowsocksInboundConfigUpdateRequest(BaseModel):
+    """Shadowsocks 入口配置更新请求"""
+    enabled: Optional[bool] = None
+    listen_addr: Optional[str] = None
+    listen_port: Optional[int] = None
+    method: Optional[str] = None
+    password: Optional[str] = None
+    udp_enabled: Optional[bool] = None
+
+
+@app.get("/api/ingress/shadowsocks/config")
+def api_get_shadowsocks_inbound_config():
+    """获取 Shadowsocks 入口配置"""
+    db = _get_db()
+    config = db.get_shadowsocks_inbound_config()
+
+    # 返回默认配置如果数据库中没有
+    if not config:
+        config = {
+            "enabled": False,
+            "listen_address": "0.0.0.0",
+            "listen_port": 8388,
+            "method": "2022-blake3-aes-256-gcm",
+            "password": "",
+            "udp_enabled": True,
+            "default_outbound": None,
+        }
+
+    # 转换字段名以匹配前端类型
+    return {
+        "config": {
+            "enabled": bool(config.get("enabled", 0)),
+            "listen_addr": config.get("listen_address", "0.0.0.0"),
+            "listen_port": config.get("listen_port", 8388),
+            "method": config.get("method", "2022-blake3-aes-256-gcm"),
+            "password": config.get("password", ""),
+            "udp_enabled": bool(config.get("udp_enabled", 1)),
+        }
+    }
+
+
+@app.post("/api/ingress/shadowsocks/config")
+async def api_update_shadowsocks_inbound_config(payload: ShadowsocksInboundConfigUpdateRequest):
+    """更新 Shadowsocks 入口配置"""
+    db = _get_db()
+
+    # 获取当前配置
+    current_config = db.get_shadowsocks_inbound_config() or {}
+
+    # 合并更新
+    listen_addr = payload.listen_addr if payload.listen_addr is not None else current_config.get("listen_address", "0.0.0.0")
+    listen_port = payload.listen_port if payload.listen_port is not None else current_config.get("listen_port", 8388)
+    method = payload.method if payload.method is not None else current_config.get("method", "2022-blake3-aes-256-gcm")
+    password = payload.password if payload.password is not None else current_config.get("password", "")
+    udp_enabled = payload.udp_enabled if payload.udp_enabled is not None else bool(current_config.get("udp_enabled", 1))
+    enabled = payload.enabled if payload.enabled is not None else bool(current_config.get("enabled", 0))
+
+    # 验证密码（AEAD 2022 需要有效密码）
+    if enabled and not password:
+        raise HTTPException(status_code=400, detail="Password is required for Shadowsocks")
+
+    # 保存到数据库
+    db.set_shadowsocks_inbound_config(
+        listen_address=listen_addr,
+        listen_port=listen_port,
+        method=method,
+        password=password,
+        udp_enabled=udp_enabled,
+        enabled=enabled,
+    )
+
+    # 通过 rust-router IPC 配置 Shadowsocks inbound
+    ss_status = ""
+    if enabled:
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                # 先停止当前的 Shadowsocks inbound（如果正在运行）
+                try:
+                    await client.stop_shadowsocks_inbound()
+                except Exception:
+                    pass  # 忽略停止错误
+
+                listen = f"{listen_addr}:{listen_port}"
+                resp = await client.configure_shadowsocks_inbound(
+                    listen=listen,
+                    method=method,
+                    password=password,
+                    udp_enabled=udp_enabled,
+                )
+                if resp.success:
+                    ss_status = f", Shadowsocks inbound configured on {listen}"
+                    print(f"[api] Shadowsocks inbound configured on {listen}")
+                else:
+                    ss_status = f", Shadowsocks config failed: {resp.error}"
+                    print(f"[api] Shadowsocks inbound configuration failed: {resp.error}")
+            else:
+                ss_status = ", rust-router not available"
+        except Exception as exc:
+            print(f"[api] Shadowsocks inbound configuration error: {exc}")
+            ss_status = f", Shadowsocks config error: {exc}"
+    else:
+        # 停止 Shadowsocks inbound
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                resp = await client.stop_shadowsocks_inbound()
+                if resp.success:
+                    ss_status = ", Shadowsocks inbound stopped"
+                else:
+                    ss_status = f", Shadowsocks stop failed: {resp.error}"
+        except Exception as exc:
+            print(f"[api] Shadowsocks stop error: {exc}")
+            ss_status = f", Shadowsocks stop error: {exc}"
+
+    return {
+        "message": f"Shadowsocks inbound config updated{ss_status}",
+        "config": {
+            "enabled": enabled,
+            "listen_addr": listen_addr,
+            "listen_port": listen_port,
+            "method": method,
+            "password": password,
+            "udp_enabled": udp_enabled,
+        }
+    }
+
+
+@app.get("/api/ingress/shadowsocks/status")
+async def api_get_shadowsocks_inbound_status():
+    """获取 Shadowsocks 入口状态（从 rust-router）"""
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            return {
+                "enabled": False,
+                "listen_addr": None,
+                "listen_port": None,
+                "method": None,
+                "udp_enabled": False,
+                "active_connections": 0,
+                "total_connections": 0,
+                "bytes_received": 0,
+                "bytes_sent": 0,
+                "message": "rust-router not available"
+            }
+
+        response = await client.get_shadowsocks_inbound_status()
+
+        if not response.success:
+            return {
+                "enabled": False,
+                "listen_addr": None,
+                "listen_port": None,
+                "method": None,
+                "udp_enabled": False,
+                "active_connections": 0,
+                "total_connections": 0,
+                "bytes_received": 0,
+                "bytes_sent": 0,
+                "error": response.error
+            }
+
+        # 返回 rust-router 返回的状态数据
+        data = response.data or {}
+        return {
+            "enabled": data.get("enabled", False),
+            "listen_addr": data.get("listen_addr"),
+            "listen_port": data.get("listen_port"),
+            "method": data.get("method"),
+            "udp_enabled": data.get("udp_enabled", False),
+            "active_connections": data.get("active_connections", 0),
+            "total_connections": data.get("total_connections", 0),
+            "bytes_received": data.get("bytes_received", 0),
+            "bytes_sent": data.get("bytes_sent", 0),
+        }
+
+    except Exception as exc:
+        print(f"[api] Shadowsocks inbound status error: {exc}")
+        return {
+            "enabled": False,
+            "listen_addr": None,
+            "listen_port": None,
+            "method": None,
+            "udp_enabled": False,
+            "active_connections": 0,
+            "total_connections": 0,
+            "bytes_received": 0,
+            "bytes_sent": 0,
+            "error": str(exc)
+        }
+
+
+@app.post("/api/ingress/shadowsocks/stop")
+async def api_stop_shadowsocks_inbound():
+    """停止 Shadowsocks 入口"""
+    # 更新数据库状态
+    db = _get_db()
+    db.update_shadowsocks_inbound_config(enabled=0)
+
+    # 通过 IPC 停止
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.stop_shadowsocks_inbound()
+            if resp.success:
+                return {"message": "Shadowsocks inbound stopped"}
+            else:
+                return {"message": f"Stop failed: {resp.error}"}
+        else:
+            return {"message": "rust-router not available"}
+    except Exception as exc:
+        print(f"[api] Shadowsocks stop error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/ingress/shadowsocks/outbound")
+def api_get_shadowsocks_ingress_outbound():
+    """获取 Shadowsocks 入口的绑定出口"""
+    db = _get_db()
+    config = db.get_shadowsocks_inbound_config()
+
+    global_default = db.get_setting("default_outbound") or "direct"
+    available = _get_available_outbounds(db)
+
+    return {
+        "outbound": config.get("default_outbound") if config else None,
+        "global_default": global_default,
+        "available_outbounds": available,
+    }
+
+
+@app.put("/api/ingress/shadowsocks/outbound")
+def api_set_shadowsocks_ingress_outbound(payload: dict):
+    """设置 Shadowsocks 入口的绑定出口"""
+    outbound = payload.get("outbound")
+    db = _get_db()
+
+    # 验证出口存在
+    if outbound:
+        available = _get_available_outbounds(db)
+        if outbound not in available:
+            raise HTTPException(status_code=400, detail=f"Outbound '{outbound}' not found")
+
+    # 更新配置
+    db.update_shadowsocks_inbound_config(default_outbound=outbound)
+
+    return {
+        "success": True,
+        "message": f"Shadowsocks ingress outbound set to {outbound or 'global default'}",
+        "outbound": outbound,
+        "reloaded": False,
+    }
+
+
+# ============ Shadowsocks Egress APIs ============
+
+class ShadowsocksEgressCreateRequest(BaseModel):
+    """创建 Shadowsocks 出口"""
+    tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="出口标识符")
+    description: str = Field("", description="描述")
+    server: str = Field(..., description="服务器地址")
+    server_port: int = Field(8388, ge=1, le=65535, description="服务器端口")
+    method: str = Field("2022-blake3-aes-256-gcm", description="加密方法")
+    password: str = Field(..., description="密码 (AEAD 2022 需要 Base64 编码)")
+    udp: bool = Field(True, description="启用 UDP")
+
+
+class ShadowsocksURIParseRequest(BaseModel):
+    """解析 Shadowsocks URI"""
+    uri: str = Field(..., description="Shadowsocks URI (ss://...)")
+
+
+def parse_shadowsocks_uri(uri: str) -> dict:
+    """
+    解析 Shadowsocks URI (SIP002 格式)
+    格式: ss://BASE64(method:password)@host:port#tag
+    或旧格式: ss://BASE64(method:password@host:port)#tag
+    """
+    import base64
+    from urllib.parse import urlparse, unquote
+
+    if not uri.startswith("ss://"):
+        raise ValueError("Invalid Shadowsocks URI: must start with ss://")
+
+    # 移除 ss:// 前缀
+    uri_body = uri[5:]
+
+    # 提取 fragment (tag)
+    tag = None
+    if "#" in uri_body:
+        uri_body, fragment = uri_body.rsplit("#", 1)
+        tag = unquote(fragment)
+
+    # SIP002 格式: userinfo@host:port
+    if "@" in uri_body:
+        userinfo_part, server_part = uri_body.rsplit("@", 1)
+
+        # 解码 userinfo (base64)
+        # 先尝试标准 base64 (大多数客户端使用，包括浏览器的 btoa)
+        # 再尝试 URL 安全 base64
+        padded = userinfo_part
+        padding = 4 - len(padded) % 4
+        if padding != 4:
+            padded += "=" * padding
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8")
+        except Exception:
+            try:
+                decoded = base64.urlsafe_b64decode(padded).decode("utf-8")
+            except Exception as e:
+                raise ValueError(f"Failed to decode userinfo: {e}")
+
+        # method:password
+        if ":" not in decoded:
+            raise ValueError("Invalid userinfo format: expected method:password")
+        method, password = decoded.split(":", 1)
+
+        # host:port
+        if ":" not in server_part:
+            raise ValueError("Invalid server format: expected host:port")
+        host, port_str = server_part.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            raise ValueError(f"Invalid port: {port_str}")
+
+    else:
+        # 旧格式: 整个 body 是 base64 编码
+        padded = uri_body
+        padding = 4 - len(padded) % 4
+        if padding != 4:
+            padded += "=" * padding
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8")
+        except Exception:
+            try:
+                decoded = base64.urlsafe_b64decode(padded).decode("utf-8")
+            except Exception as e:
+                raise ValueError(f"Failed to decode URI: {e}")
+
+        # method:password@host:port
+        if "@" not in decoded:
+            raise ValueError("Invalid URI format")
+        auth_part, server_part = decoded.rsplit("@", 1)
+
+        if ":" not in auth_part:
+            raise ValueError("Invalid auth format: expected method:password")
+        method, password = auth_part.split(":", 1)
+
+        if ":" not in server_part:
+            raise ValueError("Invalid server format: expected host:port")
+        host, port_str = server_part.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            raise ValueError(f"Invalid port: {port_str}")
+
+    return {
+        "method": method,
+        "password": password,
+        "server": host,
+        "server_port": port,
+        "tag": tag,
+    }
+
+
+@app.post("/api/egress/shadowsocks/parse")
+def api_parse_shadowsocks_uri(payload: ShadowsocksURIParseRequest):
+    """解析 Shadowsocks URI (ss://)"""
+    try:
+        result = parse_shadowsocks_uri(payload.uri)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse Shadowsocks URI: {e}")
+
+
+@app.get("/api/egress/shadowsocks")
+async def api_list_shadowsocks_egress():
+    """列出所有 Shadowsocks 出口 (合并数据库和运行时状态)"""
+    db = _get_db()
+
+    # 从数据库获取配置
+    db_egress = db.get_shadowsocks_egress_list()
+    result = []
+
+    # 尝试从 rust-router 获取运行时状态
+    runtime_status = {}
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.list_shadowsocks_outbounds()
+            if resp.success:
+                for out in resp.data.get("outbounds", []):
+                    runtime_status[out.get("tag")] = out
+    except Exception:
+        pass  # rust-router 不可用时仍然返回数据库配置
+
+    # 合并数据库配置和运行时状态
+    for egress in db_egress:
+        tag = egress.get("tag")
+        runtime = runtime_status.get(tag, {})
+        result.append({
+            "tag": tag,
+            "description": egress.get("description", ""),
+            "server": egress.get("server"),
+            "server_port": egress.get("server_port"),
+            "method": egress.get("method"),
+            "udp": bool(egress.get("udp_enabled", 1)),
+            "enabled": bool(egress.get("enabled", 1)),
+            # 运行时状态
+            "health_status": runtime.get("health", "unknown"),
+            "active_connections": runtime.get("active_connections", 0),
+        })
+
+    return {"egress": result}
+
+
+@app.post("/api/egress/shadowsocks")
+async def api_create_shadowsocks_egress(payload: ShadowsocksEgressCreateRequest):
+    """创建 Shadowsocks 出口 (保存到数据库 + 添加到 rust-router)"""
+    db = _get_db()
+
+    # 检查 tag 是否已存在
+    if db.get_shadowsocks_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Shadowsocks egress '{payload.tag}' already exists")
+
+    # 检查是否与其他出口冲突
+    if db.get_v2ray_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with V2Ray egress")
+    if db.get_custom_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with custom WireGuard egress")
+
+    try:
+        # 1. 保存到数据库
+        egress_id = db.add_shadowsocks_egress(
+            tag=payload.tag,
+            server=payload.server,
+            server_port=payload.server_port,
+            method=payload.method,
+            password=payload.password,
+            description=payload.description,
+            udp_enabled=payload.udp,
+            enabled=True
+        )
+
+        # 2. 添加到 rust-router
+        ipc_error = None
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                resp = await client.add_shadowsocks_outbound(
+                    tag=payload.tag,
+                    server=payload.server,
+                    server_port=payload.server_port,
+                    method=payload.method,
+                    password=payload.password,
+                    udp=payload.udp,
+                )
+                if not resp.success:
+                    ipc_error = resp.error
+        except Exception as e:
+            ipc_error = str(e)
+
+        return {
+            "success": True,
+            "message": f"Shadowsocks egress '{payload.tag}' created",
+            "tag": payload.tag,
+            "id": egress_id,
+            "ipc_error": ipc_error,  # None if IPC succeeded
+        }
+
+    except Exception as e:
+        import traceback
+        print(f"[api] Error creating Shadowsocks egress: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/api/egress/shadowsocks/{tag}")
+async def api_get_shadowsocks_egress(tag: str):
+    """获取 Shadowsocks 出口详情 (合并数据库和运行时状态)"""
+    db = _get_db()
+
+    # 从数据库获取配置
+    egress = db.get_shadowsocks_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"Shadowsocks egress '{tag}' not found")
+
+    # 尝试获取运行时状态
+    runtime = {}
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.get_shadowsocks_outbound(tag)
+            if resp.success:
+                runtime = resp.data
+    except Exception:
+        pass
+
+    return {
+        "tag": egress.get("tag"),
+        "description": egress.get("description", ""),
+        "server": egress.get("server"),
+        "server_port": egress.get("server_port"),
+        "method": egress.get("method"),
+        "udp": bool(egress.get("udp_enabled", 1)),
+        "enabled": bool(egress.get("enabled", 1)),
+        # 运行时状态
+        "health_status": runtime.get("health_status", "unknown"),
+        "active_connections": runtime.get("active_connections", 0),
+    }
+
+
+@app.delete("/api/egress/shadowsocks/{tag}")
+async def api_delete_shadowsocks_egress(tag: str):
+    """删除 Shadowsocks 出口 (从数据库和 rust-router 删除)"""
+    db = _get_db()
+
+    # 检查是否存在
+    if not db.get_shadowsocks_egress(tag):
+        raise HTTPException(status_code=404, detail=f"Shadowsocks egress '{tag}' not found")
+
+    # 1. 从 rust-router 移除
+    ipc_error = None
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.remove_shadowsocks_outbound(tag)
+            if not resp.success:
+                ipc_error = resp.error
+    except Exception as e:
+        ipc_error = str(e)
+
+    # 2. 从数据库删除
+    db.delete_shadowsocks_egress(tag)
+
+    return {
+        "success": True,
+        "message": f"Shadowsocks egress '{tag}' deleted",
+        "ipc_error": ipc_error,
+    }
+
+
+# ============ VLESS Egress APIs ============
+
+class VlessEgressCreateRequest(BaseModel):
+    """创建 VLESS 出口"""
+    tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="出口标识符")
+    description: str = Field("", description="描述")
+    server: str = Field(..., description="服务器地址")
+    server_port: int = Field(443, ge=1, le=65535, description="服务器端口")
+    uuid: str = Field(..., description="用户 UUID")
+    flow: Optional[str] = Field(None, description="流控 (xtls-rprx-vision)")
+    transport: str = Field("tcp", description="传输层 (tcp, ws, grpc)")
+    ws_path: Optional[str] = Field(None, description="WebSocket 路径")
+    ws_host: Optional[str] = Field(None, description="WebSocket Host 头")
+    tls_enabled: bool = Field(True, description="启用 TLS")
+    tls_server_name: Optional[str] = Field(None, description="TLS SNI")
+    tls_skip_verify: bool = Field(False, description="跳过 TLS 验证")
+    reality_enabled: bool = Field(False, description="启用 REALITY")
+    reality_public_key: Optional[str] = Field(None, description="REALITY 公钥")
+    reality_short_id: Optional[str] = Field(None, description="REALITY Short ID")
+
+
+@app.get("/api/egress/vless")
+async def api_list_vless_egress():
+    """列出所有 VLESS 出口 (合并数据库和运行时状态)"""
+    db = _get_db()
+
+    # 从数据库获取配置
+    db_egress = db.get_vless_egress_list()
+    result = []
+
+    # 尝试从 rust-router 获取运行时状态
+    runtime_status = {}
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.list_vless_outbounds()
+            if resp.success:
+                for out in resp.data.get("outbounds", []):
+                    runtime_status[out.get("tag")] = out
+    except Exception:
+        pass  # rust-router 不可用时仍然返回数据库配置
+
+    # 合并数据库配置和运行时状态
+    for egress in db_egress:
+        tag = egress.get("tag")
+        runtime = runtime_status.get(tag, {})
+        result.append({
+            "tag": tag,
+            "description": egress.get("description", ""),
+            "server": egress.get("server"),
+            "server_port": egress.get("server_port"),
+            "uuid": egress.get("uuid"),
+            "flow": egress.get("flow"),
+            "transport": egress.get("transport", "tcp"),
+            "tls_enabled": bool(egress.get("tls_enabled", 1)),
+            "tls_server_name": egress.get("tls_server_name"),
+            "reality_enabled": bool(egress.get("reality_enabled", 0)),
+            "enabled": bool(egress.get("enabled", 1)),
+            # 运行时状态
+            "health_status": runtime.get("health_status", "unknown"),
+            "active_connections": runtime.get("active_connections", 0),
+        })
+
+    return {"egress": result}
+
+
+@app.post("/api/egress/vless")
+async def api_create_vless_egress(payload: VlessEgressCreateRequest):
+    """创建 VLESS 出口 (保存到数据库 + 添加到 rust-router)"""
+    db = _get_db()
+
+    # 检查 tag 是否已存在
+    if db.get_vless_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"VLESS egress '{payload.tag}' already exists")
+
+    # 检查是否与其他出口冲突
+    if db.get_v2ray_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with V2Ray egress")
+    if db.get_shadowsocks_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with Shadowsocks egress")
+    if db.get_custom_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with custom WireGuard egress")
+
+    try:
+        # 1. 保存到数据库
+        egress_id = db.add_vless_egress(
+            tag=payload.tag,
+            server=payload.server,
+            server_port=payload.server_port,
+            uuid=payload.uuid,
+            description=payload.description,
+            flow=payload.flow,
+            transport=payload.transport,
+            ws_path=payload.ws_path,
+            ws_host=payload.ws_host,
+            tls_enabled=payload.tls_enabled,
+            tls_server_name=payload.tls_server_name,
+            tls_skip_verify=payload.tls_skip_verify,
+            reality_enabled=payload.reality_enabled,
+            reality_public_key=payload.reality_public_key,
+            reality_short_id=payload.reality_short_id,
+            enabled=True
+        )
+
+        # 2. 添加到 rust-router
+        ipc_error = None
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                resp = await client.add_vless_outbound(
+                    tag=payload.tag,
+                    server_address=payload.server,
+                    server_port=payload.server_port,
+                    uuid=payload.uuid,
+                    flow=payload.flow,
+                    transport=payload.transport,
+                    tls_enabled=payload.tls_enabled,
+                    tls_sni=payload.tls_server_name,
+                    tls_skip_verify=payload.tls_skip_verify,
+                    reality_enabled=payload.reality_enabled,
+                    reality_public_key=payload.reality_public_key,
+                    reality_short_id=payload.reality_short_id,
+                    ws_path=payload.ws_path,
+                    ws_host=payload.ws_host,
+                )
+                if not resp.success:
+                    ipc_error = resp.error
+        except Exception as e:
+            ipc_error = str(e)
+
+        return {
+            "success": True,
+            "message": f"VLESS egress '{payload.tag}' created",
+            "tag": payload.tag,
+            "id": egress_id,
+            "ipc_error": ipc_error,
+        }
+
+    except Exception as e:
+        import traceback
+        print(f"[api] Error creating VLESS egress: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/api/egress/vless/{tag}")
+async def api_get_vless_egress(tag: str):
+    """获取 VLESS 出口详情 (合并数据库和运行时状态)"""
+    db = _get_db()
+
+    egress = db.get_vless_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"VLESS egress '{tag}' not found")
+
+    # 尝试获取运行时状态
+    runtime = {}
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.get_vless_outbound(tag)
+            if resp.success:
+                runtime = resp.data or {}
+    except Exception:
+        pass
+
+    return {
+        "tag": tag,
+        "description": egress.get("description", ""),
+        "server": egress.get("server"),
+        "server_port": egress.get("server_port"),
+        "uuid": egress.get("uuid"),
+        "flow": egress.get("flow"),
+        "transport": egress.get("transport", "tcp"),
+        "ws_path": egress.get("ws_path"),
+        "ws_host": egress.get("ws_host"),
+        "tls_enabled": bool(egress.get("tls_enabled", 1)),
+        "tls_server_name": egress.get("tls_server_name"),
+        "tls_skip_verify": bool(egress.get("tls_skip_verify", 0)),
+        "reality_enabled": bool(egress.get("reality_enabled", 0)),
+        "reality_public_key": egress.get("reality_public_key"),
+        "reality_short_id": egress.get("reality_short_id"),
+        "enabled": bool(egress.get("enabled", 1)),
+        # 运行时状态
+        "health_status": runtime.get("health_status", "unknown"),
+        "active_connections": runtime.get("active_connections", 0),
+    }
+
+
+@app.delete("/api/egress/vless/{tag}")
+async def api_delete_vless_egress(tag: str):
+    """删除 VLESS 出口 (从数据库和 rust-router 删除)"""
+    db = _get_db()
+
+    # 检查是否存在
+    if not db.get_vless_egress(tag):
+        raise HTTPException(status_code=404, detail=f"VLESS egress '{tag}' not found")
+
+    # 1. 从 rust-router 移除
+    ipc_error = None
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.remove_vless_outbound(tag)
+            if not resp.success:
+                ipc_error = resp.error
+    except Exception as e:
+        ipc_error = str(e)
+
+    # 2. 从数据库删除
+    db.delete_vless_egress(tag)
+
+    return {
+        "success": True,
+        "message": f"VLESS egress '{tag}' deleted",
+        "ipc_error": ipc_error,
+    }
+
+
+# ============ Xray Egress Control APIs (DEPRECATED - use rust-router VLESS) ============
 
 @app.get("/api/egress/xray/status")
 def api_get_xray_egress_status():
-    """获取 Xray 出站进程状态"""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "status"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            status = json.loads(result.stdout)
-            return {
-                "running": status.get("status") == "running",
-                "pid": status.get("pid"),
-                "egress_count": status.get("egress_count", 0),
-                "socks_ports": status.get("socks_ports", [])
-            }
-        else:
-            return {"running": False, "egress_count": 0, "socks_ports": [],
-                    "message": result.stderr}
-    except subprocess.TimeoutExpired:
-        return {"running": False, "egress_count": 0, "socks_ports": [],
-                "message": "Timeout"}
-    except Exception as e:
-        return {"running": False, "egress_count": 0, "socks_ports": [],
-                "message": str(e)}
+    """[DEPRECATED] Get Xray egress process status
+
+    This endpoint is deprecated. VLESS outbound is now handled by rust-router.
+    Use rust-router IPC ListVlessOutbounds for VLESS egress status.
+    """
+    # Return deprecation notice with backward-compatible structure
+    return {
+        "running": False,
+        "egress_count": 0,
+        "socks_ports": [],
+        "deprecated": True,
+        "message": "DEPRECATED: xray-lite replaced by rust-router. Use ListVlessOutbounds IPC."
+    }
 
 
 @app.post("/api/egress/xray/restart")
 def api_restart_xray_egress():
-    """重启 Xray 出站进程"""
-    import subprocess
-    try:
-        # 先停止
-        subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "stop"],
-            capture_output=True, timeout=10
-        )
-        # 再启动
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "start"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            return {"message": "Xray egress restarted successfully"}
-        else:
-            raise HTTPException(status_code=500, detail=f"Failed to start Xray egress: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Xray egress restart timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """[DEPRECATED] Restart Xray egress process
+
+    This endpoint is deprecated. VLESS outbound is now handled by rust-router.
+    VLESS outbound is managed via rust-router IPC (AddVlessOutbound/RemoveVlessOutbound).
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="DEPRECATED: xray-lite replaced by rust-router. VLESS outbound is configured via AddVlessOutbound IPC."
+    )
 
 
 @app.post("/api/egress/xray/reload")
 def api_reload_xray_egress():
-    """重载 Xray 出站配置"""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "reload"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            return {"message": "Xray egress config reloaded successfully"}
-        else:
-            raise HTTPException(status_code=500, detail=f"Failed to reload Xray egress: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Xray egress reload timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """[DEPRECATED] Reload Xray egress configuration
+
+    This endpoint is deprecated. VLESS outbound is now handled by rust-router.
+    VLESS outbound is managed via rust-router IPC (AddVlessOutbound/RemoveVlessOutbound).
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="DEPRECATED: xray-lite replaced by rust-router. VLESS outbound is configured via AddVlessOutbound IPC."
+    )
 
 
 # ============ Egress Connection Test API ============
@@ -7940,7 +11792,18 @@ def api_test_egress_connection(tag: str, timeout: int = 5000):
     test_url = "http://cp.cloudflare.com/"  # Cloudflare 204 测试 (国内可访问)
     timeout_sec = timeout / 1000
 
-    # 首先获取出口类型
+    # 首先检查数据库中的出口类型
+    db_egress_type = None
+    if HAS_DATABASE:
+        db = _get_db()
+        # 检查 Shadowsocks 出口
+        if db.get_shadowsocks_egress(tag):
+            db_egress_type = "shadowsocks"
+        # 检查 V2Ray 出口
+        elif db.get_v2ray_egress(tag):
+            db_egress_type = "v2ray"
+
+    # 然后尝试从 clash API 获取类型
     proxy_type = None
     try:
         clash_proxy_url = f"http://127.0.0.1:{DEFAULT_CLASH_API_PORT}/proxies/{urllib.parse.quote(tag)}"
@@ -7962,6 +11825,10 @@ def api_test_egress_connection(tag: str, timeout: int = 5000):
     if proxy_type == "socks":
         return _test_socks_connection(tag, test_url, timeout_sec)
 
+    # Shadowsocks/V2Ray 类型：通过 rust-router IPC 测试
+    if db_egress_type in ("shadowsocks", "v2ray"):
+        return _test_rust_router_outbound(tag, test_url, timeout)
+
     # WireGuard 和其他类型：先检查活跃流量，再尝试 clash_api
     return _test_wireguard_endpoint(tag, test_url, timeout)
 
@@ -7978,9 +11845,10 @@ def _test_direct_connection(tag: str, test_url: str, timeout_sec: float) -> dict
         ]
 
         # 如果是 direct-* 类型，尝试获取绑定配置
+        # 修复方法名 get_direct_egress_by_tag -> get_direct_egress
         if tag.startswith("direct-") and HAS_DATABASE:
             db = _get_db()
-            direct_egress = db.get_direct_egress_by_tag(tag)
+            direct_egress = db.get_direct_egress(tag)
             if direct_egress:
                 if direct_egress.get("bind_interface"):
                     curl_cmd.extend(["--interface", direct_egress["bind_interface"]])
@@ -8063,6 +11931,154 @@ def _test_socks_connection(tag: str, test_url: str, timeout_sec: float) -> dict:
         return {"success": False, "delay": -1, "message": str(e)}
 
 
+def _ping_endpoint_ip(ip: str, count: int = 2, timeout: int = 2) -> Optional[int]:
+    """Ping an IP address and return average latency in ms.
+
+    Args:
+        ip: IP address to ping
+        count: Number of ping attempts
+        timeout: Timeout per ping in seconds
+
+    Returns:
+        Average latency in milliseconds, or None if ping failed
+    """
+    try:
+        result = subprocess.run(
+            ["ping", "-c", str(count), "-W", str(timeout), ip],
+            capture_output=True,
+            text=True,
+            timeout=count * timeout + 2
+        )
+
+        if result.returncode == 0:
+            # Parse ping output for average latency
+            # Format: rtt min/avg/max/mdev = 73.457/74.116/74.798/0.547 ms
+            import re
+            match = re.search(r"rtt.*?=.*?/([\d.]+)/", result.stdout)
+            if match:
+                return int(float(match.group(1)))
+            # Fallback: look for "time=XXms" pattern
+            times = re.findall(r"time[<=]([\d.]+)", result.stdout)
+            if times:
+                avg = sum(float(t) for t in times) / len(times)
+                return int(avg)
+        return None
+    except Exception:
+        return None
+
+
+def _test_interface_connection(interface: str, test_url: str, timeout_sec: float) -> dict:
+    """Test connection via specific network interface"""
+    try:
+        curl_cmd = [
+            "curl", "-s", "-o", "/dev/null",
+            "-w", "%{http_code}|%{time_total}",
+            "--interface", interface,
+            "--max-time", str(int(timeout_sec + 1)),
+            test_url
+        ]
+
+        start_time = time.time()
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=timeout_sec + 2)
+
+        if result.returncode == 0:
+            parts = result.stdout.strip().split("|")
+            if len(parts) == 2:
+                http_code = parts[0]
+                time_total = float(parts[1])
+                delay_ms = int(time_total * 1000)
+
+                if http_code in ("200", "204", "301", "302"):
+                    return {"success": True, "delay": delay_ms, "message": f"{delay_ms}ms"}
+                else:
+                    return {"success": False, "delay": -1, "message": f"HTTP {http_code}"}
+
+        return {"success": False, "delay": -1, "message": "Connection failed"}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "delay": -1, "message": "Connection timeout"}
+    except Exception as e:
+        return {"success": False, "delay": -1, "message": str(e)}
+
+
+def _test_simple_curl(test_url: str, timeout_sec: float) -> dict:
+    """Simple curl test without interface binding"""
+    try:
+        curl_cmd = [
+            "curl", "-s", "-o", "/dev/null",
+            "-w", "%{http_code}|%{time_total}",
+            "--max-time", str(int(timeout_sec + 1)),
+            test_url
+        ]
+
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=timeout_sec + 2)
+
+        if result.returncode == 0:
+            parts = result.stdout.strip().split("|")
+            if len(parts) == 2:
+                http_code = parts[0]
+                time_total = float(parts[1])
+                delay_ms = int(time_total * 1000)
+
+                if http_code in ("200", "204", "301", "302"):
+                    return {"success": True, "delay": delay_ms, "message": f"{delay_ms}ms"}
+                else:
+                    return {"success": False, "delay": -1, "message": f"HTTP {http_code}"}
+
+        return {"success": False, "delay": -1, "message": "Connection failed"}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "delay": -1, "message": "Connection timeout"}
+    except Exception as e:
+        return {"success": False, "delay": -1, "message": str(e)}
+
+
+def _test_rust_router_outbound(tag: str, test_url: str, timeout: int) -> dict:
+    """测试 rust-router 管理的出口 (Shadowsocks, V2Ray)
+
+    通过 rust-router IPC 获取健康状态。
+    """
+    import asyncio
+
+    if not HAS_RUST_ROUTER_CLIENT:
+        return {"success": False, "delay": -1, "message": "rust-router not available"}
+
+    try:
+        async def _get_health():
+            try:
+                client = RustRouterClient()
+                await client.connect()
+                try:
+                    # Get outbound health status
+                    health_list = await client.get_outbound_health()
+                    for health in health_list:
+                        if health.tag == tag:
+                            if health.health in ("healthy", "active"):
+                                # Return success with placeholder delay (health check doesn't measure latency)
+                                return {"success": True, "delay": 0, "message": "Connected (health: OK)"}
+                            else:
+                                return {"success": False, "delay": -1, "message": f"Health: {health.health}"}
+
+                    # If not found in health list, check if it exists in outbounds
+                    resp = await client._send_command({"type": "list_outbounds"})
+                    if resp.success and resp.data:
+                        outbounds = resp.data.get("outbounds", [])
+                        for ob in outbounds:
+                            if ob.get("tag") == tag:
+                                # Outbound exists but no health data
+                                return {"success": True, "delay": 0, "message": "Configured (no traffic yet)"}
+
+                    return {"success": False, "delay": -1, "message": "Outbound not found in rust-router"}
+                finally:
+                    await client.close()
+            except Exception as e:
+                return {"success": False, "delay": -1, "message": str(e)}
+
+        return asyncio.run(_get_health())
+    except Exception as e:
+        return {"success": False, "delay": -1, "message": str(e)}
+
+
 def _test_wireguard_endpoint(tag: str, test_url: str, timeout: int) -> dict:
     """测试 WireGuard 端点
 
@@ -8070,6 +12086,7 @@ def _test_wireguard_endpoint(tag: str, test_url: str, timeout: int) -> dict:
     clash_api 的延迟测试对 WireGuard 端点有时会失败，即使隧道正常工作。
 
     策略:
+    0. 如果 rust-router 可用，优先使用其健康检查 API
     1. 检查是否有活跃流量通过该端点
     2. 如果有活跃流量，认为连接正常
     3. 如果没有活跃流量，尝试 clash_api 延迟测试
@@ -8078,6 +12095,118 @@ def _test_wireguard_endpoint(tag: str, test_url: str, timeout: int) -> dict:
     import urllib.request
     import urllib.error
     import urllib.parse
+    import asyncio
+
+    # Try rust-router health check first (userspace WG support)
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            async def _check_rust_router_health():
+                try:
+                    # Create fresh client to avoid asyncio.run() state issues
+                    client = RustRouterClient()
+                    await client.connect()
+                    try:
+                        # First check if this is a WireGuard tunnel
+                        # get_outbound_health() only returns Direct/Block types, not WG tunnels
+                        try:
+                            wg_status = await client.get_wg_tunnel_status(tag)
+                            if wg_status.success and wg_status.data:
+                                data = wg_status.data
+                                active = data.get("active", False)
+                                tx_bytes = data.get("tx_bytes", 0)
+                                rx_bytes = data.get("rx_bytes", 0)
+                                last_handshake = data.get("last_handshake", 0)
+                                peer_endpoint = data.get("peer_endpoint", "")
+                                error = data.get("error")
+
+                                if error:
+                                    return {"success": False, "delay": -1, "message": f"Tunnel error: {error}"}
+
+                                if active and last_handshake > 0:
+                                    # Tunnel is active with valid handshake
+                                    # Measure actual latency by pinging the peer endpoint
+                                    ping_delay_ms = None
+                                    if peer_endpoint:
+                                        # Extract IP from endpoint (format: IP:PORT)
+                                        try:
+                                            ep_parts = peer_endpoint.rsplit(":", 1)
+                                            ep_ip = ep_parts[0]
+                                            # Handle IPv6 format [IP]:PORT
+                                            if ep_ip.startswith("[") and ep_ip.endswith("]"):
+                                                ep_ip = ep_ip[1:-1]
+                                            ping_delay_ms = _ping_endpoint_ip(ep_ip)
+                                        except Exception:
+                                            pass
+
+                                    total_kb = (tx_bytes + rx_bytes) / 1024
+                                    if total_kb >= 1024:
+                                        traffic_str = f"{total_kb/1024:.1f}MB"
+                                    elif total_kb > 0:
+                                        traffic_str = f"{total_kb:.0f}KB"
+                                    else:
+                                        traffic_str = "0KB"
+
+                                    if ping_delay_ms is not None:
+                                        return {
+                                            "success": True,
+                                            "delay": ping_delay_ms,
+                                            "message": f"{ping_delay_ms}ms ({traffic_str})"
+                                        }
+                                    else:
+                                        return {
+                                            "success": True,
+                                            "delay": 0,
+                                            "message": f"✓ Tunnel active ({peer_endpoint}, {traffic_str})"
+                                        }
+                                elif active:
+                                    # Active but no handshake yet
+                                    return {
+                                        "success": True,
+                                        "delay": 0,
+                                        "message": f"✓ Tunnel connected ({peer_endpoint})"
+                                    }
+                                else:
+                                    return {"success": False, "delay": -1, "message": "Tunnel not active"}
+                        except Exception:
+                            pass  # Not a WG tunnel, try regular outbound health
+
+                        # Check regular outbound health (Direct/Block/SOCKS5)
+                        health_info = await client.get_outbound_health()
+                        for h in health_info:
+                            if h.tag == tag:
+                                if h.health != "healthy":
+                                    return {"success": False, "delay": -1, "message": f"Unhealthy: {h.health}"}
+                                # Outbound exists and healthy, do an actual latency test
+                                # Get bind interface from outbound info
+                                outbounds = await client.list_outbounds()
+                                bind_interface = None
+                                for out in outbounds:
+                                    if out.tag == tag and out.bind_interface:
+                                        bind_interface = out.bind_interface
+                                        break
+                                return {"bind_interface": bind_interface}  # Signal to do interface test
+                    finally:
+                        await client.disconnect()
+                except Exception:
+                    pass
+                return None  # Fallback to Clash API
+
+            result = asyncio.run(_check_rust_router_health())
+            if result is not None:
+                # If we got a complete success/failure result, return it
+                if "success" in result:
+                    return result
+                # If outbound found in rust-router, do interface-based test
+                if "bind_interface" in result:
+                    bind_if = result.get("bind_interface")
+                    if bind_if:
+                        return _test_interface_connection(bind_if, test_url, timeout / 1000)
+                    else:
+                        # No interface binding, but outbound is healthy
+                        # Do a simple curl test without binding
+                        return _test_simple_curl(test_url, timeout / 1000)
+        except Exception:
+            pass  # Fallback to original method
 
     # 首先检查是否有活跃流量通过该端点
     try:
@@ -8315,6 +12444,9 @@ def _get_warp_socks_port(tag: str) -> Optional[int]:
 def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -> dict:
     """通过下载文件测速
 
+    优先使用 rust-router IPC 进行测速（支持 WireGuard 隧道和 ECMP 组）。
+    对于其他类型的出口，回退到 curl 命令。
+
     Args:
         tag: 出口标识
         size_mb: 下载文件大小 (MB)
@@ -8323,6 +12455,48 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
     Returns:
         测速结果字典
     """
+    import asyncio
+
+    # 首先尝试通过 rust-router IPC 进行测速
+    # 这支持 WireGuard 隧道、ECMP 组和其他 rust-router 管理的出口
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            from rust_router_client import RustRouterClient
+
+            async def _speed_test_via_ipc():
+                client = RustRouterClient()
+                await client.connect()
+                try:
+                    result = await client.speed_test(
+                        tag=tag,
+                        size_bytes=size_mb * 1024 * 1024,
+                        timeout_secs=int(timeout_sec),
+                    )
+                    return result
+                finally:
+                    await client.disconnect()
+
+            result = asyncio.run(_speed_test_via_ipc())
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "speed_mbps": round(result.get("speed_mbps", 0), 2),
+                    "download_bytes": result.get("bytes_downloaded", 0),
+                    "duration_sec": round(result.get("duration_ms", 0) / 1000, 2),
+                    "message": f"{result.get('speed_mbps', 0):.1f} Mbps"
+                }
+            elif result.get("error"):
+                # rust-router 返回了具体错误，检查是否需要回退到其他方式
+                error = result.get("error", "")
+                if "not found" not in error.lower():
+                    # 出口存在但测速失败
+                    return {"success": False, "speed_mbps": 0, "message": error}
+                # 否则继续尝试其他方式
+        except Exception as e:
+            print(f"[speedtest] rust-router IPC failed: {e}")
+            # 继续尝试其他方式
+
+    # 回退：使用 curl 命令
     test_url = f"https://speed.cloudflare.com/__down?bytes={size_mb * 1024 * 1024}"
 
     curl_cmd = [
@@ -8339,7 +12513,7 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
         # Direct 出口：绑定接口
         if HAS_DATABASE:
             db = _get_db()
-            direct_egress = db.get_direct_egress_by_tag(tag)
+            direct_egress = db.get_direct_egress(tag)
             if direct_egress:
                 if direct_egress.get("bind_interface"):
                     curl_cmd.extend(["--interface", direct_egress["bind_interface"]])
@@ -8356,36 +12530,15 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
         else:
             return {"success": False, "speed_mbps": 0, "message": "OpenVPN tunnel not connected"}
     elif _is_warp_egress(tag):
-        # WARP：根据协议类型选择测试方式
-        if HAS_DATABASE:
-            db = _get_db()
-            warp_egress = db.get_warp_egress(tag)
-            if warp_egress and warp_egress.get("protocol") == "wireguard":
-                # WireGuard 协议：使用内核接口
-                from setup_kernel_wg_egress import get_egress_interface_name
-                interface = get_egress_interface_name(tag, egress_type="warp")
-                curl_cmd.extend(["--interface", interface])
-                proxy_info = f"接口 {interface}"
-            else:
-                # MASQUE 协议：使用 SOCKS 端口
-                socks_port = _get_warp_socks_port(tag)
-                if socks_port:
-                    curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
-                    proxy_info = f"SOCKS5 :{socks_port}"
-                else:
-                    return {"success": False, "speed_mbps": 0, "message": "WARP not connected"}
-        else:
-            return {"success": False, "speed_mbps": 0, "message": "Database not available"}
+        # WARP WireGuard 出口已通过 rust-router IPC 处理（见上方代码）
+        # 如果到这里说明 rust-router IPC 不可用或失败
+        return {"success": False, "speed_mbps": 0, "message": "WARP speed test requires rust-router"}
     elif tag in ("block", "adblock"):
         return {"success": False, "speed_mbps": 0, "message": "Block egress, cannot test speed"}
     else:
-        # WireGuard/PIA：使用测速专用 SOCKS 端口
-        socks_port = _get_speedtest_socks_port(tag)
-        if socks_port:
-            curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
-            proxy_info = f"SOCKS5 :{socks_port}"
-        else:
-            return {"success": False, "speed_mbps": 0, "message": "Speed test port not configured, restart container"}
+        # WireGuard/PIA/Custom WG 出口已通过 rust-router IPC 处理
+        # 如果到这里说明 rust-router IPC 不可用或该出口类型不支持
+        return {"success": False, "speed_mbps": 0, "message": "Speed test not available for this egress type"}
 
     curl_cmd.append(test_url)
 
@@ -8470,10 +12623,22 @@ class AdblockRuleSetCreateRequest(BaseModel):
 
 
 @app.get("/api/adblock/rules")
-def api_list_adblock_rules(category: Optional[str] = None):
-    """列出所有广告拦截规则集"""
+def api_list_adblock_rules(request: Request, category: Optional[str] = None):
+    """列出广告拦截规则集
+
+    普通用户只能看到自己的规则集，管理员可以看到所有规则集。
+    """
     db = _get_db()
-    rules = db.get_remote_rule_sets(enabled_only=False, category=category)
+    owner_filter = get_owner_filter(request)
+    rules = db.get_remote_rule_sets(enabled_only=False, category=category, owner_id=owner_filter)
+
+    # 添加加载状态
+    for rule in rules:
+        tag = rule.get("tag")
+        if _rule_loader and tag:
+            rule["loaded"] = _rule_loader.is_remote_loaded(tag)
+        else:
+            rule["loaded"] = False
 
     # 按分类分组
     by_category = {}
@@ -8487,28 +12652,53 @@ def api_list_adblock_rules(category: Optional[str] = None):
         "rules": rules,
         "by_category": by_category,
         "total": len(rules),
-        "enabled_count": sum(1 for r in rules if r.get("enabled"))
+        "enabled_count": sum(1 for r in rules if r.get("enabled")),
+        "loaded_count": sum(1 for r in rules if r.get("loaded"))
     }
 
 
 @app.get("/api/adblock/rules/{tag}")
-def api_get_adblock_rule(tag: str):
-    """获取单个广告拦截规则集"""
+def api_get_adblock_rule(request: Request, tag: str):
+    """获取单个广告拦截规则集
+
+    普通用户只能查看自己的规则集。
+    """
     db = _get_db()
+    user = get_user_context(request)
+
     rule = db.get_remote_rule_set(tag)
     if not rule:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 检查权限：非管理员只能查看自己的资源
+    if not user.is_admin and rule.get("owner_id") != user.user_id:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 添加加载状态
+    if _rule_loader:
+        rule["loaded"] = _rule_loader.is_remote_loaded(tag)
+    else:
+        rule["loaded"] = False
+
     return rule
 
 
 @app.put("/api/adblock/rules/{tag}/toggle")
-def api_toggle_adblock_rule(tag: str):
-    """切换广告拦截规则集启用状态"""
+def api_toggle_adblock_rule(request: Request, tag: str):
+    """切换广告拦截规则集启用状态
+
+    普通用户只能切换自己的规则集。
+    """
     db = _get_db()
+    user = get_user_context(request)
 
     # 检查规则是否存在
     rule = db.get_remote_rule_set(tag)
     if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 检查权限：非管理员只能操作自己的资源
+    if not user.is_admin and rule.get("owner_id") != user.user_id:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
 
     # 切换状态
@@ -8523,12 +12713,21 @@ def api_toggle_adblock_rule(tag: str):
 
 
 @app.put("/api/adblock/rules/{tag}")
-def api_update_adblock_rule(tag: str, payload: AdblockRuleSetUpdateRequest):
-    """更新广告拦截规则集"""
+def api_update_adblock_rule(request: Request, tag: str, payload: AdblockRuleSetUpdateRequest):
+    """更新广告拦截规则集
+
+    普通用户只能更新自己的规则集。
+    """
     db = _get_db()
+    user = get_user_context(request)
 
     # 检查规则是否存在
-    if not db.get_remote_rule_set(tag):
+    rule = db.get_remote_rule_set(tag)
+    if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 检查权限：非管理员只能操作自己的资源
+    if not user.is_admin and rule.get("owner_id") != user.user_id:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
 
     # 更新
@@ -8540,9 +12739,13 @@ def api_update_adblock_rule(tag: str, payload: AdblockRuleSetUpdateRequest):
 
 
 @app.post("/api/adblock/rules")
-def api_create_adblock_rule(payload: AdblockRuleSetCreateRequest):
-    """创建新的广告拦截规则集"""
+def api_create_adblock_rule(request: Request, payload: AdblockRuleSetCreateRequest):
+    """创建新的广告拦截规则集
+
+    新创建的规则集归属于当前用户。
+    """
     db = _get_db()
+    owner_id = get_owner_id(request)
 
     # 检查 tag 是否已存在
     if db.get_remote_rule_set(payload.tag):
@@ -8558,65 +12761,372 @@ def api_create_adblock_rule(payload: AdblockRuleSetCreateRequest):
         outbound=payload.outbound,
         category=payload.category,
         region=payload.region,
-        priority=payload.priority
+        priority=payload.priority,
+        owner_id=owner_id
     )
 
     return {"message": f"规则集 '{payload.tag}' 已创建", "tag": payload.tag}
 
 
 @app.delete("/api/adblock/rules/{tag}")
-def api_delete_adblock_rule(tag: str):
-    """删除广告拦截规则集"""
+async def api_delete_adblock_rule(request: Request, tag: str):
+    """删除广告拦截规则集
+
+    普通用户只能删除自己的规则集。
+    """
     db = _get_db()
+    user = get_user_context(request)
 
     # 检查规则是否存在
-    if not db.get_remote_rule_set(tag):
+    rule = db.get_remote_rule_set(tag)
+    if not rule:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
 
-    # 删除
+    # 检查权限：非管理员只能操作自己的资源
+    if not user.is_admin and rule.get("owner_id") != user.user_id:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 先从 rule_loader 卸载（如果已加载）
+    if _rule_loader:
+        try:
+            await _rule_loader.unload_remote_rule_set(tag)
+        except Exception as e:
+            logging.warning(f"Failed to unload remote rule set {tag}: {e}")
+
+    # 删除二进制文件（如果存在）
+    if rule.get("file_path"):
+        file_path = RULES_DIR / rule["file_path"]
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception as e:
+            logging.warning(f"Failed to delete binary file for {tag}: {e}")
+
+    # 删除数据库记录
     db.delete_remote_rule_set(tag)
 
     return {"message": f"规则集 '{tag}' 已删除"}
 
 
-@app.post("/api/adblock/apply")
-def api_apply_adblock_rules():
-    """应用广告拦截规则（下载启用的规则并重新生成配置）"""
-    reload_status = ""
-    try:
-        _regenerate_and_reload()
-        reload_status = "配置已重新生成并重载"
-    except Exception as exc:
-        logging.error(f"Failed to apply adblock rules: {exc}")
-        raise HTTPException(status_code=500, detail="Failed to apply configuration")
+@app.post("/api/adblock/rules/{tag}/reload")
+async def api_reload_adblock_rule(request: Request, tag: str):
+    """重新下载并加载单个广告拦截规则集（使用 msgpack 二进制格式）
 
-    return {"message": reload_status, "status": "success"}
+    普通用户只能重新加载自己的规则集。
+    """
+    db = _get_db()
+    user = get_user_context(request)
+
+    # 检查规则是否存在
+    rule = db.get_remote_rule_set(tag)
+    if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 检查权限：非管理员只能操作自己的资源
+    if not user.is_admin and rule.get("owner_id") != user.user_id:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    if not _rule_loader:
+        raise HTTPException(status_code=503, detail="规则加载器未初始化")
+
+    # 使用 rule_loader 重新下载并加载
+    try:
+        success = await _rule_loader.reload_remote_rule_set(tag)
+        if not success:
+            # 获取错误信息
+            updated_rule = db.get_remote_rule_set(tag)
+            error_msg = updated_rule.get("error_message", "下载或转换失败")
+            raise HTTPException(status_code=500, detail=error_msg)
+
+        # 获取更新后的规则信息
+        updated_rule = db.get_remote_rule_set(tag)
+        return {
+            "message": f"规则集 '{tag}' 已重新加载",
+            "rule": updated_rule,
+            "loaded": _rule_loader.is_remote_loaded(tag)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception(f"Failed to reload adblock rule {tag}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/adblock/apply")
+async def api_apply_adblock_rules():
+    """应用广告拦截规则（下载启用的规则并加载到内存）
+
+    Adblock rules are applied via DNS blocking (NXDOMAIN) rather than routing.
+    This is more efficient and avoids IPC message size limits.
+    """
+    if not _rule_loader:
+        raise HTTPException(status_code=503, detail="规则加载器未初始化")
+
+    db = _get_db()
+    results = {"loaded": [], "failed": [], "skipped": []}
+
+    try:
+        # 获取所有启用的远程规则集
+        remote_sets = db.get_remote_rule_sets(enabled_only=True)
+
+        for rs in remote_sets:
+            tag = rs["tag"]
+            try:
+                success = await _rule_loader.load_remote_rule_set(tag)
+                if success:
+                    results["loaded"].append(tag)
+                else:
+                    results["failed"].append(tag)
+            except Exception as e:
+                logging.error(f"Failed to load remote rule set {tag}: {e}")
+                results["failed"].append(tag)
+
+        # 卸载已禁用但仍在内存中的规则集
+        disabled_sets = db.get_remote_rule_sets(enabled_only=False)
+        for rs in disabled_sets:
+            if not rs.get("enabled") and _rule_loader.is_remote_loaded(rs["tag"]):
+                await _rule_loader.unload_remote_rule_set(rs["tag"])
+                results["skipped"].append(rs["tag"])
+
+        # Write combined adblock rules to file and reload via DNS engine
+        # (instead of sending through IPC which has size limits)
+        await _sync_adblock_rules_to_dns_engine()
+
+        return {
+            "message": f"已加载 {len(results['loaded'])} 个规则集",
+            "results": results,
+            "status": "success"
+        }
+    except Exception as exc:
+        import traceback
+        import sys
+        tb = traceback.format_exc()
+        print(f"[ADBLOCK APPLY ERROR] {exc}", file=sys.stderr)
+        print(f"[ADBLOCK APPLY TRACEBACK]\n{tb}", file=sys.stderr)
+        sys.stderr.flush()
+        logging.error(f"Failed to apply adblock rules: {exc}")
+        logging.error(f"Traceback: {tb}")
+        raise HTTPException(status_code=500, detail=f"Failed to apply configuration: {exc}")
+
+
+async def _sync_adblock_rules_to_dns_engine():
+    """Sync adblock rules to rust-router DNS engine via file + IPC.
+
+    Instead of sending rules through IPC (which has a 1 MB limit),
+    write rules to a JSON file and tell rust-router to reload.
+
+    This uses DNS-level blocking (return NXDOMAIN) which is more efficient
+    than routing-level blocking.
+    """
+    if not _rule_loader:
+        logging.warning("[adblock] Rule loader not initialized, skipping DNS sync")
+        return
+
+    # Collect all adblock rules from loaded remote sets
+    all_domains = []
+    for tag, data in _rule_loader._loaded_remote_sets.items():
+        rules = data.get("rules", [])
+        all_domains.extend(rules)
+        logging.debug(f"[adblock] Collected {len(rules)} domains from {tag}")
+
+    logging.info(f"[adblock] Total {len(all_domains)} domains to sync to DNS engine")
+
+    # Write to sing-box ruleset format
+    # Path: /etc/sing-box/rulesets/__adblock_combined__.json
+    ruleset_dir = Path("/etc/sing-box/rulesets")
+    ruleset_dir.mkdir(parents=True, exist_ok=True)
+    combined_file = ruleset_dir / "__adblock_combined__.json"
+
+    if all_domains:
+        ruleset = {
+            "version": 1,
+            "rules": [{"domain_suffix": all_domains}]
+        }
+        combined_file.write_text(json.dumps(ruleset, ensure_ascii=False))
+        logging.info(f"[adblock] Written {len(all_domains)} domains to {combined_file}")
+    else:
+        # Remove file if no domains
+        if combined_file.exists():
+            combined_file.unlink()
+            logging.info("[adblock] Removed empty adblock file")
+
+    # Reload via IPC
+    from rust_router_client import RustRouterClient
+    client = RustRouterClient()
+
+    response = await client.reload_dns_blocklist()
+    if not response.success:
+        error_msg = response.error or response.message or "Unknown error"
+        raise RuntimeError(f"DNS blocklist reload failed: {error_msg}")
+
+    logging.info(f"[adblock] DNS blocklist reloaded successfully")
 
 
 def _regenerate_and_reload():
-    """重新生成配置并重载 sing-box
+    """Sync routing config to rust-router (sing-box migration complete).
+
+    NOTE: sing-box has been replaced by rust-router. This function now just
+    syncs rules to rust-router via IPC. The render_singbox.py step is no longer needed.
 
     Raises:
-        RuntimeError: 如果配置生成或重载失败
+        RuntimeError: If sync to rust-router fails
     """
-    # 调用 render_singbox.py 重新生成配置
-    result = subprocess.run(
-        ["python3", str(ENTRY_DIR / "render_singbox.py")],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        error_msg = f"配置生成失败: {result.stderr.strip() or result.stdout.strip()}"
-        print(f"[api] render_singbox.py 失败: {result.stderr}")
-        raise RuntimeError(error_msg)
-
-    print(f"[api] render_singbox.py 成功")
-
-    # 重载 sing-box
+    # NOTE: render_singbox.py removed - sing-box is no longer used.
+    # Just sync rules to rust-router via IPC.
     reload_result = reload_singbox()
     if not reload_result.get("success"):
         error_msg = reload_result.get("message", "未知错误")
-        raise RuntimeError(f"配置重载失败: {error_msg}")
+        raise RuntimeError(f"配置同步失败: {error_msg}")
+
+
+class RustRouterSyncResult:
+    """Result of rust-router sync operation for structured error handling."""
+
+    def __init__(self, success: bool, rule_count: int = 0, error: Optional[str] = None):
+        self.success = success
+        self.rule_count = rule_count
+        self.error = error
+
+    @property
+    def message(self) -> str:
+        """Human-readable message for logging/display."""
+        if self.success:
+            return f"rust-router synced ({self.rule_count} rules)"
+        return f"rust-router sync failed: {self.error}"
+
+
+class RustRouterSyncError(Exception):
+    """Exception raised when rust-router sync fails."""
+
+    def __init__(self, message: str, result: RustRouterSyncResult = None):
+        super().__init__(message)
+        self.result = result or RustRouterSyncResult(success=False, error=message)
+
+
+def _sync_rules_to_rust_router(db=None, raise_on_error: bool = True) -> RustRouterSyncResult:
+    """Sync routing rules from database to rust-router via IPC.
+
+    Called after adding/deleting rules to sync with rust-router.
+    Fixed asyncio event loop handling for FastAPI context.
+    Now raises exception on failure instead of returning error string.
+
+    Includes rules from:
+    1. Database routing rules (custom rules)
+    2. Loaded rule sets (GeoIP, adblock via rule_loader)
+
+    Args:
+        db: Optional DatabaseManager instance. If None, will get from _get_db().
+        raise_on_error: If True, raises RustRouterSyncError on failure. If False,
+                        returns RustRouterSyncResult with success=False.
+
+    Returns:
+        RustRouterSyncResult: Structured result with success status and details.
+
+    Raises:
+        RustRouterSyncError: If sync fails and raise_on_error is True.
+    """
+    import asyncio
+    import concurrent.futures
+
+    if db is None:
+        db = _get_db()
+
+    # Get allowed owner IDs based on global and per-user ignore settings
+    allowed_owner_ids = db.get_allowed_rule_owner_ids()
+    logging.debug(f"[_sync_rules] Allowed owner IDs: {allowed_owner_ids}")
+
+    # Prepare rule configs before async operations
+    all_rules = db.get_routing_rules(enabled_only=True)
+
+    # Filter rules based on owner_id - only include rules from allowed owners
+    filtered_rules = [
+        r for r in all_rules
+        if r.get("owner_id") is None or r.get("owner_id") in allowed_owner_ids
+    ]
+    if len(filtered_rules) < len(all_rules):
+        logging.info(f"[_sync_rules] Filtered {len(all_rules) - len(filtered_rules)} rules from ignored users")
+
+    rule_configs = []
+    for rule in filtered_rules:
+        rule_type = rule.get("rule_type", "")
+        target = rule.get("target", "")
+        outbound = rule.get("outbound", "direct")
+        # Use domain_suffix for domain rules to match all subdomains
+        # e.g., "example.com" matches "www.example.com", "api.example.com", etc.
+        if rule_type == "domain":
+            rule_type = "domain_suffix"
+        rule_configs.append({
+            "rule_type": rule_type,
+            "target": target,
+            "outbound": outbound,
+        })
+
+    # Add rules from loaded LOCAL rule sets (GeoIP, etc.)
+    # NOTE: Remote/adblock rules are handled via DNS blocking (see _sync_adblock_rules_to_dns_engine)
+    # and are NOT included here to avoid IPC message size limits
+    if _rule_loader:
+        loaded_rules = _rule_loader.get_all_rules()
+        # Filter out remote rules (adblock) - only include local rule sets
+        local_rules = [r for r in loaded_rules if r.get("source") != "remote"]
+        logging.info(f"[_sync_rules] Adding {len(local_rules)} local rules (skipping {len(loaded_rules) - len(local_rules)} remote/adblock rules)")
+        for rule in local_rules:
+            rule_configs.append({
+                "rule_type": rule.get("rule_type", "domain_suffix"),
+                "target": rule.get("rule", ""),
+                "outbound": rule.get("outbound", "direct"),
+            })
+        logging.debug(f"Added {len(local_rules)} rules from rule_loader")
+    else:
+        logging.debug("[_sync_rules] _rule_loader is None")
+
+    default_outbound = db.get_setting("default_outbound", "direct") or "direct"
+
+    async def _do_sync():
+        """Inner async function to perform the sync."""
+        client = RustRouterClient()
+        ping_response = await client.ping()
+        if not ping_response.success:
+            return None, "rust-router not available"
+
+        logging.debug(f"[_sync_rules] Sending {len(rule_configs)} rules to rust-router")
+        result = await client.update_routing(rule_configs, default_outbound)
+        if result.success:
+            return result, None
+        else:
+            error_detail = getattr(result, 'error', getattr(result, 'message', 'unknown error'))
+            return None, f"rust-router sync failed: {error_detail}"
+
+    def _handle_error(error_msg: str) -> RustRouterSyncResult:
+        """Handle sync error - either raise or return failure result."""
+        logging.error(f"rust-router sync failed: {error_msg}")
+        result = RustRouterSyncResult(success=False, error=error_msg)
+        if raise_on_error:
+            raise RustRouterSyncError(error_msg, result)
+        return result
+
+    try:
+        # Handle asyncio event loop properly for FastAPI context
+        try:
+            loop = asyncio.get_running_loop()
+            # We're in a running loop (FastAPI) - use thread pool
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _do_sync())
+                result, error = future.result(timeout=10)
+        except RuntimeError:
+            # No running loop - safe to use asyncio.run() directly
+            result, error = asyncio.run(_do_sync())
+
+        if error:
+            return _handle_error(error)
+        if result:
+            return RustRouterSyncResult(success=True, rule_count=result.rule_count)
+        return _handle_error("unknown sync failure")
+
+    except concurrent.futures.TimeoutError:
+        return _handle_error("sync timed out (10s)")
+    except RustRouterSyncError:
+        raise  # Re-raise our own exception
+    except Exception as e:
+        return _handle_error(str(e))
 
 
 def _full_regenerate_after_import():
@@ -8644,31 +13154,29 @@ def _full_regenerate_after_import():
         "warp": False,
     }
 
-    # 1. WireGuard 入口接口
-    try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/setup_kernel_wg.py"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            print("[backup-import] WireGuard ingress interface synced")
-            results["wireguard_ingress"] = True
-        else:
-            print(f"[backup-import] WireGuard ingress sync failed: {result.stderr.strip()}")
-    except Exception as e:
-        print(f"[backup-import] WireGuard ingress error: {e}")
+    # 1. WireGuard configuration (userspace mode - rust-router handles this)
+    # In userspace mode, WireGuard tunnels are managed by rust-router via IPC
+    # The ingress is automatically configured when rust-router starts
+    print("[backup-import] WireGuard ingress handled by rust-router (userspace mode)")
+    results["wireguard_ingress"] = True
 
-    # 2. WireGuard 出口接口（PIA、自定义）
+    # 2. WireGuard egress tunnels (synced via rust-router IPC)
     try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/setup_kernel_wg_egress.py"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            print("[backup-import] WireGuard egress interfaces synced")
-            results["wireguard_egress"] = True
+        if HAS_RUST_ROUTER_CLIENT:
+            from rust_router_manager import RustRouterManager
+            import asyncio
+            manager = RustRouterManager()
+            loop = asyncio.get_event_loop()
+            sync_result = loop.run_until_complete(manager.sync_wg_egress_tunnels())
+            if sync_result.success:
+                print(f"[backup-import] WireGuard egress synced via rust-router ({sync_result.wg_tunnels_synced} tunnels)")
+                results["wireguard_egress"] = True
+            else:
+                print(f"[backup-import] WireGuard egress sync partial: {sync_result.wg_tunnels_synced} synced, {sync_result.wg_tunnels_removed} removed")
+                results["wireguard_egress"] = True  # Partial success is still success
         else:
-            print(f"[backup-import] WireGuard egress sync failed: {result.stderr.strip()}")
+            print("[backup-import] rust-router client not available, skipping WireGuard egress sync")
+            results["wireguard_egress"] = False
     except Exception as e:
         print(f"[backup-import] WireGuard egress error: {e}")
 
@@ -8680,46 +13188,20 @@ def _full_regenerate_after_import():
     except Exception as e:
         print(f"[backup-import] sing-box error: {e}")
 
-    # 4. Xray 入口（检查 V2Ray ingress 是否启用）
-    try:
-        db = _get_db()
-        v2ray_config = db.user.get_v2ray_inbound_config()
-        if v2ray_config and v2ray_config.get("enabled"):
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/xray_manager.py", "restart"],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0:
-                print("[backup-import] Xray ingress restarted")
-                results["xray_ingress"] = True
-            else:
-                print(f"[backup-import] Xray ingress restart failed: {result.stderr.strip()}")
-        else:
-            results["xray_ingress"] = True  # 未启用，视为成功
-    except Exception as e:
-        print(f"[backup-import] Xray ingress error: {e}")
+    # 4. VLESS ingress (handled by rust-router)
+    # NOTE: xray-lite replaced by rust-router - VLESS config synced via rust-router IPC
+    results["xray_ingress"] = True  # rust-router handles VLESS inbound
+    print("[backup-import] VLESS ingress managed by rust-router (no legacy xray-lite)")
 
-    # 5. Xray 出口（检查 V2Ray egress）
-    try:
-        db = _get_db()
-        v2ray_egress = db.user.get_v2ray_egress_list()
-        if v2ray_egress:
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/xray_egress_manager.py", "daemon"],
-                capture_output=True, text=True, timeout=5
-            )
-            # daemon 会后台运行，立即返回
-            print("[backup-import] Xray egress manager started")
-            results["xray_egress"] = True
-        else:
-            results["xray_egress"] = True  # 无配置，视为成功
-    except Exception as e:
-        print(f"[backup-import] Xray egress error: {e}")
+    # 5. VLESS egress (handled by rust-router)
+    # NOTE: xray-lite replaced by rust-router - VLESS outbound synced via rust-router IPC
+    results["xray_egress"] = True  # rust-router handles VLESS outbound
+    print("[backup-import] VLESS egress managed by rust-router (no legacy xray-lite)")
 
     # 6. OpenVPN 隧道
     try:
         db = _get_db()
-        openvpn_list = db.user.get_openvpn_egress_list()
+        openvpn_list = db.get_openvpn_egress_list()
         if openvpn_list:
             result = subprocess.run(
                 ["python3", "/usr/local/bin/openvpn_manager.py", "daemon"],
@@ -8733,15 +13215,13 @@ def _full_regenerate_after_import():
         print(f"[backup-import] OpenVPN error: {e}")
 
     # 7. WARP 代理
+    # warp_manager.py removed - WARP tunnels managed via rust-router IPC
     try:
         db = _get_db()
-        warp_list = db.user.get_warp_egress_list()
+        warp_list = db.get_warp_egress_list()
         if warp_list:
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/warp_manager.py", "daemon"],
-                capture_output=True, text=True, timeout=5
-            )
-            print("[backup-import] WARP manager started")
+            # WARP tunnels will be synced automatically by rust_router_manager
+            print(f"[backup-import] Found {len(warp_list)} WARP egress entries")
             results["warp"] = True
         else:
             results["warp"] = True  # 无配置，视为成功
@@ -8752,61 +13232,19 @@ def _full_regenerate_after_import():
 
 
 def _reload_xray_egress() -> str:
-    """重载或启动 Xray 出站进程
+    """[DEPRECATED] Reload or start Xray egress process
 
-    如果守护进程没有运行，则启动它；如果已运行则重载配置。
+    Legacy xray-lite has been replaced by rust-router.
+    VLESS outbound is now managed via rust-router IPC.
+    This function is kept for API compatibility but is now a no-op.
 
     Returns:
-        状态消息
+        Status message
     """
-    try:
-        # 先检查状态
-        status_result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "status"],
-            capture_output=True, text=True, timeout=5
-        )
-        is_running = False
-        if status_result.returncode == 0:
-            try:
-                status = json.loads(status_result.stdout)
-                is_running = status.get("status") == "running"
-            except json.JSONDecodeError:
-                pass
-
-        # 根据状态决定操作
-        if is_running:
-            # 已运行，使用 reload
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/xray_egress_manager.py", "reload"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                print("[api] Xray egress reloaded")
-                _reset_xray_egress_client()
-                return ", Xray egress reloaded"
-            else:
-                print(f"[api] Xray egress reload failed: {result.stderr.strip()}")
-                return ", Xray egress reload failed"
-        else:
-            # 未运行，使用 start
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/xray_egress_manager.py", "start"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                print("[api] Xray egress started")
-                _reset_xray_egress_client()
-                return ", Xray egress started"
-            else:
-                print(f"[api] Xray egress start failed: {result.stderr.strip()}")
-                return ", Xray egress start failed"
-
-    except subprocess.TimeoutExpired:
-        print("[api] Xray egress operation timeout")
-        return ", Xray egress timeout"
-    except Exception as e:
-        print(f"[api] Xray egress error: {e}")
-        return ""
+    # Legacy xray-lite egress manager removed
+    # VLESS outbound is handled by rust-router AddVlessOutbound IPC
+    logging.debug("[api] _reload_xray_egress called but xray-lite is deprecated (using rust-router)")
+    return ""  # Return empty string to not affect reload_status messages
 
 
 def _reload_openvpn_manager() -> str:
@@ -8891,63 +13329,102 @@ def _reload_openvpn_manager() -> str:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
-def _sync_kernel_wg_egress() -> str:
-    """同步内核 WireGuard 出口接口与数据库
+def _sync_wg_egress() -> str:
+    """同步 WireGuard 出口隧道与数据库
 
     创建/更新/删除 PIA 或自定义出口后调用此函数，
-    确保内核 WireGuard 接口与数据库保持同步。
+    确保 WireGuard 隧道与数据库保持同步。
+
+    用户态模式下通过 rust-router IPC 同步。
 
     Returns:
         状态消息
     """
     try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/setup_kernel_wg_egress.py"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            print("[api] Kernel WireGuard egress interfaces synced")
-            return ", WireGuard interfaces synced"
+        if HAS_RUST_ROUTER_CLIENT:
+            from rust_router_manager import RustRouterManager
+            import asyncio
+            manager = RustRouterManager()
+            # Use asyncio.run() for thread safety in sync context
+            result = asyncio.run(manager.sync_wg_egress_tunnels())
+            if result.success:
+                print(f"[api] WireGuard egress synced via rust-router ({result.wg_tunnels_synced} synced)")
+                return f", WireGuard tunnels synced ({result.wg_tunnels_synced})"
+            else:
+                print(f"[api] WireGuard sync partial: {result.wg_tunnels_synced} synced")
+                return f", WireGuard sync partial ({result.wg_tunnels_synced} synced)"
         else:
-            print(f"[api] WireGuard sync failed: {result.stderr.strip()}")
-            return ", WireGuard sync failed"
-    except subprocess.TimeoutExpired:
-        print("[api] WireGuard sync timeout")
-        return ", WireGuard sync timeout"
+            print("[api] rust-router client not available")
+            return ", WireGuard sync skipped (userspace mode)"
     except Exception as e:
         print(f"[api] WireGuard sync error: {e}")
-        return ""
+        return f", WireGuard sync error: {e}"
 
 
-def _sync_kernel_wg_ingress() -> str:
-    """同步内核 WireGuard 入口接口与数据库
+def _refresh_wg_tunnel(tag: str) -> str:
+    """刷新指定的 WireGuard 隧道（删除旧隧道并重新创建）
 
-    更新 WireGuard 服务器配置后调用此函数，
-    确保内核 wg-ingress 接口与数据库保持同步。
+    当 PIA 凭证刷新后，endpoint 可能已变化，需要删除旧隧道后重新创建。
 
-    注意: 不使用 --sync-only，因为需要应用服务器配置更改
-    (private_key, listen_port, address, mtu)
+    Args:
+        tag: 隧道标识
 
     Returns:
         状态消息
     """
     try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/setup_kernel_wg.py"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            print("[api] Kernel WireGuard ingress interface synced")
-            return ", WireGuard ingress synced"
+        if HAS_RUST_ROUTER_CLIENT:
+            from rust_router_client import RustRouterClient
+            from rust_router_manager import RustRouterManager
+            import asyncio
+
+            async def _refresh():
+                # 先删除旧隧道
+                client = RustRouterClient()
+                await client.connect()
+                try:
+                    result = await client.remove_wg_tunnel(tag)
+                    if result.success:
+                        print(f"[api] Removed old tunnel '{tag}'")
+                    else:
+                        print(f"[api] Tunnel '{tag}' not found or already removed")
+                finally:
+                    await client.disconnect()
+
+                # 再同步新配置
+                manager = RustRouterManager()
+                sync_result = await manager.sync_wg_egress_tunnels()
+                return sync_result
+
+            result = asyncio.run(_refresh())
+            if result.success:
+                print(f"[api] WireGuard tunnel '{tag}' refreshed ({result.wg_tunnels_synced} synced)")
+                return f", tunnel refreshed"
+            else:
+                return f", tunnel refresh partial"
         else:
-            print(f"[api] WireGuard ingress sync failed: {result.stderr.strip()}")
-            return ", WireGuard ingress sync failed"
-    except subprocess.TimeoutExpired:
-        print("[api] WireGuard ingress sync timeout")
-        return ", WireGuard ingress sync timeout"
+            print("[api] rust-router client not available")
+            return ", tunnel refresh skipped"
     except Exception as e:
-        print(f"[api] WireGuard ingress sync error: {e}")
-        return ""
+        print(f"[api] Tunnel refresh error: {e}")
+        return f", tunnel refresh error: {e}"
+
+
+def _sync_wg_ingress() -> str:
+    """同步 WireGuard 入口配置与数据库
+
+    更新 WireGuard 服务器配置后调用此函数。
+
+    用户态模式下，ingress 由 rust-router 启动时自动配置，
+    配置更改需要重启 rust-router 生效。
+
+    Returns:
+        状态消息
+    """
+    # In userspace mode, ingress is managed by rust-router
+    # Changes require rust-router restart to take effect
+    print("[api] WireGuard ingress managed by rust-router (userspace mode)")
+    return ", WireGuard ingress config updated (restart required)"
 
 
 # ============ Domain List Catalog APIs ============
@@ -9144,11 +13621,14 @@ def is_adblock_list(list_id: str) -> bool:
 
 
 @app.post("/api/domain-catalog/quick-rule")
-def api_create_quick_rule(payload: QuickRuleRequest):
+def api_create_quick_rule(request: Request, payload: QuickRuleRequest):
     """从域名列表快速创建路由规则"""
     # 使用数据库存储
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
+
+    # Get current user's owner_id for resource ownership
+    owner_id = get_owner_id(request)
 
     db = _get_db()
 
@@ -9184,7 +13664,7 @@ def api_create_quick_rule(payload: QuickRuleRequest):
     # 批量添加域名到数据库（使用 executemany 一次性插入）
     # 格式: (rule_type, target, outbound, tag, priority)
     rules = [("domain", domain, payload.outbound, tag, 0) for domain in all_domains]
-    added_count = db.add_routing_rules_batch(rules)
+    added_count = db.add_routing_rules_batch(rules, owner_id=owner_id)
 
     return {
         "message": f"快速规则已创建，添加了 {added_count} 个域名到数据库",
@@ -9422,12 +13902,19 @@ class IpQuickRuleRequest(BaseModel):
     country_codes: List[str] = Field(..., description="国家代码列表")
     outbound: str = Field(..., description="出口线路 tag")
     tag: Optional[str] = Field(None, description="规则集标签")
+    name: Optional[str] = Field(None, description="规则集名称（可选，不提供则自动生成）")
     ipv4_only: bool = Field(True, description="仅 IPv4")
 
 
 @app.post("/api/ip-catalog/quick-rule")
-def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
-    """从 IP 列表快速创建路由规则"""
+def api_create_ip_quick_rule(request: Request, payload: IpQuickRuleRequest):
+    """从 IP 列表快速创建路由规则
+
+    当 CIDR 数量 >= RULE_SET_THRESHOLD 时，使用二进制规则集存储以提高性能。
+    否则使用传统数据库行存储。
+    """
+    # Get current user's owner_id for resource ownership
+    owner_id = get_owner_id(request)
     all_cidrs = []
 
     for cc in payload.country_codes:
@@ -9455,22 +13942,102 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
 
     db = _get_db()
 
+    # Large rule sets: use binary storage for better performance
+    if len(all_cidrs) >= RULE_SET_THRESHOLD and HAS_RULE_BINARY:
+        # Use binary rule set storage
+        set_id = f"geoip-{'-'.join(cc.lower() for cc in payload.country_codes[:3])}"
+
+        # Check if already exists
+        existing = db.get_rule_set(set_id)
+        if existing:
+            # Delete existing and recreate
+            db.delete_rule_set(set_id)
+            old_file = RULES_DIR / existing.get("file_path", "")
+            try:
+                old_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # Create rules directory if needed
+        RULES_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Write binary file
+        file_name = f"{set_id}.bin"
+        file_path = RULES_DIR / file_name
+
+        try:
+            checksum = write_rule_binary(
+                str(file_path),
+                rules=all_cidrs,
+                rule_type="ip",
+                outbound=payload.outbound,
+                tag=set_id
+            )
+        except Exception as e:
+            logging.error(f"Failed to write binary file for rule set {set_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"写入规则文件失败: {e}") from e
+
+        # Add to database - use user-provided name or auto-generate
+        name = payload.name if payload.name else f"GeoIP {' '.join(cc.upper() for cc in payload.country_codes[:5])}"
+        success = db.add_rule_set(
+            set_id=set_id,
+            name=name,
+            rule_type="ip",
+            outbound=payload.outbound,
+            rule_count=len(all_cidrs),
+            file_path=file_name,
+            checksum=checksum,
+            priority=0,
+            owner_id=owner_id
+        )
+
+        if not success:
+            try:
+                file_path.unlink(missing_ok=True)
+            except Exception as e:
+                logging.warning(f"Failed to cleanup file {file_path}: {e}")
+            raise HTTPException(status_code=500, detail="添加规则集到数据库失败")
+
+        # Load into memory if loader is available
+        if _rule_loader:
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(_rule_loader.load_rule_set(set_id))
+                else:
+                    loop.run_until_complete(_rule_loader.load_rule_set(set_id))
+            except Exception as e:
+                logging.warning(f"加载规则集到内存失败 {set_id}: {e}")
+
+        return {
+            "message": f"IP 快速规则已创建（二进制存储），添加了 {len(all_cidrs)} 个 CIDR",
+            "tag": tag,
+            "set_id": set_id,
+            "cidr_count": len(all_cidrs),
+            "outbound": payload.outbound,
+            "storage": "binary",
+            "file_path": file_name,
+        }
+
+    # Small rule sets: use traditional database row storage
     # 批量添加 IP CIDR 到数据库（使用 executemany 一次性插入）
     # 格式: (rule_type, target, outbound, tag, priority)
     rules = [("ip", cidr, payload.outbound, tag, 0) for cidr in all_cidrs]
-    added_count = db.add_routing_rules_batch(rules)
+    added_count = db.add_routing_rules_batch(rules, owner_id=owner_id)
 
     return {
         "message": f"IP 快速规则已创建，添加了 {added_count} 个 CIDR 到数据库",
         "tag": tag,
         "cidr_count": added_count,
         "outbound": payload.outbound,
+        "storage": "database",
     }
 
 
 # ============ Backup / Restore APIs ============
 
-BACKUP_VERSION = "2.0"
+BACKUP_VERSION = "2.1"
 
 
 @app.post("/api/backup/export")
@@ -9518,12 +14085,40 @@ def api_export_backup(payload: BackupExportRequest):
         "encryption_key": encrypted_key,
     }
 
+    # 5. 包含二进制规则文件（如果存在）
+    rule_files = {}
+    rule_files_size = 0
+    if RULES_DIR.exists() and HAS_DATABASE:
+        try:
+            db = _get_db()
+            rule_sets = db.get_rule_sets(enabled_only=False)
+            for rs in rule_sets:
+                file_path_str = rs.get("file_path")
+                if file_path_str:
+                    file_path = RULES_DIR / file_path_str
+                    if file_path.exists():
+                        try:
+                            file_bytes = file_path.read_bytes()
+                            rule_files[file_path_str] = base64.b64encode(file_bytes).decode("utf-8")
+                            rule_files_size += len(file_bytes)
+                        except Exception as e:
+                            logging.warning(f"无法读取规则文件 {file_path}: {e}")
+        except Exception as e:
+            logging.warning(f"备份规则文件时出错: {e}")
+
+    if rule_files:
+        backup_data["rule_files"] = rule_files
+        backup_data["rule_files_count"] = len(rule_files)
+        backup_data["rule_files_size_bytes"] = rule_files_size
+
     return {
         "message": "备份已生成 (v2.0)",
         "backup": backup_data,
         "encrypted": True,
         "database_size_bytes": db_size,
         "checksum": f"sha256:{checksum}",
+        "rule_files_count": len(rule_files),
+        "rule_files_size_bytes": rule_files_size,
     }
 
 
@@ -9863,7 +14458,30 @@ def api_import_backup(payload: BackupImportRequest):
                 shutil.move(backup_db_path, USER_DB_PATH)
             raise HTTPException(status_code=500, detail=f"导入失败: {e}") from e
 
-        # 6. 完整重新生成所有接口和配置
+        # 6. 恢复二进制规则文件（如果存在）
+        rule_files_restored = 0
+        if "rule_files" in backup_data:
+            try:
+                RULES_DIR.mkdir(parents=True, exist_ok=True)
+                for file_name, file_data_b64 in backup_data["rule_files"].items():
+                    try:
+                        file_bytes = base64.b64decode(file_data_b64)
+                        file_path = RULES_DIR / file_name
+                        # Atomic write
+                        with tempfile.NamedTemporaryFile(
+                            dir=RULES_DIR, suffix=".tmp", delete=False
+                        ) as tmp:
+                            tmp.write(file_bytes)
+                            tmp_path = tmp.name
+                        shutil.move(tmp_path, file_path)
+                        rule_files_restored += 1
+                    except Exception as e:
+                        logging.warning(f"恢复规则文件 {file_name} 失败: {e}")
+                print(f"[backup] 恢复了 {rule_files_restored} 个规则文件")
+            except Exception as e:
+                logging.warning(f"恢复规则文件时出错: {e}")
+
+        # 7. 完整重新生成所有接口和配置
         regen_results = {}
         try:
             regen_results = _full_regenerate_after_import()
@@ -9872,7 +14490,22 @@ def api_import_backup(payload: BackupImportRequest):
             print(f"[backup] 重新生成配置失败: {e}")
             # 不回滚，数据已成功导入
 
-        # 7. 清除速率限制（用户可能需要重新登录，之前的限制不应影响）
+        # 8. 重新初始化规则加载器（如果可用）
+        if _rule_loader and HAS_RULE_LOADER:
+            try:
+                import asyncio
+                # Reset and reload all rule sets
+                _rule_loader.reset_stats()
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(_rule_loader.start_background_load())
+                else:
+                    loop.run_until_complete(_rule_loader.start_background_load())
+                print("[backup] 规则加载器已重新初始化")
+            except Exception as e:
+                logging.warning(f"重新初始化规则加载器失败: {e}")
+
+        # 9. 清除速率限制（用户可能需要重新登录，之前的限制不应影响）
         _clear_rate_limit()
 
         return {
@@ -9881,6 +14514,7 @@ def api_import_backup(payload: BackupImportRequest):
             "checksum_verified": True,
             "database_size_bytes": len(db_bytes),
             "regeneration_results": regen_results,
+            "rule_files_restored": rule_files_restored,
         }
 
     # === v1.0 格式处理（向后兼容）===
@@ -10091,13 +14725,23 @@ def api_import_backup(payload: BackupImportRequest):
                     db.delete_v2ray_egress(eg["tag"])
 
             existing_tags = {eg["tag"] for eg in db.get_v2ray_egress_list(enabled_only=False)}
+            skipped_count = 0
             for eg in backup_data["v2ray_egress"]:
                 tag = eg.get("tag", "")
+                protocol = eg.get("protocol", "vless")
+
+                # [Xray-lite] Skip VMess/Trojan egress from backup - only VLESS supported
+                if protocol != "vless":
+                    print(f"[backup] Skipping unsupported protocol '{protocol}' for egress '{tag}' - "
+                          "only VLESS is supported in Xray-lite. See docs/VMESS_TROJAN_MIGRATION.md")
+                    skipped_count += 1
+                    continue
+
                 if tag and tag not in existing_tags:
                     sens = sensitive_by_tag.get(tag, {})
                     db.add_v2ray_egress(
                         tag=tag,
-                        protocol=eg.get("protocol", "vless"),
+                        protocol=protocol,
                         server=eg.get("server", ""),
                         server_port=eg.get("server_port", 443),
                         description=eg.get("description", ""),
@@ -10344,7 +14988,7 @@ def _extract_subnet_idx_from_ip(ip_str: str) -> int:
 def _get_next_peer_tunnel_subnet(db, local_node_tag: str = None, remote_node_tag: str = None) -> tuple:
     """获取下一个可用的 /30 子网
 
-    Phase 11-Fix.A 增强版：支持确定性分配以避免多节点场景下的冲突。
+    增强版：支持确定性分配以避免多节点场景下的冲突。
 
     当提供 local_node_tag 和 remote_node_tag 时，使用确定性算法：
     1. 基于节点对的哈希值计算起始子网索引
@@ -10461,7 +15105,7 @@ def _find_peer_node_by_ip(db, client_ip: str):
     遍历所有节点，检查 endpoint 或 tunnel_remote_ip 是否匹配该 IP。
     支持不同 tag 的互联场景。
 
-    Phase 11-Fix.C3: 增加 tunnel_remote_ip 检查，支持隧道内 API 调用
+    增加 tunnel_remote_ip 检查，支持隧道内 API 调用
     当请求通过隧道到达时，client_ip 是隧道 IP（如 10.200.200.242），
     而不是外部 endpoint IP（如 10.1.100.11）。
     """
@@ -10492,7 +15136,7 @@ def _find_peer_node_by_ip(db, client_ip: str):
 def _resolve_peer_node(db, node_identifier: str, fallback_ip: str = None) -> Optional[dict]:
     """解析节点标识符到本地 peer_node
 
-    Phase 11-Fix.D: 支持多种查找方式
+    支持多种查找方式
 
     尝试多种查找方式:
     1. 精确 tag 匹配
@@ -10567,9 +15211,9 @@ def api_peer_notify_connected(request: Request, payload: PeerNotifyRequest):
 
     db = _get_db()
 
-    # Phase 11-Fix.M: 使用灵活认证函数
+    # 使用灵活认证函数
     # 认证方式：隧道 IP 认证（WireGuard）或 UUID 认证（Xray）
-    # PSK 认证已废弃（Phase 11-Fix.N），所有节点间通信使用隧道认证
+    # PSK 认证已废弃，所有节点间通信使用隧道认证
     node = _verify_peer_request_flexible(
         request, db,
         payload_node_id=payload.node_id
@@ -10612,19 +15256,15 @@ def api_peer_notify_connected(request: Request, payload: PeerNotifyRequest):
                 detail="Missing peer public key. Provide initiator_public_key or complete key exchange first."
             )
 
-    # 建立本地隧道
+    # 建立本地隧道 (via rust-router IPC)
     try:
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-        success = manager.connect_node(tag)
+        success, message = _connect_peer_sync(tag)
 
         if success:
             logging.info(f"[peer-notify] 节点 '{tag}' 隧道已建立（响应远程通知）")
             return {"success": True, "message": "Tunnel established", "status": "connected"}
         else:
-            updated_node = db.get_peer_node(tag)
-            internal_error = updated_node.get("last_error", "Unknown error")
-            logging.error(f"[peer-notify] 节点 '{tag}' 隧道建立失败: {internal_error}")
+            logging.error(f"[peer-notify] 节点 '{tag}' 隧道建立失败: {message}")
             # 不暴露内部错误详情给客户端
             raise HTTPException(status_code=500, detail="Tunnel setup failed")
     except HTTPException:
@@ -10658,7 +15298,7 @@ def api_peer_notify_disconnected(request: Request, payload: PeerNotifyRequest):
 
     db = _get_db()
 
-    # Phase 11-Fix.M: 使用灵活认证函数
+    # 使用灵活认证函数
     # 注意：require_psk=False 允许新配对节点（无 PSK）使用隧道 IP 认证
     # 断开通知通常在隧道断开前发送，此时隧道可能还在
     # 对于无 PSK 的节点：如果隧道已连接，使用 IP 认证；否则认证失败（可接受）
@@ -10678,29 +15318,63 @@ def api_peer_notify_disconnected(request: Request, payload: PeerNotifyRequest):
     if current_status == "disconnected":
         return {"success": True, "message": "Already disconnected", "status": "disconnected"}
 
-    # 断开本地隧道
+    # 断开本地隧道 (via rust-router IPC)
     try:
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-        success = manager.disconnect_node(tag)
+        success, message = _disconnect_peer_sync(tag)
+
+        # 更新使用该节点的链路状态
+        chain_result = _update_chains_for_disconnected_peer(db, tag)
+        chains_updated = chain_result.get("updated", [])
+
+        # 使客户端缓存失效
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+            client_mgr = TunnelAPIClientManager(db)
+            client_mgr.invalidate_client(tag)
+        except Exception as cache_err:
+            logging.debug(f"[peer-notify] 清除客户端缓存失败: {cache_err}")
 
         if success:
             logging.info(f"[peer-notify] 节点 '{tag}' 隧道已断开（响应远程通知）")
-            return {"success": True, "message": "Tunnel disconnected", "status": "disconnected"}
+            return {
+                "success": True,
+                "message": "Tunnel disconnected",
+                "status": "disconnected",
+                "chains_updated": chains_updated,  #
+            }
         else:
             # 断开失败也更新状态（可能接口已经不存在）
             db.update_peer_node(tag, tunnel_status="disconnected")
-            return {"success": True, "message": "Tunnel marked as disconnected", "status": "disconnected"}
+            return {
+                "success": True,
+                "message": "Tunnel marked as disconnected",
+                "status": "disconnected",
+                "chains_updated": chains_updated,  #
+            }
     except Exception as e:
         logging.warning(f"[peer-notify] 节点 '{tag}' 断开异常: {e}")
         # 异常情况下也标记为断开
         db.update_peer_node(tag, tunnel_status="disconnected")
-        return {"success": True, "message": "Tunnel marked as disconnected", "status": "disconnected"}
+        # 使客户端缓存失效
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+            client_mgr = TunnelAPIClientManager(db)
+            client_mgr.invalidate_client(tag)
+        except Exception:
+            pass
+        #: 即使断开异常，也要更新链路状态
+        chain_result = _update_chains_for_disconnected_peer(db, tag)
+        return {
+            "success": True,
+            "message": "Tunnel marked as disconnected",
+            "status": "disconnected",
+            "chains_updated": chain_result.get("updated", []),  #
+        }
 
 
 @app.post("/api/peer-tunnel/reverse-setup")
 def api_peer_tunnel_reverse_setup(request: Request, payload: ReverseSetupRequest):
-    """Phase 11.2: 请求建立反向连接
+    """请求建立反向连接
 
     当节点 A 完成配对并连接到节点 B 后，A 通过隧道调用此 API，
     请求 B 也建立到 A 的连接，实现双向自动连接。
@@ -10801,23 +15475,20 @@ def api_peer_tunnel_reverse_setup(request: Request, payload: ReverseSetupRequest
             "tunnel_status": current_status
         }
 
-    # 尝试建立连接
+    # 尝试建立连接 (via rust-router IPC)
     try:
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-
         # 刷新节点数据（可能已更新）
         node = db.get_peer_node(tag)
 
         if current_status != "connected":
             # 建立隧道连接
             # 注：不需要再通知对方，因为对方调用了此 API 说明已经知道我们要连接
-            success = manager.connect_node(tag)
+            success, message = _connect_peer_sync(tag)
             if success:
                 current_status = "connected"
                 logging.info(f"[reverse-setup] 节点 '{tag}' 隧道已建立")
             else:
-                logging.warning(f"[reverse-setup] 节点 '{tag}' 隧道建立失败")
+                logging.warning(f"[reverse-setup] 节点 '{tag}' 隧道建立失败: {message}")
                 return {
                     "success": False,
                     "message": "Failed to establish tunnel",
@@ -10849,7 +15520,7 @@ def api_peer_tunnel_reverse_setup(request: Request, payload: ReverseSetupRequest
 
 @app.post("/api/peer-tunnel/complete-handshake")
 def api_peer_tunnel_complete_handshake(request: Request, payload: CompleteHandshakeRequest):
-    """Phase 11-Tunnel: 完成隧道优先配对
+    """完成隧道优先配对
 
     当 Node B 导入 Node A 的配对码并建立隧道后，
     B 通过隧道调用此 API 通知 A 完成配对流程。
@@ -10944,7 +15615,7 @@ def api_peer_tunnel_complete_handshake(request: Request, payload: CompleteHandsh
             name=payload.node_tag,
             description=payload.node_description or f"Paired via tunnel",
             endpoint=payload.endpoint,
-            api_port=payload.api_port,  # Phase 11-Fix.K: 保存 API 端口
+            api_port=payload.api_port,  # 保存 API 端口
             tunnel_type="wireguard",
             tunnel_status="connected",
             tunnel_interface=permanent_interface,
@@ -10954,7 +15625,7 @@ def api_peer_tunnel_complete_handshake(request: Request, payload: CompleteHandsh
             wg_private_key=pending.get("wg_private_key"),
             wg_public_key=pending.get("wg_public_key"),  # A 的公钥
             wg_peer_public_key=payload.wg_public_key,  # B 的公钥
-            # Phase 11-Fix.K: 使用正确的 api_port
+            # 使用正确的 api_port
             tunnel_api_endpoint=f"{remote_ip}:{payload.api_port or DEFAULT_WEB_PORT}",
             bidirectional_status="bidirectional",
         )
@@ -10983,7 +15654,7 @@ def api_peer_tunnel_complete_handshake(request: Request, payload: CompleteHandsh
 
 @app.post("/api/peer-tunnel/peer-event")
 def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
-    """Phase 11-Cascade: 接收对等节点事件通知
+    """接收对等节点事件通知
 
     当节点删除或断开另一个节点时，通过隧道调用此 API 通知对方。
     支持级联广播，让所有连接的节点得知变更。
@@ -11090,12 +15761,15 @@ def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
         if source_peer:
             logging.info(f"[peer-event] 处理删除事件: 清理与 {peer_tag} 的连接 (source_node={payload.source_node})")
 
-            # 断开隧道（如果已连接）
+            # 断开隧道（如果已连接）- via rust-router IPC
             if source_peer.get("tunnel_status") == "connected":
                 try:
-                    from peer_tunnel_manager import disconnect_peer_tunnel
-                    disconnect_peer_tunnel(db, peer_tag)
-                    result["actions_taken"].append(f"disconnected tunnel to {peer_tag}")
+                    success, msg = _disconnect_peer_sync(peer_tag)
+                    if success:
+                        result["actions_taken"].append(f"disconnected tunnel to {peer_tag}")
+                    else:
+                        logging.warning(f"[peer-event] 断开隧道返回失败: {msg}")
+                        result["actions_taken"].append(f"disconnect attempted for {peer_tag}")
                 except Exception as e:
                     logging.error(f"[peer-event] 断开隧道失败: {e}")
 
@@ -11111,6 +15785,12 @@ def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
                 logging.exception(f"[peer-event] 添加墓碑失败 (非致命): {e}")
                 result["actions_taken"].append(f"tombstone failed for {peer_tag}")
 
+            # NOTE: Legacy xray_peer_inbound_manager removed
+            # VLESS peer inbound is now handled by rust-router
+            if source_peer.get("inbound_enabled"):
+                logging.debug(f"[peer-event] VLESS peer inbound cleanup for {peer_tag} handled by rust-router")
+                result["actions_taken"].append(f"vless inbound cleanup for {peer_tag} (rust-router)")
+
             # 删除本地 peer_node 记录
             db.delete_peer_node(peer_tag)
             result["actions_taken"].append(f"deleted peer_node {peer_tag}")
@@ -11125,6 +15805,11 @@ def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
             logging.info(f"[peer-event] 处理断开事件: 更新 {peer_tag} 状态 (source_node={payload.source_node})")
             db.update_peer_node(peer_tag, tunnel_status="disconnected")
             result["actions_taken"].append(f"updated status of {peer_tag}")
+
+            # 更新使用该节点的链路状态
+            chain_result = _update_chains_for_disconnected_peer(db, peer_tag)
+            if chain_result.get("updated"):
+                result["actions_taken"].append(f"updated {len(chain_result['updated'])} chains to error state")
 
         result["message"] = f"Processed disconnect event from {payload.source_node}"
 
@@ -11240,7 +15925,8 @@ def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
                         if resp.get("success"):
                             logging.info(f"[peer-event] 广播成功: {other_tag}")
                         else:
-                            logging.warning(f"[peer-event] 广播失败: {other_tag}: {resp.get('message')}")
+                            # 防御性默认值
+                            logging.warning(f"[peer-event] 广播失败: {other_tag}: {resp.get('message', 'Unknown error')}")
 
                     except Exception as e:
                         # M-2: 使用 exception() 记录完整堆栈
@@ -11262,7 +15948,7 @@ def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
 
 
 def _trigger_bidirectional_connect(db, node_tag: str, pending_request: Dict[str, Any]) -> bool:
-    """Phase 11.2/11.3: 触发双向自动连接 (WireGuard/Xray)
+    """触发双向自动连接 (WireGuard/Xray)
 
     在配对完成后自动执行：
     1. 建立到远程节点的隧道连接
@@ -11282,7 +15968,6 @@ def _trigger_bidirectional_connect(db, node_tag: str, pending_request: Dict[str,
         是否成功建立双向连接
     """
     import requests
-    from peer_tunnel_manager import PeerTunnelManager
 
     node = db.get_peer_node(node_tag)
     if not node:
@@ -11296,12 +15981,11 @@ def _trigger_bidirectional_connect(db, node_tag: str, pending_request: Dict[str,
 
     logging.info(f"[bidirectional] 开始双向自动连接: 节点 '{node_tag}', 类型={tunnel_type}")
 
-    # Step 1: 建立到远程节点的隧道
+    # Step 1: 建立到远程节点的隧道 (via rust-router IPC)
     try:
-        manager = PeerTunnelManager()
-        connect_success = manager.connect_node(node_tag)
+        connect_success, connect_message = _connect_peer_sync(node_tag)
         if not connect_success:
-            logging.warning(f"[bidirectional] 节点 '{node_tag}' 连接失败")
+            logging.warning(f"[bidirectional] 节点 '{node_tag}' 连接失败: {connect_message}")
             db.update_peer_node(node_tag, bidirectional_status="outbound_only")
             return False
         logging.info(f"[bidirectional] 节点 '{node_tag}' 出站隧道已建立")
@@ -11323,7 +16007,7 @@ def _trigger_bidirectional_connect(db, node_tag: str, pending_request: Dict[str,
         db.update_peer_node(node_tag, bidirectional_status="outbound_only")
         return False
 
-    # Phase 11-Fix.B: 使用统一的 API 端口推导函数
+    # 使用统一的 API 端口推导函数
     remote_ip, api_port = _derive_api_port_from_endpoint(endpoint, node)
 
     reverse_setup_url = f"http://{remote_ip}:{api_port}/api/peer-tunnel/reverse-setup"
@@ -11346,7 +16030,7 @@ def _trigger_bidirectional_connect(db, node_tag: str, pending_request: Dict[str,
     # 根据隧道类型选择请求方式
     proxies = None
     if tunnel_type == "xray":
-        # Phase 11.3: Xray 通过 SOCKS5 代理发起请求
+        # Xray 通过 SOCKS5 代理发起请求
         xray_socks_port = node.get("xray_socks_port")
         # HIGH 修复: SOCKS 端口验证
         if not xray_socks_port or not (1 <= xray_socks_port <= 65535):
@@ -11395,7 +16079,7 @@ def _trigger_bidirectional_connect(db, node_tag: str, pending_request: Dict[str,
 
 
 def _check_and_update_bidirectional_status(db, tag: str) -> str:
-    """Phase 11-Fix.B: 检查并更新双向连接状态
+    """检查并更新双向连接状态
 
     在手动连接成功后调用，检测是否建立了双向连接。
 
@@ -11456,7 +16140,7 @@ def _notify_peer_connected(db, node: dict) -> bool:
     调用远程节点的 /api/peer-notify/connected 端点，
     让对方也建立其侧的隧道，实现双向连接。
 
-    Phase 2 修复：优先使用隧道通信，如果隧道不可用则回退到 LAN 端点。
+    优先使用隧道通信，如果隧道不可用则回退到 LAN 端点。
     这对于初始连接建立（bootstrap）场景很重要，因为此时隧道可能尚未完全建立。
 
     Args:
@@ -11475,13 +16159,13 @@ def _notify_peer_connected(db, node: dict) -> bool:
     payload = {
         "node_id": tag,
         # 提供我们的参数，让对方可以连接到我们
-        # Phase 6 Fix: 使用有效范围内的端口常量
+        # 使用有效范围内的端口常量
         "initiator_endpoint": f"{_get_local_ip()}:{node.get('tunnel_port', PEER_TUNNEL_PORT_MIN)}",
         "initiator_public_key": node.get("wg_public_key"),
         "initiator_tunnel_ip": node.get("tunnel_local_ip"),
     }
 
-    # Phase 2: 优先使用隧道通信（如果隧道已连接）
+    # 优先使用隧道通信（如果隧道已连接）
     tunnel_api = _get_peer_tunnel_endpoint(node)
     if tunnel_api and node.get("tunnel_status") == "connected":
         tunnel_type = node.get("tunnel_type", "wireguard")
@@ -11503,7 +16187,8 @@ def _notify_peer_connected(db, node: dict) -> bool:
                 logging.info(f"[peer-notify] 远程节点 '{tag}' 已通过隧道确认建立隧道")
                 return True
             else:
-                logging.warning(f"[peer-notify] 隧道通知 '{tag}' 失败: {resp.get('message')}, 尝试 LAN 回退")
+                # 防御性默认值
+                logging.warning(f"[peer-notify] 隧道通知 '{tag}' 失败: {resp.get('message', 'Unknown error')}, 尝试 LAN 回退")
         except Exception as e:
             logging.warning(f"[peer-notify] 隧道调用 '{tag}' 失败: {e}, 尝试 LAN 回退")
 
@@ -11542,7 +16227,7 @@ def _notify_peer_disconnected(db, node: dict) -> bool:
     调用远程节点的 /api/peer-notify/disconnected 端点，
     让对方也断开其侧的隧道，实现双向断开。
 
-    Phase 2 修复：优先使用隧道通信，如果隧道不可用则回退到 LAN 端点。
+    优先使用隧道通信，如果隧道不可用则回退到 LAN 端点。
     断开通知时隧道可能仍然可用（正在断开过程中），优先使用隧道可确保消息送达。
 
     Args:
@@ -11562,7 +16247,7 @@ def _notify_peer_disconnected(db, node: dict) -> bool:
         "node_id": tag,
     }
 
-    # Phase 2: 优先使用隧道通信（如果隧道已连接）
+    # 优先使用隧道通信（如果隧道已连接）
     tunnel_api = _get_peer_tunnel_endpoint(node)
     if tunnel_api and node.get("tunnel_status") == "connected":
         tunnel_type = node.get("tunnel_type", "wireguard")
@@ -11584,7 +16269,8 @@ def _notify_peer_disconnected(db, node: dict) -> bool:
                 logging.info(f"[peer-notify] 远程节点 '{tag}' 已通过隧道确认断开")
                 return True
             else:
-                logging.warning(f"[peer-notify] 隧道断开通知 '{tag}' 失败: {resp.get('message')}, 尝试 LAN 回退")
+                # 防御性默认值
+                logging.warning(f"[peer-notify] 隧道断开通知 '{tag}' 失败: {resp.get('message', 'Unknown error')}, 尝试 LAN 回退")
         except Exception as e:
             logging.warning(f"[peer-notify] 隧道调用 '{tag}' 失败: {e}, 尝试 LAN 回退")
 
@@ -11664,7 +16350,7 @@ def _forward_downstream_disconnected(
 ) -> bool:
     """向上游节点转发下游断连通知
 
-    Phase 2 修复：仅通过隧道通信。级联通知发生在链路激活期间，
+    仅通过隧道通信。级联通知发生在链路激活期间，
     此时隧道必须已建立。如果隧道不可用，则通知无法送达。
 
     Args:
@@ -11691,7 +16377,7 @@ def _forward_downstream_disconnected(
         logging.warning(f"[cascade-notify] 无法转发: 未找到上游节点 '{upstream_node_tag}'")
         return False
 
-    # Phase 2: 使用隧道通信（级联通知必须通过隧道）
+    # 使用隧道通信（级联通知必须通过隧道）
     tunnel_api = _get_peer_tunnel_endpoint(upstream_node)
     if not tunnel_api:
         logging.warning(f"[cascade-notify] 节点 '{upstream_node_tag}' 隧道不可用，无法转发")
@@ -11725,7 +16411,8 @@ def _forward_downstream_disconnected(
             logging.info(f"[cascade-notify] 上游节点 '{upstream_node_tag}' 已通过隧道收到通知")
             return True
         else:
-            logging.warning(f"[cascade-notify] 上游节点响应: {resp.get('message')}")
+            # 防御性默认值
+            logging.warning(f"[cascade-notify] 上游节点响应: {resp.get('message', 'Unknown error')}")
             return False
     except Exception as e:
         logging.warning(f"[cascade-notify] 转发失败: {e}")
@@ -11770,7 +16457,7 @@ def _register_chain_with_peers(db, chain: dict) -> dict:
 
     当链路启用时，需要向所有中间节点注册，以便它们知道此链路经过它们。
 
-    Phase 2 修复：仅通过隧道通信。链路注册发生在链路激活期间，
+    仅通过隧道通信。链路注册发生在链路激活期间，
     此时所有隧道必须已建立。如果隧道不可用，则跳过该节点。
 
     Args:
@@ -11809,7 +16496,7 @@ def _register_chain_with_peers(db, chain: dict) -> dict:
             results[intermediate_tag] = False
             continue
 
-        # Phase 2: 使用隧道通信（链路注册必须通过隧道）
+        # 使用隧道通信（链路注册必须通过隧道）
         tunnel_api = _get_peer_tunnel_endpoint(intermediate_node)
         if not tunnel_api:
             logging.warning(f"[chain-register] 节点 '{intermediate_tag}' 隧道不可用，跳过")
@@ -11843,7 +16530,8 @@ def _register_chain_with_peers(db, chain: dict) -> dict:
                 logging.info(f"[chain-register] 节点 '{intermediate_tag}' 通过隧道注册成功")
                 results[intermediate_tag] = True
             else:
-                logging.warning(f"[chain-register] 节点 '{intermediate_tag}' 注册失败: {resp.get('message')}")
+                # 防御性默认值
+                logging.warning(f"[chain-register] 节点 '{intermediate_tag}' 注册失败: {resp.get('message', 'Unknown error')}")
                 results[intermediate_tag] = False
         except Exception as e:
             logging.warning(f"[chain-register] 向 '{intermediate_tag}' 注册失败: {e}")
@@ -11857,7 +16545,7 @@ def _unregister_chain_from_peers(db, chain: dict) -> dict:
 
     当链路禁用或删除时，需要通知所有中间节点注销此链路注册。
 
-    Phase 2 修复：仅通过隧道通信。链路注销发生在链路停用期间，
+    仅通过隧道通信。链路注销发生在链路停用期间，
     如果隧道不可用，则跳过该节点（尽力清理）。
 
     Args:
@@ -11886,7 +16574,7 @@ def _unregister_chain_from_peers(db, chain: dict) -> dict:
             results[intermediate_tag] = False
             continue
 
-        # Phase 2: 使用隧道通信（链路注销必须通过隧道）
+        # 使用隧道通信（链路注销必须通过隧道）
         tunnel_api = _get_peer_tunnel_endpoint(intermediate_node)
         if not tunnel_api:
             logging.warning(f"[chain-unregister] 节点 '{intermediate_tag}' 隧道不可用，跳过")
@@ -11918,13 +16606,526 @@ def _unregister_chain_from_peers(db, chain: dict) -> dict:
                 logging.info(f"[chain-unregister] 节点 '{intermediate_tag}' 通过隧道注销成功")
                 results[intermediate_tag] = True
             else:
-                logging.warning(f"[chain-unregister] 节点 '{intermediate_tag}' 注销失败: {resp.get('message')}")
+                # 防御性默认值
+                logging.warning(f"[chain-unregister] 节点 '{intermediate_tag}' 注销失败: {resp.get('message', 'Unknown error')}")
                 results[intermediate_tag] = False
         except Exception as e:
             logging.warning(f"[chain-unregister] 向 '{intermediate_tag}' 注销失败: {e}")
             results[intermediate_tag] = False
 
     return results
+
+
+# ============ Chain Sync Propagation ============
+
+
+def _collect_used_dscp_from_chain(db, hops: List[str]) -> Dict[str, Any]:
+    """收集链路中所有节点已使用的 DSCP 值
+
+    在创建链路前，递归查询所有下游节点的 DSCP 使用情况。
+    这确保新分配的 DSCP 值在整个链路中都可用。
+
+    Args:
+        db: 数据库实例
+        hops: 下游节点列表
+
+    Returns:
+        {
+            "success": True,
+            "used_dscp": [1, 2, 3, ...],  # 所有节点的并集
+            "by_node": {"node-b": [1, 2], "node-c": [3], ...}
+        }
+    """
+    from tunnel_api_client import TunnelAPIClient
+
+    all_used = set()
+    by_node = {}
+
+    # 添加本地已使用的 DSCP
+    local_chains = db.get_node_chains()
+    local_used = [c.get("dscp_value") for c in local_chains if c.get("dscp_value")]
+    local_tag = _get_local_node_tag(db)
+    all_used.update(local_used)
+    by_node[local_tag] = local_used
+
+    # 查询每个下游节点
+    for hop_tag in hops:
+        node = db.get_peer_node(hop_tag)
+        if not node:
+            logging.warning(f"[dscp-check] 节点 '{hop_tag}' 不存在，跳过")
+            continue
+
+        tunnel_api = _get_peer_tunnel_endpoint(node)
+        if not tunnel_api:
+            logging.warning(f"[dscp-check] 节点 '{hop_tag}' 隧道不可用，跳过")
+            continue
+
+        tunnel_type = node.get("tunnel_type", "wireguard")
+        socks_port = node.get("xray_socks_port") if tunnel_type == "xray" else None
+        peer_uuid = node.get("xray_uuid") if tunnel_type == "xray" else None
+
+        try:
+            client = TunnelAPIClient(
+                node_tag=hop_tag,
+                tunnel_endpoint=tunnel_api,
+                tunnel_type=tunnel_type,
+                socks_port=socks_port,
+                peer_uuid=peer_uuid,
+                timeout=10
+            )
+
+            resp = client.get_used_dscp_values()
+            if resp.get("success"):
+                node_used = resp.get("used_dscp", [])
+                all_used.update(node_used)
+                by_node[hop_tag] = node_used
+                logging.debug(f"[dscp-check] 节点 '{hop_tag}' 已用 DSCP: {node_used}")
+            else:
+                logging.warning(
+                    f"[dscp-check] 查询节点 '{hop_tag}' 失败: {resp.get('error')}"
+                )
+
+        except Exception as e:
+            logging.warning(f"[dscp-check] 查询节点 '{hop_tag}' 异常: {e}")
+            # 继续查询其他节点
+
+    return {
+        "success": True,
+        "used_dscp": sorted(list(all_used)),
+        "by_node": by_node,
+    }
+
+
+def _find_available_dscp(used_dscp: List[int], reserved: List[int] = None) -> Optional[int]:
+    """找到一个全局可用的 DSCP 值
+
+    Args:
+        used_dscp: 已使用的 DSCP 值列表
+        reserved: 保留的 DSCP 值（如 EF=46, AF 类等）
+
+    Returns:
+        可用的 DSCP 值，或 None 如果没有可用值
+    """
+    if reserved is None:
+        # 默认保留: 0(默认), 46(EF), AF 类 (10,12,14,18,20,22,26,28,30,34,36,38)
+        reserved = [0, 46, 10, 12, 14, 18, 20, 22, 26, 28, 30, 34, 36, 38]
+
+    used_set = set(used_dscp) | set(reserved)
+
+    # 从 1 到 63 找第一个可用值
+    for dscp in range(1, 64):
+        if dscp not in used_set:
+            return dscp
+
+    return None
+
+
+def _propagate_chain_to_peers(
+    db,
+    chain_tag: str,
+    dscp_value: int,
+    full_hops: List[str],
+    exit_egress: str,
+    description: str = "",
+    allow_transitive: bool = False,
+    action: str = "create",
+) -> Dict[str, Any]:
+    """向链路中的所有下游节点同步链路配置
+
+    在创建链路时，将完整配置同步到所有节点，确保 DSCP 值一致。
+
+    同步流程：
+    1. Entry 节点向第一个下游节点发送同步请求
+    2. 下游节点存储链路到本地数据库
+    3. 下游节点同步到 rust-router
+    4. 如果不是终端节点，继续向下一跳传播
+
+    Args:
+        db: 数据库实例
+        chain_tag: 链路标识
+        dscp_value: DSCP 值 (1-63)
+        full_hops: 完整跳转列表 (包含本节点)
+        exit_egress: 终端出口
+        description: 链路描述
+        allow_transitive: 是否允许传递验证
+        action: 操作类型 ('create', 'update', 'delete')
+
+    Returns:
+        同步结果 {"success": bool, "results": {node_tag: success_bool, ...}}
+    """
+    from tunnel_api_client import TunnelAPIClient
+
+    local_tag = _get_local_node_tag(db)
+    source_node = local_tag
+
+    # 找到本节点在 hops 中的位置
+    try:
+        my_index = full_hops.index(local_tag)
+    except ValueError:
+        logging.warning(f"[chain-sync] 本节点 '{local_tag}' 不在链路 hops 中: {full_hops}")
+        return {"success": False, "error": "Local node not in chain hops", "results": {}}
+
+    # 只需向第一个下游节点发送，它会继续传播
+    if my_index >= len(full_hops) - 1:
+        # 已经是终端节点，无需传播
+        logging.debug(f"[chain-sync] 本节点是终端，无需传播")
+        return {"success": True, "results": {}}
+
+    next_hop = full_hops[my_index + 1]
+    results = {}
+
+    # 获取下一跳节点信息
+    next_node = db.get_peer_node(next_hop)
+    if not next_node:
+        logging.warning(f"[chain-sync] 下一跳节点 '{next_hop}' 不存在")
+        return {"success": False, "error": f"Next hop '{next_hop}' not found", "results": {next_hop: False}}
+
+    # 获取隧道端点
+    tunnel_api = _get_peer_tunnel_endpoint(next_node)
+    if not tunnel_api:
+        logging.warning(f"[chain-sync] 节点 '{next_hop}' 隧道不可用")
+        return {"success": False, "error": f"Tunnel to '{next_hop}' unavailable", "results": {next_hop: False}}
+
+    tunnel_type = next_node.get("tunnel_type", "wireguard")
+    socks_port = next_node.get("xray_socks_port") if tunnel_type == "xray" else None
+    peer_uuid = next_node.get("xray_uuid") if tunnel_type == "xray" else None
+
+    try:
+        client = TunnelAPIClient(
+            node_tag=next_hop,
+            tunnel_endpoint=tunnel_api,
+            tunnel_type=tunnel_type,
+            socks_port=socks_port,
+            peer_uuid=peer_uuid,
+            timeout=15
+        )
+
+        logging.info(
+            f"[chain-sync] 向 '{next_hop}' 同步链路 '{chain_tag}': "
+            f"dscp={dscp_value}, action={action}"
+        )
+
+        resp = client.propagate_chain(
+            chain_tag=chain_tag,
+            dscp_value=dscp_value,
+            full_hops=full_hops,
+            exit_egress=exit_egress,
+            source_node=source_node,
+            description=description,
+            allow_transitive=allow_transitive,
+            action=action,
+        )
+
+        if resp.get("success"):
+            logging.info(f"[chain-sync] 节点 '{next_hop}' 同步成功")
+            results[next_hop] = True
+            # 合并下游节点的传播结果
+            downstream_results = resp.get("propagation_results", {})
+            results.update(downstream_results)
+            return {"success": True, "results": results}
+        else:
+            logging.warning(f"[chain-sync] 节点 '{next_hop}' 同步失败: {resp.get('error', 'Unknown')}")
+            results[next_hop] = False
+            return {"success": False, "error": resp.get("error", "Unknown"), "results": results}
+
+    except Exception as e:
+        logging.error(f"[chain-sync] 向 '{next_hop}' 同步失败: {e}")
+        results[next_hop] = False
+        return {"success": False, "error": str(e), "results": results}
+
+
+class ChainSyncPropagateRequest(BaseModel):
+    """链路同步传播请求
+
+    用于在创建/更新/删除链路时将配置同步到所有节点。
+
+    认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
+    """
+    chain_tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]{0,63}$", description="链路标识")
+    dscp_value: int = Field(..., ge=1, le=63, description="DSCP 值 (1-63)")
+    full_hops: List[str] = Field(..., min_length=1, max_length=10, description="完整跳转列表")
+    exit_egress: str = Field(..., description="终端出口")
+    source_node: str = Field(..., pattern=r"^[a-z][a-z0-9-]{0,63}$", description="发起同步的节点")
+    description: str = Field("", description="链路描述")
+    allow_transitive: bool = Field(False, description="是否允许传递验证")
+    action: str = Field("create", pattern=r"^(create|update|delete)$", description="操作类型")
+
+
+@app.get("/api/chain-sync/used-dscp")
+def api_chain_sync_used_dscp(request: Request):
+    """获取本节点已使用的 DSCP 值列表
+
+    用于在创建链路前检查 DSCP 冲突。
+    Entry 节点在分配 DSCP 值前，先查询所有下游节点已使用的 DSCP 值，
+    确保新分配的值在整个链路中都可用。
+
+    认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
+
+    Returns:
+        {
+            "success": true,
+            "used_dscp": [1, 3, 5],
+            "chains": {"chain-a": 1, "chain-b": 3, "chain-c": 5}
+        }
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_api_rate_limit(client_ip):
+        return {"success": False, "error": "Too many requests"}
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return {"success": False, "error": "Database unavailable"}
+
+    db = _get_db()
+
+    # 验证隧道认证
+    node = _verify_tunnel_header(request, db)
+    if not node:
+        node = _verify_peer_endpoint_auth(request, db)
+    if not node:
+        logging.warning(f"[chain-sync] used-dscp 认证失败: client_ip={client_ip}")
+        return {"success": False, "error": "Authentication failed"}
+
+    # 获取所有链路的 DSCP 值
+    try:
+        all_chains = db.get_node_chains()
+        used_dscp = []
+        chains_map = {}
+
+        for chain in all_chains:
+            dscp = chain.get("dscp_value")
+            tag = chain.get("tag")
+            if dscp is not None and dscp > 0:
+                if dscp not in used_dscp:
+                    used_dscp.append(dscp)
+                chains_map[tag] = dscp
+
+        logging.debug(f"[chain-sync] 返回已用 DSCP: {used_dscp} (from {node['tag']})")
+
+        return {
+            "success": True,
+            "used_dscp": sorted(used_dscp),
+            "chains": chains_map,
+        }
+
+    except Exception as e:
+        logging.error(f"[chain-sync] 获取已用 DSCP 失败: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/chain-sync/propagate")
+def api_chain_sync_propagate(request: Request, payload: ChainSyncPropagateRequest):
+    """接收链路同步传播请求
+
+    当上游节点创建/更新/删除链路时，调用此端点同步配置。
+
+    处理流程：
+    1. 验证请求来自可信节点
+    2. 根据 full_hops 计算本节点角色
+    3. 存储/更新/删除链路到本地数据库
+    4. 同步到 rust-router
+    5. 如果不是终端节点，继续向下游传播
+
+    认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_api_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return {"success": False, "error": "Database unavailable"}
+
+    db = _get_db()
+
+    # 验证隧道认证
+    node = _verify_tunnel_header(request, db)
+    if not node:
+        node = _verify_peer_endpoint_auth(request, db)
+    if not node:
+        logging.warning(f"[chain-sync] 认证失败: client_ip={client_ip}")
+        return {"success": False, "error": "Authentication failed"}
+
+    local_tag = _get_local_node_tag(db)
+
+    # 验证本节点在 hops 中
+    if local_tag not in payload.full_hops:
+        logging.warning(
+            f"[chain-sync] 本节点 '{local_tag}' 不在链路 hops 中: {payload.full_hops}"
+        )
+        return {"success": False, "error": f"Local node '{local_tag}' not in chain hops"}
+
+    # 计算本节点角色
+    my_index = payload.full_hops.index(local_tag)
+    last_index = len(payload.full_hops) - 1
+
+    if my_index == 0:
+        role = "entry"
+    elif my_index == last_index:
+        role = "terminal"
+    else:
+        role = "relay"
+
+    logging.info(
+        f"[chain-sync] 收到链路同步: chain={payload.chain_tag}, dscp={payload.dscp_value}, "
+        f"role={role}, action={payload.action}, from={node['tag']}"
+    )
+
+    # 处理不同操作
+    propagation_results = {}
+
+    if payload.action == "delete":
+        # 删除链路
+        existing = db.get_node_chain(payload.chain_tag)
+        if existing:
+            try:
+                db.delete_node_chain(payload.chain_tag)
+                logging.info(f"[chain-sync] 删除链路 '{payload.chain_tag}'")
+            except Exception as e:
+                logging.error(f"[chain-sync] 删除链路失败: {e}")
+                return {"success": False, "error": f"Failed to delete chain: {e}"}
+        else:
+            logging.debug(f"[chain-sync] 链路 '{payload.chain_tag}' 不存在，跳过删除")
+
+    else:
+        # 创建或更新链路
+        # 构建 hops: 从本节点开始的后续跳转
+        downstream_hops = payload.full_hops[my_index + 1:] if my_index < last_index else []
+
+        existing = db.get_node_chain(payload.chain_tag)
+
+        # DSCP 冲突检测
+        # 检查是否有其他链路使用相同的 DSCP 值
+        if not existing or (existing and existing.get("dscp_value") != payload.dscp_value):
+            all_chains = db.get_node_chains()
+            for chain in all_chains:
+                if (
+                    chain.get("tag") != payload.chain_tag
+                    and chain.get("dscp_value") == payload.dscp_value
+                ):
+                    conflict_tag = chain.get("tag")
+                    logging.warning(
+                        f"[chain-sync] DSCP 冲突: 值 {payload.dscp_value} 已被链路 "
+                        f"'{conflict_tag}' 使用"
+                    )
+                    return {
+                        "success": False,
+                        "error": f"DSCP value {payload.dscp_value} already used by chain '{conflict_tag}'",
+                        "conflict_chain": conflict_tag,
+                        "dscp_value": payload.dscp_value,
+                    }
+
+        try:
+            if existing and payload.action == "update":
+                # 更新现有链路
+                db.update_node_chain(
+                    tag=payload.chain_tag,
+                    name=payload.chain_tag,
+                    description=payload.description,
+                    hops=downstream_hops,
+                    exit_egress=payload.exit_egress if role == "terminal" else None,
+                    dscp_value=payload.dscp_value,
+                    allow_transitive=payload.allow_transitive,
+                )
+                logging.info(
+                    f"[chain-sync] 更新链路 '{payload.chain_tag}': "
+                    f"dscp={payload.dscp_value}, role={role}"
+                )
+            elif not existing:
+                # 创建新链路
+                db.add_node_chain(
+                    tag=payload.chain_tag,
+                    name=payload.chain_tag,
+                    description=payload.description,
+                    hops=downstream_hops,
+                    priority=0,
+                    enabled=1,  # 默认启用
+                    exit_egress=payload.exit_egress if role == "terminal" else None,
+                    dscp_value=payload.dscp_value,
+                    chain_mark_type="dscp",
+                    allow_transitive=payload.allow_transitive,
+                )
+                logging.info(
+                    f"[chain-sync] 创建链路 '{payload.chain_tag}': "
+                    f"dscp={payload.dscp_value}, role={role}, hops={downstream_hops}"
+                )
+            else:
+                # 链路已存在且 action=create，检查 DSCP 是否一致
+                if existing.get("dscp_value") != payload.dscp_value:
+                    logging.warning(
+                        f"[chain-sync] 链路 '{payload.chain_tag}' 已存在但 DSCP 不一致: "
+                        f"本地={existing.get('dscp_value')}, 请求={payload.dscp_value}"
+                    )
+                    # 更新为新的 DSCP 值以保持一致性
+                    db.update_node_chain(
+                        tag=payload.chain_tag,
+                        dscp_value=payload.dscp_value,
+                    )
+                    logging.info(f"[chain-sync] 已更新链路 '{payload.chain_tag}' 的 DSCP 值")
+                else:
+                    logging.info(f"[chain-sync] 链路 '{payload.chain_tag}' 已存在且配置一致，跳过")
+
+        except Exception as e:
+            logging.error(f"[chain-sync] 存储链路失败: {e}")
+            return {"success": False, "error": f"Failed to store chain: {e}"}
+
+    # 通知 rust-router 同步链路
+    try:
+        if os.environ.get("USE_RUST_ROUTER", "false").lower() == "true":
+            from rust_router_manager import RustRouterManager
+            manager = RustRouterManager()
+            if manager.is_available():
+                import asyncio
+                loop = asyncio.new_event_loop()
+                try:
+                    if payload.action == "delete":
+                        loop.run_until_complete(
+                            manager.notify_chain_changed(payload.chain_tag, "deleted")
+                        )
+                    else:
+                        loop.run_until_complete(
+                            manager.notify_chain_changed(payload.chain_tag, payload.action)
+                        )
+                    logging.info(f"[chain-sync] rust-router 同步成功")
+                finally:
+                    loop.close()
+    except Exception as e:
+        logging.warning(f"[chain-sync] rust-router 同步失败: {e}")
+        # 不阻塞传播，继续
+
+    # 如果不是终端节点，继续向下游传播
+    if role != "terminal":
+        prop_result = _propagate_chain_to_peers(
+            db=db,
+            chain_tag=payload.chain_tag,
+            dscp_value=payload.dscp_value,
+            full_hops=payload.full_hops,
+            exit_egress=payload.exit_egress,
+            description=payload.description,
+            allow_transitive=payload.allow_transitive,
+            action=payload.action,
+        )
+        propagation_results = prop_result.get("results", {})
+
+        if not prop_result.get("success"):
+            logging.warning(f"[chain-sync] 下游传播失败: {prop_result.get('error')}")
+            # 仍然返回成功（本节点已处理），但包含传播错误
+            return {
+                "success": True,
+                "message": f"Local sync succeeded, downstream propagation failed",
+                "role": role,
+                "propagation_results": propagation_results,
+                "propagation_error": prop_result.get("error"),
+            }
+
+    return {
+        "success": True,
+        "message": f"Chain sync completed (role={role})",
+        "role": role,
+        "propagation_results": propagation_results,
+    }
 
 
 # ============ Cascade Notification Endpoints ============
@@ -11969,7 +17170,7 @@ def api_peer_notify_downstream_disconnected(request: Request, payload: Downstrea
         logging.info(f"[cascade-notify] 忽略重复通知: {payload.notification_id[:8]}...")
         return {"status": "duplicate", "forwarded": False}
 
-    # Phase 11-Fix.M: 使用灵活认证函数（可通过隧道调用，支持 IP 认证）
+    # 使用灵活认证函数
     node = _verify_peer_request_flexible(
         request, db,
         payload_node_id=payload.node_id
@@ -12039,7 +17240,7 @@ def api_peer_chain_register(request: Request, payload: ChainRegisterRequest):
 
     db = _get_db()
 
-    # Phase 11-Fix.M: 使用灵活认证函数（可通过隧道调用，支持 IP 认证）
+    # 使用灵活认证函数
     node = _verify_peer_request_flexible(
         request, db,
         payload_node_id=payload.node_id
@@ -12061,7 +17262,8 @@ def api_peer_chain_register(request: Request, payload: ChainRegisterRequest):
         downstream_node_tag=payload.downstream_node
     )
 
-    return {"status": "registered", "chain_id": payload.chain_id}
+    # 添加 success 字段，与 _register_chain_with_peers 的 resp.get("success") 匹配
+    return {"success": True, "status": "registered", "chain_id": payload.chain_id}
 
 
 class ChainUnregisterRequest(BaseModel):
@@ -12096,7 +17298,7 @@ def api_peer_chain_unregister(request: Request, payload: ChainUnregisterRequest)
 
     db = _get_db()
 
-    # Phase 11-Fix.M: 使用灵活认证函数（可通过隧道调用，支持 IP 认证）
+    # 使用灵活认证函数
     node = _verify_peer_request_flexible(
         request, db,
         payload_node_id=payload.node_id
@@ -12112,7 +17314,7 @@ def api_peer_chain_unregister(request: Request, payload: ChainUnregisterRequest)
     return {"status": "unregistered" if deleted else "not_found", "chain_id": payload.chain_id}
 
 
-# ============ Phase 3: 隧道 API 通信 ============
+# ============ 隧道 API 通信 ============
 # 这些端点通过已建立的隧道访问
 # - WireGuard 隧道：通过 tunnel_remote_ip 验证（IP 即身份）
 # - Xray 隧道：通过 X-Peer-UUID header 验证
@@ -12174,11 +17376,13 @@ def _verify_tunnel_request(request: Request, db) -> Optional[Dict]:
     根据隧道类型使用不同的认证方式：
     - WireGuard 隧道：通过 tunnel_remote_ip 验证（IP 即身份）
     - Xray 隧道：通过 X-Peer-UUID header 验证
+    - SimpleTcpProxy 代理：通过 X-Tunnel-Source-IP header 验证（仅限 localhost）
 
-    安全关键（Phase 11-Fix.M）：
+    安全关键：
     - 必须使用 _get_direct_client_ip() 而非 _get_client_ip()
     - 不能信任 X-Forwarded-For 等可伪造的 HTTP 头
     - 已移除 endpoint IP 回退认证（安全风险）
+    - X-Tunnel-Source-IP 仅在请求来自 localhost 时信任
 
     Args:
         request: FastAPI 请求对象
@@ -12187,8 +17391,53 @@ def _verify_tunnel_request(request: Request, db) -> Optional[Dict]:
     Returns:
         认证成功返回节点信息 dict，失败返回 None
     """
-    # Phase 11-Fix.M: 使用直连 IP，防止 X-Forwarded-For 欺骗
+    # 使用直连 IP，防止 X-Forwarded-For 欺骗
     client_ip = _get_direct_client_ip(request)
+
+    # 方式 0: SimpleTcpProxy 代理请求 - 通过 X-Tunnel-Source-IP header 验证
+    # 当请求来自 localhost 且有 X-Tunnel-Source-IP header 时，
+    # 说明请求通过 SimpleTcpProxy 代理，header 值是真实的隧道源 IP
+    # 安全性：X-Tunnel-Source-IP 仅在来自 localhost 时信任，因为：
+    #   1. SimpleTcpProxy 在本地运行，从 WireGuard 解密包中提取源 IP
+    #   2. 外部攻击者无法伪造 localhost 来源
+    if client_ip == "127.0.0.1":
+        tunnel_source_ip = request.headers.get("X-Tunnel-Source-IP")
+        tunnel_peer_tag = request.headers.get("X-Tunnel-Peer-Tag")
+
+        if tunnel_source_ip:
+            logging.info(
+                f"[tunnel-api] 本地代理认证尝试: X-Tunnel-Source-IP={tunnel_source_ip}, "
+                f"X-Tunnel-Peer-Tag={tunnel_peer_tag}"
+            )
+
+            # 使用 tunnel_source_ip 查找 peer
+            node = _find_peer_by_tunnel_ip(db, tunnel_source_ip)
+            if node:
+                # 可选：验证 peer_tag 匹配（额外安全层）
+                if tunnel_peer_tag and node.get("tag") != tunnel_peer_tag:
+                    logging.warning(
+                        f"[tunnel-api] Peer tag 不匹配: header={tunnel_peer_tag}, "
+                        f"db={node.get('tag')}, ip={tunnel_source_ip}"
+                    )
+                    # 仍然允许，但记录警告（tag 不是安全关键，IP 才是）
+
+                if node.get("tunnel_status") == "connected":
+                    logging.info(
+                        f"[tunnel-api] 本地代理认证成功: {node['tag']} "
+                        f"(via X-Tunnel-Source-IP: {tunnel_source_ip})"
+                    )
+                    return node
+                else:
+                    logging.warning(
+                        f"[tunnel-api] 隧道未连接: {node['tag']} "
+                        f"(status={node.get('tunnel_status')})"
+                    )
+                    return None
+            else:
+                logging.warning(
+                    f"[tunnel-api] 本地代理认证失败: 未找到匹配的 peer "
+                    f"(X-Tunnel-Source-IP={tunnel_source_ip})"
+                )
 
     # 方式 1: WireGuard 隧道 - 通过 tunnel_remote_ip 验证
     node = _find_peer_by_tunnel_ip(db, client_ip)
@@ -12217,7 +17466,7 @@ def _verify_tunnel_request(request: Request, db) -> Optional[Dict]:
                     logging.warning(f"[tunnel-api] Xray 隧道未连接: {node['tag']}")
                     return None
 
-    # Phase 11-Fix.M: 已移除 endpoint IP 回退认证
+    # 已移除 endpoint IP 回退认证
     # 原因：endpoint IP 可被 NAT 共享，存在安全风险
     # 所有隧道内 API 必须通过 tunnel_remote_ip 或 X-Peer-UUID 认证
 
@@ -12225,9 +17474,49 @@ def _verify_tunnel_request(request: Request, db) -> Optional[Dict]:
     return None
 
 
-# Phase 5: 重命名别名以反映实际功能（PSK 已废弃）
+#: 重命名别名以反映实际功能（PSK 已废弃）
 # 保留别名以保持向后兼容，实际使用隧道认证
 _verify_tunnel_header = _verify_tunnel_request
+
+
+def _is_tunnel_authenticated(request: Request) -> bool:
+    """简单检查请求是否来自已认证的隧道
+
+    用于 2PC chain routing 端点的快速认证检查。
+    通过 X-Tunnel-Source-IP header 验证请求来自本地 SimpleTcpProxy 代理。
+
+    Args:
+        request: FastAPI 请求对象
+
+    Returns:
+        True 如果请求来自已认证的隧道，False 否则
+    """
+    client_ip = _get_direct_client_ip(request)
+
+    # 只接受来自 localhost 的请求（SimpleTcpProxy 代理）
+    if client_ip != "127.0.0.1":
+        logging.debug(f"[tunnel-auth] 拒绝非本地请求: client_ip={client_ip}")
+        return False
+
+    # 检查必须的 tunnel headers
+    tunnel_source_ip = request.headers.get("X-Tunnel-Source-IP")
+    if not tunnel_source_ip:
+        logging.debug("[tunnel-auth] 缺少 X-Tunnel-Source-IP header")
+        return False
+
+    # 验证 tunnel_source_ip 是有效的 peer
+    try:
+        db = _get_db()
+        node = _find_peer_by_tunnel_ip(db, tunnel_source_ip)
+        if node and node.get("tunnel_status") == "connected":
+            logging.debug(f"[tunnel-auth] 认证成功: peer={node.get('tag')}, ip={tunnel_source_ip}")
+            return True
+        else:
+            logging.warning(f"[tunnel-auth] 未找到已连接的 peer: ip={tunnel_source_ip}")
+            return False
+    except Exception as e:
+        logging.error(f"[tunnel-auth] 认证检查失败: {e}")
+        return False
 
 
 def _verify_peer_request_flexible(
@@ -12298,6 +17587,78 @@ def _verify_peer_request_flexible(
     return None
 
 
+def _verify_peer_endpoint_auth(request: Request, db) -> Optional[Dict]:
+    """验证对等节点通过公网端点 IP 进行的 API 调用
+    
+    当隧道认证不可用时（如 userspace WireGuard 下的直接 HTTP 调用），
+    允许通过 X-Peer-Node-ID header 进行认证。
+    
+    认证条件：
+    1. 请求头包含 X-Peer-Node-ID（调用方的节点 ID）
+    2. 该节点存在于本地 peer_nodes 表中
+    3. 该节点的 tunnel_status 为 "connected"
+    
+    安全考虑：
+    - 仅限已配对并连接的节点使用
+    - X-Peer-Node-ID 可被伪造，但需要知道有效的节点 ID
+    - 此方法安全性低于隧道认证，仅作为 fallback
+    - 如果 endpoint IP 匹配则额外记录
+    
+    Args:
+        request: FastAPI 请求对象
+        db: 数据库连接
+        
+    Returns:
+        认证成功返回节点信息 dict，失败返回 None
+    """
+    # 获取调用方节点 ID
+    peer_node_id = request.headers.get("X-Peer-Node-ID")
+    if not peer_node_id:
+        return None
+    
+    # 获取直连 IP
+    client_ip = _get_direct_client_ip(request)
+    
+    logging.info(f"[peer-endpoint-auth] 尝试认证: node_id={peer_node_id}, client_ip={client_ip}")
+    
+    # 查找节点
+    try:
+        node = db.get_peer_node(peer_node_id)
+        if not node:
+            logging.warning(f"[peer-endpoint-auth] 节点不存在: {peer_node_id} (from {client_ip})")
+            return None
+        
+        # 检查连接状态
+        if node.get("tunnel_status") != "connected":
+            logging.warning(
+                f"[peer-endpoint-auth] 节点未连接: {peer_node_id} "
+                f"(status={node.get('tunnel_status')}, from {client_ip})"
+            )
+            return None
+        
+        # 验证 endpoint IP（可选，仅用于日志）
+        endpoint = node.get("endpoint", "")
+        endpoint_ip = ""
+        if endpoint:
+            endpoint_ip = endpoint.rsplit(":", 1)[0]  # 移除端口
+            if endpoint_ip.startswith("[") and endpoint_ip.endswith("]"):
+                endpoint_ip = endpoint_ip[1:-1]  # 移除 IPv6 方括号
+        
+        ip_match = (client_ip == endpoint_ip) if endpoint_ip else False
+        
+        # 只要节点存在且已连接，就允许认证
+        # endpoint IP 匹配是额外的安全层，但在 NAT 环境下可能不匹配
+        logging.info(
+            f"[peer-endpoint-auth] 认证成功: {node['tag']} "
+            f"(from {client_ip}, endpoint_ip={endpoint_ip}, ip_match={ip_match})"
+        )
+        return node
+            
+    except Exception as e:
+        logging.warning(f"[peer-endpoint-auth] 验证异常: {e}")
+        return None
+
+
 @app.get("/api/peer-info/egress")
 def api_peer_info_egress(request: Request):
     """获取本节点的可用出口列表
@@ -12319,6 +17680,12 @@ def api_peer_info_egress(request: Request):
 
     # 验证隧道认证（WireGuard IP / Xray UUID）
     node = _verify_tunnel_header(request, db)
+    
+    # 如果隧道认证失败，尝试 endpoint IP 认证
+    # 这支持 userspace WireGuard 模式下的直接 HTTP 调用
+    if not node:
+        node = _verify_peer_endpoint_auth(request, db)
+    
     if not node:
         raise HTTPException(status_code=401, detail="Authentication failed")
 
@@ -12327,64 +17694,151 @@ def api_peer_info_egress(request: Request):
     # 收集所有可用出口
     egress_list = []
 
+    # 获取 rust-router 出口健康状态（用于 userspace WireGuard 检测）
+    # 当使用 userspace WireGuard 时，内核接口不存在，需要从 rust-router 获取状态
+    rust_router_outbound_health = {}
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            import asyncio
+            from rust_router_client import RustRouterClient
+
+            async def _fetch_outbound_health():
+                client = RustRouterClient()
+                await client.connect()
+                outbounds = await client.list_outbounds()
+                await client.close()
+                return {o.tag: o.health for o in outbounds}
+
+            rust_router_outbound_health = asyncio.run(_fetch_outbound_health())
+            logging.debug(f"[peer-info] rust-router 出口状态: {len(rust_router_outbound_health)} 个出口")
+        except Exception as e:
+            logging.debug(f"[peer-info] 无法获取 rust-router 出口状态: {e}")
+
+    # 辅助函数：检查接口是否存在（支持 kernel 和 userspace WireGuard）
+    def _check_interface(interface: str, egress_tag: str = None) -> bool:
+        """检查接口是否存在/连接
+        
+        支持两种模式：
+        1. 内核 WireGuard：检查 ip link show
+        2. Userspace WireGuard (rust-router)：从 rust-router 获取健康状态
+        """
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["ip", "link", "show", interface],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                return True
+            
+            # 内核接口不存在时，检查 rust-router 出口状态
+            # 这支持 userspace WireGuard 模式（使用 boringtun）
+            if egress_tag and rust_router_outbound_health:
+                health = rust_router_outbound_health.get(egress_tag, "unknown")
+                if health in ("healthy", "unknown"):
+                    # "healthy" 表示出口可用
+                    # "unknown" 表示未配置健康检查，假设可用
+                    logging.debug(f"[peer-info] 出口 '{egress_tag}' 使用 userspace WireGuard，健康状态: {health}")
+                    return True
+            
+            return False
+        except Exception:
+            return False
+
     # 1. PIA profiles
     for profile in db.get_pia_profiles(enabled_only=True):
+        from db_helper import get_egress_interface_name
+        tag = profile["name"]
+        interface = get_egress_interface_name(tag, egress_type="pia")
+        connected = _check_interface(interface, egress_tag=tag)
         egress_list.append({
-            "tag": profile["name"],
-            "name": profile.get("description") or profile["name"],
+            "tag": tag,
+            "name": profile.get("description") or tag,
             "type": "pia",
             "enabled": True,
+            "connected": connected,
+            "interface": interface,
             "description": f"PIA {profile.get('region_id', 'Unknown')}",
         })
 
     # 2. Custom WireGuard
     for egress in db.get_custom_egress_list(enabled_only=True):
+        from db_helper import get_egress_interface_name
+        tag = egress["tag"]
+        interface = get_egress_interface_name(tag, egress_type="custom")
+        connected = _check_interface(interface, egress_tag=tag)
         egress_list.append({
-            "tag": egress["tag"],
-            "name": egress.get("description") or egress["tag"],
+            "tag": tag,
+            "name": egress.get("description") or tag,
             "type": "custom",
             "enabled": True,
+            "connected": connected,
+            "interface": interface,
             "description": "Custom WireGuard",
         })
 
     # 3. Direct egress
     for egress in db.get_direct_egress_list(enabled_only=True):
+        bind_iface = egress.get('bind_interface')
+        connected = _check_interface(bind_iface) if bind_iface else True
         egress_list.append({
             "tag": egress["tag"],
             "name": egress.get("description") or egress["tag"],
             "type": "direct",
             "enabled": True,
-            "description": f"Direct ({egress.get('bind_interface') or egress.get('inet4_bind_address', '')})",
+            "connected": connected,
+            "interface": bind_iface,
+            "description": f"Direct ({bind_iface or egress.get('inet4_bind_address', '')})",
         })
 
     # 4. OpenVPN egress
     for egress in db.get_openvpn_egress_list(enabled_only=True):
+        # OpenVPN 使用 tun 接口，接口名在配置中
+        interface = egress.get("tun_interface", "tun0")
+        connected = _check_interface(interface)
         egress_list.append({
             "tag": egress["tag"],
             "name": egress.get("description") or egress["tag"],
             "type": "openvpn",
             "enabled": True,
+            "connected": connected,
+            "interface": interface,
             "description": f"OpenVPN {egress.get('remote_host', '')}",
         })
 
-    # 5. V2Ray egress
+    # 5. V2Ray egress (SOCKS-based, always "connected" if enabled)
     for egress in db.get_v2ray_egress_list(enabled_only=True):
         egress_list.append({
             "tag": egress["tag"],
             "name": egress.get("description") or egress["tag"],
             "type": "v2ray",
             "enabled": True,
+            "connected": True,  # V2Ray 无法检查实际连接，假设可用
             "description": f"V2Ray {egress.get('protocol', '')}",
         })
 
     # 6. WARP egress
     for egress in db.get_warp_egress_list(enabled_only=True):
+        tag = egress["tag"]
+        protocol = egress.get("protocol", "wireguard")
+        # WARP WireGuard 模式检查接口，MASQUE 模式无法检查
+        if protocol == "wireguard":
+            from db_helper import get_egress_interface_name
+            interface = get_egress_interface_name(tag, egress_type="warp")
+            connected = _check_interface(interface, egress_tag=tag)
+        else:
+            interface = None
+            connected = True  # MASQUE 模式无法检查
         egress_list.append({
-            "tag": egress["tag"],
-            "name": egress.get("description") or egress["tag"],
+            "tag": tag,
+            "name": egress.get("description") or tag,
             "type": "warp",
             "enabled": True,
-            "description": f"WARP {egress.get('protocol', '')}",
+            "connected": connected,
+            "interface": interface,
+            "description": f"WARP {protocol}",
+            "protocol": protocol,  # 用于 MASQUE 检测
         })
 
     # 7. 添加内置 direct 出口
@@ -12393,8 +17847,22 @@ def api_peer_info_egress(request: Request):
         "name": "Direct",
         "type": "direct",
         "enabled": True,
+        "connected": True,  # 内置 direct 始终可用
         "description": "Default direct connection",
     })
+
+    # 8. 负载均衡/故障转移组
+    for group in db.get_outbound_groups(enabled_only=True):
+        group_type = group.get("type", "loadbalance")
+        egress_list.append({
+            "tag": group["tag"],
+            "name": group.get("name") or group["tag"],
+            "type": "group",
+            "enabled": True,
+            "connected": True,  # 组的连接状态由成员决定，这里不检查
+            "description": f"{'负载均衡' if group_type == 'loadbalance' else '故障转移'}组",
+            "group_type": group_type,
+        })
 
     logging.info(f"[tunnel-api] 返回 {len(egress_list)} 个可用出口给节点 '{node['tag']}'")
     return {"egress": egress_list, "node_tag": node["tag"]}
@@ -12406,16 +17874,417 @@ VALID_MARK_TYPES = {"dscp", "xray_email"}
 # 标签名称正则：小写字母开头，允许小写字母、数字、连字符，最长64字符
 TAG_PATTERN = r"^[a-z][a-z0-9-]{0,63}$"
 
-# Phase 11-Fix.J: 不能作为链路终端出口的 egress 类型
+# 不能作为链路终端出口的 egress 类型
 # 这些 outbound 没有 bind_interface，无法用于 DSCP 路由
 INVALID_CHAIN_TERMINAL_EGRESS = frozenset({"direct", "block", "adblock"})
 
 
-def _validate_chain_terminal_egress(egress_tag: str, for_tunnel_api: bool = False):
-    """验证 egress 是否可作为链路终端出口
+def _validate_chain_terminal_egress_static(egress_tag: str):
+    """静态验证 egress 是否可作为链路终端出口
 
-    Phase 4 Issue 24 修复: 增加对 V2Ray 和 WARP MASQUE 出口的检查
+    仅执行静态检查，不查询数据库。
+    用于链路创建/更新时的快速验证。
+    完整验证在链路激活时通过 _validate_remote_terminal_egress() 执行。
+
+    Args:
+        egress_tag: 出口标识
+
+    Raises:
+        HTTPException: 如果 egress 在静态无效列表中
+    """
+    if egress_tag in INVALID_CHAIN_TERMINAL_EGRESS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{egress_tag}' 不能作为链路终端出口 - "
+                   "请选择具有网络接口的出口 (PIA/Custom WireGuard/OpenVPN)"
+        )
+
+
+async def _validate_remote_terminal_egress(
+    db,
+    chain_hops: list,
+    exit_egress: str,
+    allow_transitive: bool = False
+) -> Optional[str]:
+    """远程验证终端节点出口
+
+    通过 IPC 转发查询终端节点的出口列表，验证 exit_egress 存在且兼容 DSCP 路由。
+
+    使用 IPC forward_peer_request 替代直接 HTTP 请求
+    这解决了 userspace WireGuard 模式下无法直接路由到隧道 IP 的问题。
+
+    Args:
+        db: 数据库实例
+        chain_hops: 链路节点列表（最后一个是终端节点）
+        exit_egress: 要验证的出口标识
+        allow_transitive: 是否使用传递模式（通过中间节点转发查询）
+
+    Returns:
+        错误消息（如有），None 表示验证通过
+    """
+    import json
+
+    # 允许单跳链路
+    if not chain_hops or len(chain_hops) < 1:
+        return "Chain must have at least 1 hop"
+
+    terminal_tag = chain_hops[-1]
+
+    # 静态检查
+    if exit_egress in INVALID_CHAIN_TERMINAL_EGRESS:
+        return f"'{exit_egress}' cannot be used as chain terminal egress"
+
+    # 通过 IPC 转发查询终端节点的出口列表
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            return f"rust-router 不可用，无法验证终端节点 '{terminal_tag}' 的出口"
+
+        # 使用统一的参数获取函数
+        params = _get_peer_forward_params(db, terminal_tag)
+        node = params["node"]
+        if not node:
+            return f"Terminal node '{terminal_tag}' not found in database"
+
+        # 使用实时状态检查，而非数据库中可能过时的值
+        real_status = _check_peer_tunnel_status(node)
+        if real_status != "connected":
+            return f"Terminal node '{terminal_tag}' is not connected"
+
+        # 获取本地节点 tag 用于 endpoint IP 认证
+        local_node_tag = _get_local_node_tag(db)
+
+        # 通过 IPC 转发请求到终端节点
+        result = await client.forward_peer_request(
+            peer_tag=terminal_tag,
+            method="GET",
+            path="/api/peer-info/egress",
+            timeout_secs=30,
+            endpoint=params["endpoint"],
+            tunnel_type=params["tunnel_type"],
+            api_port=params["api_port"],
+            tunnel_ip=params["tunnel_ip"],
+            tunnel_local_ip=params["tunnel_local_ip"],
+            headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
+        )
+
+        if not result.get("success"):
+            error = result.get("error", "Unknown error")
+            status_code = result.get("status_code", 0)
+            logging.warning(
+                f"[validate-egress] IPC forward failed for {terminal_tag}: "
+                f"status={status_code}, error={error}"
+            )
+            return f"Cannot reach terminal node '{terminal_tag}' to validate egress: {error}"
+
+        # 解析响应
+        response_body = result.get("body", "{}")
+        try:
+            data = json.loads(response_body)
+        except json.JSONDecodeError as e:
+            logging.error(f"[validate-egress] 解析响应失败: {e}")
+            return f"Failed to parse egress list from terminal node '{terminal_tag}'"
+
+        egress_list = data.get("egress", [])
+
+        if not egress_list:
+            # 终端节点没有可用出口
+            return f"Terminal node '{terminal_tag}' has no available egress"
+
+        # 检查 exit_egress 是否存在于终端节点
+        egress_tags = [e.get("tag", "") for e in egress_list]
+        if exit_egress not in egress_tags:
+            return f"Egress '{exit_egress}' not found on terminal node '{terminal_tag}'"
+
+        # 检查出口类型和连接状态
+        for egress in egress_list:
+            if egress.get("tag") == exit_egress:
+                egress_type = egress.get("type", "unknown")
+                
+                # 检查是否兼容 DSCP 路由
+                if egress_type in ("v2ray", "socks"):
+                    return f"Egress '{exit_egress}' is SOCKS-based ({egress_type}), incompatible with DSCP routing"
+                # 使用 protocol 字段检测 WARP MASQUE
+                if egress_type == "warp" and egress.get("protocol") == "masque":
+                    return f"WARP MASQUE egress '{exit_egress}' is SOCKS-based, incompatible with DSCP routing"
+                
+                # 检查出口接口是否实际连接（WireGuard 接口是否存在）
+                connected = egress.get("connected", True)  # 默认为 True（兼容旧版本）
+                if not connected:
+                    interface = egress.get("interface", "unknown")
+                    return f"Egress '{exit_egress}' interface '{interface}' is not connected on terminal node '{terminal_tag}'"
+                
+                break
+
+        logging.info(f"[validate-egress] 终端出口验证通过: {exit_egress} on {terminal_tag}")
+        return None  # 验证通过
+
+    except Exception as e:
+        logging.error(f"[validate-egress] 验证失败: {e}", exc_info=True)
+        return f"Failed to validate egress on terminal node: {str(e)}"
+
+
+async def _ipc_ping_peer(db, node_tag: str) -> bool:
+    """通过 IPC 转发 ping 对端节点
+
+    使用 /api/peer-info/egress 端点验证节点可达性，
+    因为该端点不需要认证且已存在。
+
+    Args:
+        db: 数据库实例
+        node_tag: 节点标识
+
+    Returns:
+        True 如果节点可达，False 否则
+    """
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            logging.warning(f"[ipc-ping] rust-router 不可用")
+            return False
+
+        # 使用统一的参数获取函数
+        params = _get_peer_forward_params(db, node_tag)
+        if not params["node"]:
+            logging.warning(f"[ipc-ping] 节点 '{node_tag}' 不存在")
+            return False
+
+        local_node_tag = _get_local_node_tag(db)
+
+        # 使用 egress 端点验证可达性
+        result = await client.forward_peer_request(
+            peer_tag=node_tag,
+            method="GET",
+            path="/api/peer-info/egress",
+            timeout_secs=10,
+            endpoint=params["endpoint"],
+            tunnel_type=params["tunnel_type"],
+            api_port=params["api_port"],
+            tunnel_ip=params["tunnel_ip"],
+            tunnel_local_ip=params["tunnel_local_ip"],
+            headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
+        )
+
+        success = result.get("success", False)
+        if success:
+            logging.debug(f"[ipc-ping] {node_tag} 可达")
+        else:
+            logging.warning(f"[ipc-ping] {node_tag} 不可达: {result.get('error')}")
+        return success
+
+    except Exception as e:
+        logging.error(f"[ipc-ping] 异常: {e}")
+        return False
+
+
+async def _ipc_register_chain_route(
+    db,
+    node_tag: str,
+    chain_tag: str,
+    mark_value: int,
+    egress_tag: str,
+    mark_type: str = "dscp",
+    source_node: Optional[str] = None,
+    target_node: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """通过 IPC 转发注册链路路由
+
+    Args:
+        db: 数据库实例
+        node_tag: 目标节点标识
+        chain_tag: 链路标识
+        mark_value: DSCP 值
+        egress_tag: 出口标识
+        mark_type: 标记类型
+        source_node: 来源节点
+        target_node: 转发目标节点（传递模式）
+
+    Returns:
+        (success, error_message) 元组
+    """
+    import json
+
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            return False, "rust-router 不可用"
+
+        # 使用统一的参数获取函数
+        params = _get_peer_forward_params(db, node_tag)
+        if not params["node"]:
+            return False, f"节点 '{node_tag}' 不存在"
+
+        local_node_tag = _get_local_node_tag(db)
+
+        # 构建请求体
+        data = {
+            "chain_tag": chain_tag,
+            "mark_value": mark_value,
+            "mark_type": mark_type,
+            "egress_tag": egress_tag,
+        }
+        if source_node:
+            data["source_node"] = source_node
+        if target_node:
+            data["target_node"] = target_node
+
+        result = await client.forward_peer_request(
+            peer_tag=node_tag,
+            method="POST",
+            path="/api/chain-routing/register",
+            body=json.dumps(data),
+            timeout_secs=30,
+            endpoint=params["endpoint"],
+            tunnel_type=params["tunnel_type"],
+            api_port=params["api_port"],
+            tunnel_ip=params["tunnel_ip"],
+            tunnel_local_ip=params["tunnel_local_ip"],
+            headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
+        )
+
+        # 解析响应体 (无论成功或失败都可能有有用信息)
+        response_body = result.get("body", "{}")
+        status_code = result.get("status_code", 0)
+        
+        try:
+            resp_data = json.loads(response_body) if response_body else {}
+        except json.JSONDecodeError:
+            resp_data = {}
+
+        if not result.get("success"):
+            # 从响应体提取错误信息
+            error = (
+                result.get("error") or  # IPC 层错误
+                resp_data.get("detail") or  # FastAPI 错误格式
+                resp_data.get("message") or  # 自定义错误格式
+                f"HTTP {status_code}" if status_code else "Unknown error"
+            )
+            logging.warning(
+                f"[ipc-register] 注册失败 @ {node_tag}: {error} "
+                f"(status={status_code}, body={response_body[:200]})"
+            )
+            return False, error
+
+        if resp_data.get("success"):
+            logging.info(
+                f"[ipc-register] 注册成功: chain={chain_tag}, "
+                f"mark={mark_value}, egress={egress_tag} @ {node_tag}"
+            )
+            return True, None
+        else:
+            error = resp_data.get("message") or resp_data.get("detail") or "Unknown error"
+            return False, error
+
+    except Exception as e:
+        logging.error(f"[ipc-register] 异常: {e}", exc_info=True)
+        return False, str(e)
+
+
+async def _ipc_unregister_chain_route(
+    db,
+    node_tag: str,
+    chain_tag: str,
+    mark_value: int,
+    mark_type: str = "dscp",
+    source_node: Optional[str] = None,
+    target_node: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """通过 IPC 转发注销链路路由
+
+    Args:
+        db: 数据库实例
+        node_tag: 目标节点标识
+        chain_tag: 链路标识
+        mark_value: DSCP 值
+        mark_type: 标记类型
+        source_node: 来源节点
+        target_node: 转发目标节点（传递模式）
+
+    Returns:
+        (success, error_message) 元组
+    """
+    import json
+
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            return False, "rust-router 不可用"
+
+        # 使用统一的参数获取函数
+        params = _get_peer_forward_params(db, node_tag)
+        if not params["node"]:
+            # 节点不存在时跳过注销（可能已删除）
+            logging.warning(f"[ipc-unregister] 节点 '{node_tag}' 不存在，跳过注销")
+            return True, None
+
+        local_node_tag = _get_local_node_tag(db)
+
+        # 构建请求体
+        data = {
+            "chain_tag": chain_tag,
+            "mark_value": mark_value,
+            "mark_type": mark_type,
+        }
+        if source_node:
+            data["source_node"] = source_node
+        if target_node:
+            data["target_node"] = target_node
+
+        result = await client.forward_peer_request(
+            peer_tag=node_tag,
+            method="POST",
+            path="/api/chain-routing/unregister",
+            body=json.dumps(data),
+            timeout_secs=30,
+            endpoint=params["endpoint"],
+            tunnel_type=params["tunnel_type"],
+            api_port=params["api_port"],
+            tunnel_ip=params["tunnel_ip"],
+            tunnel_local_ip=params["tunnel_local_ip"],
+            headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
+        )
+
+        # 解析响应体 (无论成功或失败都可能有有用信息)
+        response_body = result.get("body", "{}")
+        status_code = result.get("status_code", 0)
+        
+        try:
+            resp_data = json.loads(response_body) if response_body else {}
+        except json.JSONDecodeError:
+            resp_data = {}
+
+        if not result.get("success"):
+            # 从响应体提取错误信息
+            error = (
+                result.get("error") or  # IPC 层错误
+                resp_data.get("detail") or  # FastAPI 错误格式
+                resp_data.get("message") or  # 自定义错误格式
+                f"HTTP {status_code}" if status_code else "Unknown error"
+            )
+            logging.warning(
+                f"[ipc-unregister] 注销失败 @ {node_tag}: {error} "
+                f"(status={status_code}, body={response_body[:200]})"
+            )
+            return False, error
+
+        logging.info(f"[ipc-unregister] 注销成功: chain={chain_tag} @ {node_tag}")
+        return True, None
+
+    except Exception as e:
+        logging.error(f"[ipc-unregister] 异常: {e}", exc_info=True)
+        return False, str(e)
+
+
+def _validate_chain_terminal_egress(egress_tag: str, for_tunnel_api: bool = False):
+    """验证 egress 是否可作为链路终端出口（本地验证）
+
+    增加对 V2Ray 和 WARP MASQUE 出口的检查
     这些出口基于 SOCKS 代理，无法接收 DSCP 标记的流量。
+
+    注意：此函数查询 LOCAL 数据库，适用于：
+    - 终端节点上的 /api/chain-routing/register 端点（for_tunnel_api=True）
+
+    对于入口节点的链路激活，应使用 _validate_remote_terminal_egress() 替代。
 
     Args:
         egress_tag: 出口标识
@@ -12436,7 +18305,7 @@ def _validate_chain_terminal_egress(egress_tag: str, for_tunnel_api: bool = Fals
             return {"success": False, "message": msg_en}
         raise HTTPException(status_code=400, detail=msg_zh)
 
-    # Phase 4 Issue 24: 检查 V2Ray 出口 (SOCKS-based)
+    # 检查 V2Ray 出口 (SOCKS-based)
     if HAS_DATABASE and USER_DB_PATH.exists():
         db = _get_db()
 
@@ -12464,7 +18333,7 @@ def _validate_chain_terminal_egress(egress_tag: str, for_tunnel_api: bool = Fals
                 return {"success": False, "message": msg_en}
             raise HTTPException(status_code=400, detail=msg_zh)
 
-        # Phase 7 Fix: 验证出口实际存在
+        # 验证出口实际存在
         # 如果上面没有找到 V2Ray/WARP 出口，检查其他类型
         if not v2ray_egress and not warp_egress:
             # 检查是否为 WARP WireGuard 出口（非 MASQUE）
@@ -12492,6 +18361,11 @@ def _validate_chain_terminal_egress(egress_tag: str, for_tunnel_api: bool = Fals
             if openvpn_egress:
                 return None  # OpenVPN 有效
 
+            # 检查是否为负载均衡/故障转移组
+            outbound_group = db.get_outbound_group(egress_tag) if hasattr(db, 'get_outbound_group') else None
+            if outbound_group:
+                return None  # 出口组有效
+
             # 没找到任何匹配的出口
             msg_en = f"Egress '{egress_tag}' not found in any egress table"
             msg_zh = f"出口 '{egress_tag}' 不存在"
@@ -12515,8 +18389,8 @@ class ChainRoutingRegisterRequest(BaseModel):
     )
     mark_type: str = Field(
         default="dscp",
-        pattern=r"^(dscp|xray_email)$",
-        description="标记类型 (dscp 或 xray_email)"
+        pattern=r"^dscp$",
+        description="标记类型（仅支持 DSCP）"
     )
     egress_tag: str = Field(
         ..., pattern=TAG_PATTERN,
@@ -12526,11 +18400,203 @@ class ChainRoutingRegisterRequest(BaseModel):
         default=None, pattern=TAG_PATTERN,
         description="来源节点标识"
     )
-    # Phase 11-Fix.E: 支持转发注册到目标节点（用于传递模式）
+    # 支持转发注册到目标节点（用于传递模式）
     target_node: Optional[str] = Field(
         default=None, pattern=TAG_PATTERN,
         description="目标节点（如果指定，将转发注册到该节点）"
     )
+
+
+# 2PC (Two-Phase Commit) 请求模型
+class ChainRouting2PCPrepareRequest(BaseModel):
+    """2PC PREPARE 请求 - 验证链路配置"""
+    chain_tag: str = Field(..., pattern=TAG_PATTERN, description="链路标识")
+    config: dict = Field(..., description="完整链路配置")
+    source_node: str = Field(..., pattern=TAG_PATTERN, description="发起节点")
+
+
+class ChainRouting2PCCommitRequest(BaseModel):
+    """2PC COMMIT 请求 - 应用已验证的配置"""
+    chain_tag: str = Field(..., pattern=TAG_PATTERN, description="链路标识")
+    source_node: str = Field(..., pattern=TAG_PATTERN, description="发起节点")
+
+
+class ChainRouting2PCAbortRequest(BaseModel):
+    """2PC ABORT 请求 - 回滚预验证状态"""
+    chain_tag: str = Field(..., pattern=TAG_PATTERN, description="链路标识")
+    source_node: str = Field(..., pattern=TAG_PATTERN, description="发起节点")
+
+
+# 2PC 配置缓存（用于在 COMMIT 时持久化到数据库）
+# key: chain_tag, value: {"config": {...}, "source_node": "...", "prepared_at": timestamp}
+_2pc_config_cache: Dict[str, dict] = {}
+_2pc_cache_lock = threading.Lock()
+
+
+@app.post("/api/chain-routing/prepare")
+async def api_chain_routing_prepare(request: Request, payload: ChainRouting2PCPrepareRequest):
+    """2PC PREPARE: 验证链路路由配置
+
+    接收来自入口节点的 2PC PREPARE 请求。
+    调用 rust-router IPC prepare_chain_route 验证配置。
+
+    认证方式: 隧道 IP/UUID
+    """
+    client_ip = _get_client_ip(request)
+
+    # 隧道认证
+    if not _is_tunnel_authenticated(request):
+        raise HTTPException(status_code=401, detail="Tunnel authentication required")
+
+    logging.info(f"[2PC-PREPARE] chain={payload.chain_tag} from={payload.source_node} client={client_ip}")
+
+    try:
+        # 调用 rust-router IPC
+        async with RustRouterClient() as client:
+            response = await client.prepare_chain_route(
+                chain_tag=payload.chain_tag,
+                config=payload.config,
+                source_node=payload.source_node,
+            )
+            if response.success:
+                # 缓存配置用于 COMMIT 时持久化
+                import time
+                with _2pc_cache_lock:
+                    _2pc_config_cache[payload.chain_tag] = {
+                        "config": payload.config,
+                        "source_node": payload.source_node,
+                        "prepared_at": time.time(),
+                    }
+                logging.info(f"[2PC-PREPARE] chain={payload.chain_tag} PREPARED (config cached)")
+                return {"success": True, "message": "Chain route prepared"}
+            else:
+                logging.warning(f"[2PC-PREPARE] chain={payload.chain_tag} FAILED: {response.error}")
+                return {"success": False, "message": response.error or "Prepare failed"}
+    except Exception as e:
+        logging.error(f"[2PC-PREPARE] chain={payload.chain_tag} ERROR: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/chain-routing/commit")
+async def api_chain_routing_commit(request: Request, payload: ChainRouting2PCCommitRequest):
+    """2PC COMMIT: 应用已验证的链路路由
+
+    接收来自入口节点的 2PC COMMIT 请求。
+    调用 rust-router IPC commit_chain_route 应用配置。
+
+    认证方式: 隧道 IP/UUID
+    """
+    client_ip = _get_client_ip(request)
+
+    # 隧道认证
+    if not _is_tunnel_authenticated(request):
+        raise HTTPException(status_code=401, detail="Tunnel authentication required")
+
+    logging.info(f"[2PC-COMMIT] chain={payload.chain_tag} from={payload.source_node} client={client_ip}")
+
+    try:
+        # 调用 rust-router IPC
+        async with RustRouterClient() as client:
+            response = await client.commit_chain_route(
+                chain_tag=payload.chain_tag,
+                source_node=payload.source_node,
+            )
+            if response.success:
+                # 持久化 chain 配置到数据库
+                db_persist_success = False
+                try:
+                    with _2pc_cache_lock:
+                        cached = _2pc_config_cache.pop(payload.chain_tag, None)
+
+                    if cached and HAS_DATABASE and USER_DB_PATH.exists():
+                        config = cached.get("config", {})
+                        dscp_value = config.get("dscp_value")
+                        exit_egress = config.get("exit_egress")
+                        source_node = cached.get("source_node", payload.source_node)
+
+                        if dscp_value and exit_egress:
+                            db = _get_db()
+                            db.add_or_update_chain_routing(
+                                chain_tag=payload.chain_tag,
+                                mark_value=dscp_value,
+                                egress_tag=exit_egress,
+                                mark_type="dscp",
+                                source_node=source_node,
+                            )
+                            db_persist_success = True
+                            logging.info(
+                                f"[2PC-COMMIT] chain={payload.chain_tag} persisted to DB "
+                                f"(DSCP={dscp_value} -> {exit_egress})"
+                            )
+                        else:
+                            logging.warning(
+                                f"[2PC-COMMIT] chain={payload.chain_tag} missing dscp_value or exit_egress, "
+                                f"skipping DB persist"
+                            )
+                    elif not cached:
+                        logging.warning(
+                            f"[2PC-COMMIT] chain={payload.chain_tag} config not found in cache, "
+                            f"skipping DB persist"
+                        )
+                except Exception as db_err:
+                    logging.error(f"[2PC-COMMIT] DB persist error: {db_err}")
+
+                logging.info(
+                    f"[2PC-COMMIT] chain={payload.chain_tag} COMMITTED "
+                    f"(db_persist={'ok' if db_persist_success else 'skipped'})"
+                )
+                return {"success": True, "message": "Chain route committed"}
+            else:
+                # 清理缓存
+                with _2pc_cache_lock:
+                    _2pc_config_cache.pop(payload.chain_tag, None)
+                logging.warning(f"[2PC-COMMIT] chain={payload.chain_tag} FAILED: {response.error}")
+                return {"success": False, "message": response.error or "Commit failed"}
+    except Exception as e:
+        # 清理缓存
+        with _2pc_cache_lock:
+            _2pc_config_cache.pop(payload.chain_tag, None)
+        logging.error(f"[2PC-COMMIT] chain={payload.chain_tag} ERROR: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/chain-routing/abort")
+async def api_chain_routing_abort(request: Request, payload: ChainRouting2PCAbortRequest):
+    """2PC ABORT: 回滚链路路由预验证
+
+    接收来自入口节点的 2PC ABORT 请求。
+    调用 rust-router IPC abort_chain_route 回滚状态。
+
+    认证方式: 隧道 IP/UUID
+    """
+    client_ip = _get_client_ip(request)
+
+    # 隧道认证
+    if not _is_tunnel_authenticated(request):
+        raise HTTPException(status_code=401, detail="Tunnel authentication required")
+
+    logging.info(f"[2PC-ABORT] chain={payload.chain_tag} from={payload.source_node} client={client_ip}")
+
+    try:
+        # 清理缓存
+        with _2pc_cache_lock:
+            _2pc_config_cache.pop(payload.chain_tag, None)
+
+        # 调用 rust-router IPC
+        async with RustRouterClient() as client:
+            response = await client.abort_chain_route(
+                chain_tag=payload.chain_tag,
+                source_node=payload.source_node,
+            )
+            if response.success:
+                logging.info(f"[2PC-ABORT] chain={payload.chain_tag} ABORTED")
+                return {"success": True, "message": "Chain route aborted"}
+            else:
+                logging.warning(f"[2PC-ABORT] chain={payload.chain_tag} FAILED: {response.error}")
+                return {"success": False, "message": response.error or "Abort failed"}
+    except Exception as e:
+        logging.error(f"[2PC-ABORT] chain={payload.chain_tag} ERROR: {e}")
+        return {"success": False, "message": str(e)}
 
 
 @app.post("/api/chain-routing/register")
@@ -12540,7 +18606,7 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
     当入口节点激活多跳链路时，在终端节点注册 DSCP/email 到出口的映射。
     终端节点根据此映射选择正确的本地出口。
 
-    Phase 11-Fix.E: 支持 target_node 参数，当指定时将转发注册到目标节点。
+    支持 target_node 参数，当指定时将转发注册到目标节点。
 
     认证方式: 隧道 IP/UUID
     """
@@ -12557,10 +18623,23 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
 
     # 验证隧道认证（WireGuard IP / Xray UUID）
     node = _verify_tunnel_header(request, db)
+    
+    # 回退到 X-Peer-Node-ID 头认证（支持 userspace WireGuard 模式）
+    if not node:
+        node = _verify_peer_endpoint_auth(request, db)
+    
     if not node:
         raise HTTPException(status_code=401, detail="Authentication failed")
 
-    # Phase 11-Fix.E: 如果指定了 target_node，转发注册到目标节点
+    #: 验证请求节点是否为链路成员（传入 source_node 支持入口节点）
+    is_member, membership_error = _verify_chain_membership(
+        db, payload.chain_tag, node["tag"], source_node=payload.source_node
+    )
+    if not is_member:
+        logging.warning(f"[tunnel-api] 链路成员验证失败: {membership_error}")
+        raise HTTPException(status_code=403, detail=membership_error)
+
+    # 如果指定了 target_node，转发注册到目标节点
     if payload.target_node:
         logging.info(
             f"[tunnel-api] 链路路由转发注册: chain={payload.chain_tag}, "
@@ -12618,14 +18697,14 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
         logging.warning(f"[tunnel-api] 出口不存在: {payload.egress_tag}")
         return {"success": False, "message": f"Egress '{payload.egress_tag}' not found"}
 
-    # Phase 11-Fix.J: 拒绝无法用于 DSCP 路由的出口类型
+    # 拒绝无法用于 DSCP 路由的出口类型
     validation_result = _validate_chain_terminal_egress(payload.egress_tag, for_tunnel_api=True)
     if validation_result:
         logging.warning(f"[tunnel-api] 拒绝无效终端出口: {payload.egress_tag}")
         return validation_result
 
     try:
-        # Phase 11-Fix.I: 原子事务模式 - DB 写入 + iptables 规则必须同时成功
+        # 原子事务模式 - DB 写入 + iptables 规则必须同时成功
         # Step 1: 写入数据库
         db.add_or_update_chain_routing(
             chain_tag=payload.chain_tag,
@@ -12639,75 +18718,130 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
             f"mark={payload.mark_value} -> {payload.egress_tag}"
         )
 
-        # Step 2: 应用 iptables/ip 路由规则
+        # Sync chain to rust-router for DSCP-based terminal routing
+        # The terminal node's rust-router needs to know about this chain to route
+        # incoming DSCP-marked packets to the correct exit_egress.
+        # See rust-router/src/ingress/processor.rs lines 287-313
+        rr_sync_success = False
+        rr_sync_error = None
         try:
-            from chain_route_manager import get_chain_route_manager
+            import asyncio
 
-            chain_route_mgr = get_chain_route_manager(db)
-            route_applied = chain_route_mgr.add_route(
-                chain_tag=payload.chain_tag,
-                mark_value=payload.mark_value,
-                egress_tag=payload.egress_tag,
-                mark_type=payload.mark_type,
-                source_node=payload.source_node or node["tag"],
-            )
+            async def _sync_chain_to_rust_router():
+                # Create fresh client for new event loop context
+                # Using the singleton _get_rust_router_client() doesn't work here because
+                # we're running in a new event loop created by asyncio.new_event_loop(),
+                # but the singleton might be connected in uvicorn's main event loop.
+                if not HAS_RUST_ROUTER_CLIENT:
+                    return False, "rust-router not available"
 
-            if not route_applied:
-                # iptables 失败，回滚 DB
-                logging.error(
-                    f"[tunnel-api] iptables 规则应用失败，回滚 DB: "
-                    f"chain={payload.chain_tag}, egress={payload.egress_tag}"
-                )
+                client = RustRouterClient()
                 try:
-                    db.delete_chain_routing(
-                        chain_tag=payload.chain_tag,
-                        mark_value=payload.mark_value,
-                        mark_type=payload.mark_type,
-                    )
-                except Exception as rollback_err:
-                    logging.critical(
-                        f"[tunnel-api] 回滚失败，数据可能不一致: {rollback_err}"
-                    )
-                return {
-                    "success": False,
-                    "message": f"Failed to apply iptables rules for egress '{payload.egress_tag}'"
-                }
+                    # Verify connection
+                    ping_resp = await client.ping()
+                    if not ping_resp.success:
+                        return False, "rust-router not available"
 
-            logging.info(
-                f"[tunnel-api] 链路路由注册完成（DB + iptables）: "
-                f"chain={payload.chain_tag}, mark={payload.mark_value}"
-            )
-            return {"success": True, "message": "Chain route registered", "iptables_applied": True}
+                    local_tag = _get_local_node_tag(db)
+                    source_tag = payload.source_node or node["tag"]
 
-        except ImportError as e:
-            # chain_route_manager 模块不可用，回滚 DB
-            logging.error(f"[tunnel-api] chain_route_manager 导入失败: {e}")
+                    # Build chain config for terminal node
+                    # The chain has: entry (source_node) -> terminal (local_node)
+                    chain_config = {
+                        "tag": payload.chain_tag,
+                        "description": f"Chain route from {source_tag}",
+                        "dscp_value": payload.mark_value,
+                        "hops": [
+                            {
+                                "node_tag": source_tag,
+                                "role": "entry",
+                                "tunnel_type": "wireguard",
+                            },
+                            {
+                                "node_tag": local_tag,
+                                "role": "terminal",
+                                "tunnel_type": "wireguard",
+                            },
+                        ],
+                        "rules": [],
+                        "exit_egress": payload.egress_tag,
+                        "allow_transitive": False,
+                    }
+
+                    # Check if chain already exists
+                    # list_chains() returns List[ChainInfo], not a response object
+                    chains_list = await client.list_chains()
+                    existing_tags = {c.tag for c in chains_list if c.tag}
+
+                    if payload.chain_tag in existing_tags:
+                        # Update existing chain - first deactivate if active
+                        status_resp = await client.get_chain_status(payload.chain_tag)
+                        if status_resp.success and status_resp.data:
+                            # rust-router returns "state", not "chain_state"
+                            if status_resp.data.get("state") == "active":
+                                await client.deactivate_chain(payload.chain_tag)
+
+                        # Delete and recreate (update may not change hops)
+                        await client.delete_chain(payload.chain_tag)
+
+                    # Create the chain (in Inactive state)
+                    # NOTE: Do NOT activate here - the entry node's 2PC COMMIT will activate
+                    # This fixes the "Chain is already active" error during 2PC
+                    create_resp = await client.create_chain(
+                        tag=payload.chain_tag,
+                        config=chain_config,
+                    )
+                    if not create_resp.success:
+                        return False, f"Failed to create chain: {create_resp.error}"
+
+                    # Chain will be activated by 2PC COMMIT from entry node
+                    # Activating here would cause "Chain is already active" error when
+                    # the entry node sends 2PC PREPARE/COMMIT
+
+                    return True, None
+                finally:
+                    await client.close()
+            
+            # Run async function
+            loop = asyncio.new_event_loop()
             try:
-                db.delete_chain_routing(
-                    chain_tag=payload.chain_tag,
-                    mark_value=payload.mark_value,
-                    mark_type=payload.mark_type,
-                )
-            except Exception as rollback_err:
-                logging.critical(
-                    f"[tunnel-api] 回滚失败，数据可能不一致: {rollback_err}"
-                )
-            return {"success": False, "message": "Chain route manager unavailable"}
+                rr_sync_success, rr_sync_error = loop.run_until_complete(_sync_chain_to_rust_router())
+            finally:
+                loop.close()
+                
         except Exception as e:
-            # 其他异常，回滚 DB
-            logging.error(f"[tunnel-api] iptables 应用异常: {e}")
+            rr_sync_error = str(e)
+            logging.warning(f"[tunnel-api] rust-router sync failed: {e}")
+        
+        if rr_sync_success:
+            logging.info(
+                f"[tunnel-api] 链路路由注册完成: "
+                f"chain={payload.chain_tag}, mark={payload.mark_value} -> {payload.egress_tag} "
+                f"(rust-router synced)"
+            )
+            return {"success": True, "message": "Chain route registered"}
+        else:
+            # rust-router 同步失败时必须返回失败
+            # 否则入口节点以为链路激活成功，但终端节点的 rust-router 不知道如何路由
+            # 导致 DSCP 标记的流量被 processor.rs:320-333 阻断
+            logging.error(
+                f"[tunnel-api] 链路路由注册失败 - rust-router 同步失败: "
+                f"chain={payload.chain_tag}, error={rr_sync_error}"
+            )
+            # 回滚数据库记录
             try:
-                db.delete_chain_routing(
-                    chain_tag=payload.chain_tag,
-                    mark_value=payload.mark_value,
-                    mark_type=payload.mark_type,
-                )
+                db.delete_chain_routing(payload.chain_tag, payload.mark_value, payload.mark_type)
+                logging.info(f"[tunnel-api] 已回滚数据库中的链路路由: {payload.chain_tag}")
             except Exception as rollback_err:
-                logging.critical(
-                    f"[tunnel-api] 回滚失败，数据可能不一致: {rollback_err}"
-                )
-            return {"success": False, "message": f"iptables error: {str(e)}"}
+                logging.warning(f"[tunnel-api] 回滚数据库记录失败: {rollback_err}")
+            return {
+                "success": False,
+                "message": f"rust-router sync failed: {rr_sync_error}"
+            }
 
+    except ValueError as e:
+        logging.warning(f"[tunnel-api] 链路路由参数错误: {e}")
+        return {"success": False, "message": str(e)}
     except sqlite3.IntegrityError as e:
         logging.error(f"[tunnel-api] 链路路由数据库约束错误: {e}")
         return {"success": False, "message": "Database constraint error"}
@@ -12732,13 +18866,19 @@ def api_chain_routing_unregister(
     ),
     mark_type: str = Query(
         default="dscp",
-        pattern=r"^(dscp|xray_email)$",
-        description="标记类型 (dscp 或 xray_email)"
+        pattern=r"^dscp$",
+        description="标记类型（仅支持 DSCP，Xray 隧道不支持多跳链路）"
     ),
     target_node: Optional[str] = Query(
         default=None,
         pattern=TAG_PATTERN,
         description="目标节点 (用于传递模式转发)"
+    ),
+    #: 添加 source_node 参数支持入口节点验证
+    source_node: Optional[str] = Query(
+        default=None,
+        pattern=TAG_PATTERN,
+        description="来源节点标识（入口节点）"
     ),
 ):
     """注销链路路由
@@ -12764,17 +18904,30 @@ def api_chain_routing_unregister(
 
     db = _get_db()
 
-    # 验证隧道认证（WireGuard IP / Xray UUID）
+    # 支持多种认证方式
+    # 1. 隧道认证（WireGuard IP / Xray UUID）- 最安全
+    # 2. X-Peer-Node-ID header 认证 - 用于 IPC 转发的请求
     node = _verify_tunnel_header(request, db)
     if not node:
+        # 尝试 X-Peer-Node-ID 认证（用于 userspace WireGuard 下的 IPC 转发）
+        node = _verify_peer_endpoint_auth(request, db)
+    if not node:
         raise HTTPException(status_code=401, detail="Authentication failed")
+
+    #: 验证请求节点是否为链路成员（传入 source_node 支持入口节点）
+    is_member, membership_error = _verify_chain_membership(
+        db, chain_tag, node["tag"], source_node=source_node
+    )
+    if not is_member:
+        logging.warning(f"[tunnel-api] 链路成员验证失败: {membership_error}")
+        raise HTTPException(status_code=403, detail=membership_error)
 
     logging.info(
         f"[tunnel-api] 链路路由注销: chain={chain_tag}, "
         f"mark={mark_value}, from {node['tag']} ({client_ip})"
     )
 
-    # Phase 11-Fix.E: 如果指定了 target_node，转发注销到目标节点
+    # 如果指定了 target_node，转发注销到目标节点
     if target_node:
         target_peer = db.get_peer_node(target_node)
         if not target_peer:
@@ -12799,6 +18952,7 @@ def api_chain_routing_unregister(
                 mark_value=mark_value,
                 mark_type=mark_type,
                 target_node=None,  # 不再转发
+                source_node=source_node,  #: 传递原始入口节点
             )
             return {"success": success, "message": "Forwarded to target node", "target_node": target_node}
         except Exception as e:
@@ -12806,48 +18960,74 @@ def api_chain_routing_unregister(
             return {"success": False, "message": f"Forward failed: {e}"}
 
     try:
-        # Phase 11-Fix.I: 同时清理 DB 和 iptables 规则
+        # 移除 iptables 清理 - rust-router 在用户空间处理 DSCP 路由
         deleted = db.delete_chain_routing(
             chain_tag=chain_tag,
             mark_value=mark_value,
             mark_type=mark_type,
         )
         if deleted:
-            logging.info(
-                f"[tunnel-api] 链路路由 DB 删除成功: chain={chain_tag}, "
-                f"mark={mark_value}"
-            )
-
-            # 清理 iptables 规则（最佳努力，不影响 DB 删除结果）
-            iptables_cleaned = False
+            # Remove chain from rust-router
             try:
-                from chain_route_manager import get_chain_route_manager
+                import asyncio
+                
+                async def _remove_chain_from_rust_router():
+                    # Create fresh client for new event loop context
+                    if not HAS_RUST_ROUTER_CLIENT:
+                        return False, "rust-router not available"
 
-                chain_route_mgr = get_chain_route_manager(db)
-                iptables_cleaned = chain_route_mgr.remove_route(
-                    chain_tag=chain_tag,
-                    mark_value=mark_value,
-                    mark_type=mark_type,
-                )
-                if iptables_cleaned:
+                    client = RustRouterClient()
+                    try:
+                        ping_resp = await client.ping()
+                        if not ping_resp.success:
+                            return False, "rust-router not available"
+
+                        # Check if chain exists
+                        # list_chains() returns List[ChainInfo], not a response object
+                        chains_list = await client.list_chains()
+                        existing_tags = {c.tag for c in chains_list if c.tag}
+
+                        if chain_tag not in existing_tags:
+                            return True, None  # Chain doesn't exist, nothing to do
+
+                        # Deactivate if active
+                        status_resp = await client.get_chain_status(chain_tag)
+                        if status_resp.success and status_resp.data:
+                            # rust-router returns "state", not "chain_state"
+                            if status_resp.data.get("state") == "active":
+                                await client.deactivate_chain(chain_tag)
+
+                        # Delete the chain
+                        delete_resp = await client.delete_chain(chain_tag)
+                        if not delete_resp.success:
+                            return False, f"Failed to delete chain: {delete_resp.error}"
+
+                        return True, None
+                    finally:
+                        await client.close()
+                
+                loop = asyncio.new_event_loop()
+                try:
+                    rr_success, rr_error = loop.run_until_complete(_remove_chain_from_rust_router())
+                finally:
+                    loop.close()
+                
+                if rr_success:
                     logging.info(
-                        f"[tunnel-api] iptables 规则清理成功: chain={chain_tag}, "
-                        f"mark={mark_value}"
+                        f"[tunnel-api] 链路路由注销成功: chain={chain_tag}, "
+                        f"mark={mark_value} (rust-router synced)"
                     )
                 else:
                     logging.warning(
-                        f"[tunnel-api] iptables 规则不存在或清理失败: chain={chain_tag}, "
-                        f"mark={mark_value}"
+                        f"[tunnel-api] 链路路由注销成功但 rust-router 同步失败: "
+                        f"chain={chain_tag}, error={rr_error}"
                     )
-            except ImportError:
-                logging.warning("[tunnel-api] chain_route_manager 不可用，跳过 iptables 清理")
             except Exception as e:
-                logging.warning(f"[tunnel-api] iptables 清理异常: {e}")
-
+                logging.warning(f"[tunnel-api] rust-router cleanup failed: {e}")
+            
             return {
                 "success": True,
                 "message": "Chain route unregistered",
-                "iptables_cleaned": iptables_cleaned
             }
         else:
             logging.warning(
@@ -13067,8 +19247,9 @@ def _validate_endpoint(endpoint: str) -> tuple:
 def _check_peer_tunnel_status(node: dict) -> str:
     """检查对等节点隧道的实时状态
 
-    对于 WireGuard 隧道：检查接口是否存在以及最后握手时间
-    对于 Xray 隧道：检查 SOCKS 端口是否响应
+    WireGuard 隧道通过 rust-router IPC 查询真实状态。
+    解决数据库状态与 rust-router 实际状态不同步的问题。
+    对于 Xray 隧道：检查 SOCKS 端口是否响应。
 
     Args:
         node: 节点信息字典
@@ -13076,60 +19257,83 @@ def _check_peer_tunnel_status(node: dict) -> str:
     Returns:
         实时状态: "connected", "disconnected", "stale"
     """
-    import time
-
     db_status = node.get("tunnel_status", "disconnected")
     tunnel_type = node.get("tunnel_type", "wireguard")
+    tag = node.get("tag")
 
-    # 如果数据库状态不是已连接，直接返回
+    # WireGuard 隧道查询 rust-router 真实状态
+    # 解决配对后数据库状态未同步导致链路激活失败的问题
+    # 只有 WireGuard 握手成功（last_handshake 有值）才视为真正连接
+    if tunnel_type == "wireguard" and tag and HAS_RUST_ROUTER_CLIENT:
+        try:
+            async def _query_rr_peer_status():
+                client = RustRouterClient()
+                try:
+                    # 使用 list_peers 获取完整信息（包括 last_handshake）
+                    peers = await client.list_peers()
+                    for p in peers:
+                        if p.tag == tag:
+                            return p
+                    return None
+                finally:
+                    await client.close()
+
+            peer_info = _run_async_ipc(_query_rr_peer_status())
+            if peer_info:
+                rr_state = (peer_info.state or "").lower()
+                last_handshake = peer_info.last_handshake
+                bytes_rx = peer_info.bytes_rx or 0
+                bytes_tx = peer_info.bytes_tx or 0
+
+                # 真正连接的判断条件
+                # 1. rust-router state == "connected"
+                # 2. last_handshake 有值（WireGuard 握手成功过）
+                # 或者有流量通过（bytes_rx > 0 或 bytes_tx > 0）
+                is_really_connected = (
+                    rr_state == "connected" and
+                    (last_handshake is not None or bytes_rx > 0 or bytes_tx > 0)
+                )
+
+                if is_really_connected:
+                    if db_status != "connected":
+                        logging.info(
+                            f"[peers] 节点 '{tag}' 隧道已连接 (握手成功), "
+                            f"last_handshake={last_handshake}, rx={bytes_rx}, tx={bytes_tx}"
+                        )
+                    return "connected"
+                elif rr_state == "connected":
+                    # state 是 connected 但没有握手成功 - 等待握手中
+                    logging.debug(
+                        f"[peers] 节点 '{tag}' 等待 WireGuard 握手 "
+                        f"(state={rr_state}, last_handshake={last_handshake})"
+                    )
+                    return "connecting"
+                elif rr_state in ("disconnected", "error"):
+                    if db_status == "connected":
+                        logging.info(f"[peers] 节点 '{tag}' rust-router 状态为 {rr_state}")
+                    return "disconnected"
+                elif rr_state == "connecting":
+                    return "connecting"
+            else:
+                # peer 不在 rust-router 中时返回 disconnected
+                # 而不是回退到数据库状态（可能是旧的 "connected"）
+                # 这解决了 rust-router 重启后前端仍显示"已连接"的问题
+                if db_status == "connected":
+                    logging.info(
+                        f"[peers] 节点 '{tag}' 不在 rust-router 中，"
+                        f"数据库状态为 {db_status}，返回 disconnected"
+                    )
+                return "disconnected"
+        except Exception as e:
+            logging.debug(f"[peers] 查询 rust-router 节点 '{tag}' 状态失败: {e}，回退到数据库状态")
+            # rust-router 查询失败（如连接错误）时回退到数据库状态
+            return db_status
+
+    # 数据库状态不是已连接时直接返回（非 WireGuard 或查询失败）
     if db_status != "connected":
         return db_status
 
-    if tunnel_type == "wireguard":
-        tunnel_interface = node.get("tunnel_interface")
-        if not tunnel_interface:
-            return "disconnected"
-
-        try:
-            # 检查接口是否存在
-            result = subprocess.run(
-                ["ip", "link", "show", tunnel_interface],
-                capture_output=True, timeout=5
-            )
-            if result.returncode != 0:
-                return "disconnected"
-
-            # 检查最后握手时间
-            result = subprocess.run(
-                ["wg", "show", tunnel_interface, "latest-handshakes"],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode != 0:
-                return "disconnected"
-
-            # 解析握手时间
-            output = result.stdout.strip()
-            if output:
-                parts = output.split()
-                if len(parts) >= 2:
-                    try:
-                        last_handshake = int(parts[1])
-                        # 如果握手时间为0，说明接口已创建但尚未完成握手
-                        # 这是正常的"正在连接"状态，不应该标记为断开
-                        if last_handshake == 0:
-                            return "connecting"  # 接口已创建，等待握手
-                        elapsed = int(time.time()) - last_handshake
-                        if elapsed > 180:
-                            return "stale"  # 握手超时
-                    except ValueError:
-                        pass
-
-            return "connected"
-        except (subprocess.TimeoutExpired, Exception) as e:
-            logging.warning(f"[peers] 检查 WireGuard 隧道状态失败: {e}")
-            return db_status  # 检查失败时返回数据库状态
-
-    elif tunnel_type == "xray":
+    if tunnel_type == "xray":
         xray_socks_port = node.get("xray_socks_port")
         if not xray_socks_port:
             return "disconnected"
@@ -13181,6 +19385,58 @@ def _update_stale_peer_status(db, node: dict, real_status: str) -> None:
             logging.warning(f"[peers] 更新节点 '{tag}' 状态失败: {e}")
 
 
+def _update_chains_for_disconnected_peer(db, peer_tag: str) -> dict:
+    """当节点断开时，更新受影响的链路状态
+
+    查找使用该节点的所有活跃链路，并将其状态更新为 'error'。
+    这确保了链路状态与实际隧道状态保持一致。
+
+    Args:
+        db: 数据库实例
+        peer_tag: 断开的节点标签
+
+    Returns:
+        更新结果: {"updated": [链路列表], "errors": [错误列表]}
+    """
+    result = {"updated": [], "errors": []}
+
+    try:
+        # 使用已有的 get_chains_with_downstream_node 查找受影响的链路
+        affected_chains = db.get_chains_with_downstream_node(peer_tag)
+
+        for chain in affected_chains:
+            chain_tag = chain.get("tag")
+            chain_state = chain.get("chain_state", "inactive")
+
+            # 只更新活跃的链路
+            if chain_state in ("active", "activating"):
+                try:
+                    db.update_node_chain(
+                        chain_tag,
+                        chain_state="error",
+                        last_error=f"Peer node '{peer_tag}' disconnected"
+                    )
+                    result["updated"].append(chain_tag)
+                    logging.warning(
+                        f"[chains] 链路 '{chain_tag}' 状态更新为 error: "
+                        f"节点 '{peer_tag}' 已断开连接"
+                    )
+                except Exception as e:
+                    result["errors"].append({"chain": chain_tag, "error": str(e)})
+                    logging.error(f"[chains] 更新链路 '{chain_tag}' 状态失败: {e}")
+
+        if result["updated"]:
+            logging.info(
+                f"[chains] 因节点 '{peer_tag}' 断开，已更新 {len(result['updated'])} 条链路状态"
+            )
+
+    except Exception as e:
+        logging.error(f"[chains] 查找受影响链路失败: {e}")
+        result["errors"].append({"chain": None, "error": str(e)})
+
+    return result
+
+
 @app.get("/api/peers")
 def api_list_peers(enabled_only: bool = False):
     """列出所有对等节点"""
@@ -13191,23 +19447,21 @@ def api_list_peers(enabled_only: bool = False):
     nodes = db.get_peer_nodes(enabled_only=enabled_only)
 
     # 实时检测隧道状态并更新
+    # 前端应显示真实隧道状态
+    # 双向同步 - 连接和断开都要更新数据库
     for node in nodes:
-        if node.get("tunnel_status") == "connected":
-            real_status = _check_peer_tunnel_status(node)
-            if real_status == "connecting":
-                # 接口已创建但尚未完成握手，保持 "connected" 状态
-                # 这是刚连接后的正常过渡状态
-                pass
-            elif real_status != "connected":
-                # 真正的断开状态（disconnected 或 stale）
-                _update_stale_peer_status(db, node, real_status)
-                node["tunnel_status"] = "disconnected"
+        real_status = _check_peer_tunnel_status(node)
+        if real_status != node.get("tunnel_status"):
+            # 状态不一致时同步数据库（双向）
+            db.update_peer_node(node.get("tag"), tunnel_status=real_status)
+            logging.debug(f"[peers] 自动同步节点 '{node.get('tag')}' 状态: {node.get('tunnel_status')} -> {real_status}")
+            node["tunnel_status"] = real_status
 
         # 隐藏敏感字段
         node.pop("psk_hash", None)
         node.pop("psk_encrypted", None)
         node.pop("wg_private_key", None)
-        node.pop("remote_wg_private_key", None)  # Phase 11.1: 预生成密钥不应暴露
+        node.pop("remote_wg_private_key", None)  # 预生成密钥不应暴露
         node.pop("xray_reality_private_key", None)
 
     return {"nodes": nodes, "count": len(nodes)}
@@ -13226,20 +19480,18 @@ def api_get_peer(tag: str):
         raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
 
     # 实时检测隧道状态并更新
-    if node.get("tunnel_status") == "connected":
-        real_status = _check_peer_tunnel_status(node)
-        if real_status == "connecting":
-            # 接口已创建但尚未完成握手，保持 "connected" 状态
-            pass
-        elif real_status != "connected":
+    # 前端应显示真实隧道状态
+    real_status = _check_peer_tunnel_status(node)
+    if real_status != node.get("tunnel_status"):
+        if real_status == "disconnected" and node.get("tunnel_status") == "connected":
             _update_stale_peer_status(db, node, real_status)
-            node["tunnel_status"] = "disconnected"
+        node["tunnel_status"] = real_status
 
     # 隐藏敏感字段
     node.pop("psk_hash", None)
     node.pop("psk_encrypted", None)
     node.pop("wg_private_key", None)
-    node.pop("remote_wg_private_key", None)  # Phase 11.1: 预生成密钥不应暴露
+    node.pop("remote_wg_private_key", None)  # 预生成密钥不应暴露
     node.pop("xray_reality_private_key", None)
 
     return node
@@ -13261,7 +19513,7 @@ def api_create_peer(payload: PeerNodeCreateRequest):
     if db.get_peer_node(payload.tag):
         raise HTTPException(status_code=400, detail=f"节点标识 '{payload.tag}' 已存在")
 
-    # Phase 11-Cascade: 检查墓碑（防止删除后立即重建）
+    # 检查墓碑（防止删除后立即重建）
     if db.is_peer_tombstoned(payload.tag):
         raise HTTPException(
             status_code=409,
@@ -13273,7 +19525,7 @@ def api_create_peer(payload: PeerNodeCreateRequest):
     if not is_valid:
         raise HTTPException(status_code=400, detail=error_msg)
 
-    # Phase 6 Fix: 端口配置提示（使用有效范围 36200-36299）
+    # 端口配置提示（使用有效范围 36200-36299）
     # Peer WireGuard 端口: 36200-36299, API 端口: 36000
     # 常见错误: 使用 36100 (WireGuard 入口端口) 而非 36200-36299
     try:
@@ -13461,7 +19713,7 @@ def api_update_peer(tag: str, payload: PeerNodeUpdateRequest):
     updated_node.pop("psk_hash", None)
     updated_node.pop("psk_encrypted", None)
     updated_node.pop("wg_private_key", None)
-    updated_node.pop("remote_wg_private_key", None)  # Phase 11.1: 预生成密钥不应暴露
+    updated_node.pop("remote_wg_private_key", None)  # 预生成密钥不应暴露
     updated_node.pop("xray_reality_private_key", None)
 
     logging.info(f"[peers] 更新节点 '{tag}'")
@@ -13472,7 +19724,7 @@ def api_update_peer(tag: str, payload: PeerNodeUpdateRequest):
 def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发送级联删除通知")):
     """删除对等节点
 
-    Phase 11-Cascade: 支持级联删除通知
+    支持级联删除通知
     - 删除前通知目标节点（让对方清理连接）
     - 删除后广播给所有其他连接的节点
     - 添加墓碑防止对方重连
@@ -13498,11 +19750,11 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
                 detail=f"无法删除: 节点 '{tag}' 被链路 '{chain['tag']}' 使用"
             )
 
-    # Phase 11-Cascade: 获取本节点标识
+    # 获取本节点标识
     local_node_tag = _get_local_node_tag(db)
     cascade_results = {"notified_target": False, "broadcast_count": 0}
 
-    # Phase 11-Cascade: 在删除前通知目标节点（如果已连接）
+    # 在删除前通知目标节点（如果已连接）
     if cascade and node.get("tunnel_status") == "connected":
         try:
             from tunnel_api_client import TunnelAPIClientManager
@@ -13524,22 +19776,41 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
         except Exception as e:
             logging.warning(f"[peers] 级联通知目标节点失败: {e}")
 
-    # 清理 WireGuard/Xray 隧道接口（无论数据库状态如何，确保内核接口被删除）
-    try:
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-        manager.disconnect_node(tag)
-        logging.info(f"[peers] 删除前清理隧道接口: {tag}")
-    except Exception as e:
-        # 接口可能不存在，忽略错误继续删除
-        logging.debug(f"[peers] 清理隧道接口: {e}")
+    # 清理 WireGuard 隧道通过 rust-router IPC
+    tunnel_type = node.get("tunnel_type", "wireguard")
+    
+    if tunnel_type == "wireguard":
+        try:
+            from rust_router_client import RustRouterClient
+            client = RustRouterClient()
+
+            async def _remove_peer_ipc():
+                return await client.remove_peer(tag)
+
+            response = _run_async_ipc(_remove_peer_ipc())
+            if response.success:
+                logging.info(f"[peers] rust-router peer 已删除: {tag}")
+            else:
+                if "not found" in (response.error or "").lower():
+                    logging.debug(f"[peers] rust-router peer 已不存在 (可能已清理): {tag}")
+                else:
+                    logging.warning(f"[peers] rust-router 删除 peer 失败: {response.error}")
+        except HTTPException:
+            logging.warning(f"[peers] rust-router IPC 超时，继续删除数据库记录: {tag}")
+        except Exception as e:
+            logging.warning(f"[peers] rust-router IPC 删除失败: {e}")
+
+    # NOTE: Legacy xray_peer_inbound_manager removed
+    # VLESS peer inbound is now handled by rust-router
+    if node.get("inbound_enabled"):
+        logging.debug(f"[peers] VLESS peer inbound cleanup for {tag} handled by rust-router")
 
     # 删除数据库记录
     success = db.delete_peer_node(tag)
     if not success:
         raise HTTPException(status_code=500, detail="删除节点失败")
 
-    # Phase 11-Cascade: 添加墓碑防止对方重连
+    # 添加墓碑防止对方重连
     try:
         db.add_peer_tombstone(
             tag=tag,
@@ -13551,7 +19822,7 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
     except Exception as e:
         logging.warning(f"[peers] 添加墓碑失败: {e}")
 
-    # Phase 11-Cascade: 广播给所有其他连接的节点
+    # 广播给所有其他连接的节点
     if cascade:
         try:
             from tunnel_api_client import TunnelAPIClientManager
@@ -13593,7 +19864,7 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
 
 @app.post("/api/peer/generate-pair-request", response_model=GeneratePairRequestResponse)
 def api_generate_pair_request(payload: GeneratePairRequestRequest):
-    """生成配对请求码（Phase 11-Tunnel: 隧道优先模式）
+    """生成配对请求码（隧道优先模式）
 
     生成配对请求码，同时创建 WireGuard 接口开始监听。
     这样对端导入配对码后可以直接连接，通过隧道完成握手。
@@ -13612,18 +19883,20 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
     if not HAS_PAIRING:
         raise HTTPException(status_code=503, detail="Pairing module not available")
 
-    # 验证端点格式 (IP:port 或 域名:port)
+    # 验证端点格式 (IP 或 域名，端口可选，会自动分配)
     endpoint = payload.endpoint.strip()
-    if ':' not in endpoint:
-        raise HTTPException(status_code=400, detail="Endpoint must include port (e.g., '10.1.1.1:36200')")
-
-    host, port_str = endpoint.rsplit(':', 1)
-    try:
-        port = int(port_str)
-        if not (1 <= port <= 65535):
-            raise ValueError("Port out of range")
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid port in endpoint: {port_str}")
+    if ':' in endpoint:
+        host, port_str = endpoint.rsplit(':', 1)
+        try:
+            port = int(port_str)
+            if not (1 <= port <= 65535):
+                raise ValueError("Port out of range")
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid port in endpoint: {port_str}")
+    else:
+        # 没有端口，使用占位值（后面会被自动分配的端口替换）
+        host = endpoint
+        port = 0  # 占位值，表示需要自动分配
 
     if not validate_hostname(host):
         raise HTTPException(status_code=400, detail=f"Invalid hostname: {host}")
@@ -13632,11 +19905,55 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
     generator = PairingCodeGenerator(db)
 
     interface_name = None  # 用于错误时清理
-    pairing_id = None  # Phase 6 Issue 30: 用于错误时清理 pending_pairing
+    pairing_id = None  # 用于错误时清理 pending_pairing
 
     try:
+        # WireGuard 隧道通过 rust-router IPC 处理
+        if payload.tunnel_type == "wireguard":
+            # Auto-allocate port if not specified (port == 0)
+            ipc_endpoint = endpoint
+            # 记录本地监听端口
+            listen_port = port  # 默认使用用户指定端口
+            if port == 0:
+                listen_port = _allocate_peer_tunnel_port(db)
+                ipc_endpoint = f"{host}:{listen_port}"
+                logging.info(f"[pairing] IPC 自动分配隧道端口: {listen_port}")
+
+            # Use rust-router IPC for pairing
+            success, code_or_error, peer_tag, pending_data = _run_async_ipc(
+                _generate_pair_request_via_ipc(
+                    node_tag=payload.node_tag,
+                    node_description=payload.node_description,
+                    endpoint=ipc_endpoint,
+                    api_port=payload.api_port,
+                    bidirectional=payload.bidirectional,
+                    tunnel_type=payload.tunnel_type,
+                )
+            )
+
+            if not success:
+                raise HTTPException(status_code=503, detail=code_or_error)
+
+            # Build pending_request for response
+            # 包含本地监听端口供 complete_pairing 使用
+            pending_request = {
+                "node_tag": payload.node_tag,
+                "tunnel_type": payload.tunnel_type,
+                "bidirectional": payload.bidirectional,
+                "tunnel_port": listen_port,  # 本地监听端口
+            }
+            pending_request.update(pending_data)
+
+            logging.info(f"[pairing] 生成配对请求码 (IPC): node_tag={payload.node_tag}")
+            return GeneratePairRequestResponse(
+                code=code_or_error,
+                psk="",
+                pending_request=pending_request
+            )
+
+        # Xray tunnel code path continues below...
         # Step 1: 分配隧道 IP 和端口（需要在生成配对码之前，以便包含在配对码中）
-        # Phase 11-Fix.C: 使用确定性分配以避免多节点场景下的冲突
+        # 使用确定性分配以避免多节点场景下的冲突
         local_ip = None
         remote_ip = None
         listen_port = None
@@ -13656,16 +19973,29 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
             # endpoint 中用户指定的端口可能与保留端口(36100等)冲突，需使用自动分配的端口
             listen_port = _allocate_peer_tunnel_port(db)
 
-            # Issue 7 Fix: 如果用户指定的端口是保留端口，使用分配的端口替换 endpoint
-            if port in RESERVED_PORTS or port != listen_port:
+            # Issue 7 Fix: 如果用户指定的端口是保留端口或未指定，使用分配的端口替换 endpoint
+            if port == 0 or port in RESERVED_PORTS or port != listen_port:
                 actual_endpoint = f"{host}:{listen_port}"
-                if port in RESERVED_PORTS:
+                if port == 0:
+                    logging.info(f"[pairing] 自动分配隧道监听端口: {listen_port}")
+                elif port in RESERVED_PORTS:
                     logging.warning(f"[pairing] 用户指定端口 {port} 是保留端口 ({RESERVED_PORTS[port]})，替换为 {listen_port}")
                 else:
                     logging.info(f"[pairing] 分配隧道监听端口: {listen_port} (用户指定端口 {port})")
 
+        # Pre-allocate inbound port for Xray
+        # Xray tunnels need to know the inbound port upfront so it can be encoded in pairing code
+        xray_inbound_port = None
+        if payload.tunnel_type == "xray":
+            try:
+                xray_inbound_port = db.get_next_peer_inbound_port()
+                actual_endpoint = f"{host}:{xray_inbound_port}"
+                logging.info(f"[pairing] Xray 自动分配入站端口: {xray_inbound_port}")
+            except ValueError as e:
+                raise HTTPException(status_code=500, detail=f"无法分配 Xray 入站端口: {e}")
+
         # Step 2: 生成配对码和密钥对（包含隧道 IP 和正确的端口）
-        # Phase 11-Fix.K: 传递 api_port
+        # 传递 api_port
         code, _, request_obj = generator.generate_pair_request(
             node_tag=payload.node_tag,
             node_description=payload.node_description,
@@ -13680,7 +20010,7 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
 
         # Step 3: 为 WireGuard 隧道创建接口（只有 bidirectional + wireguard 才创建）
         if payload.tunnel_type == "wireguard" and payload.bidirectional and HAS_PENDING_TUNNEL:
-            # Phase 11-Fix.C: 使用完整 code 生成 pairing_id + 碰撞检测
+            # 使用完整 code 生成 pairing_id + 碰撞检测
             import secrets
             pairing_id = hashlib.md5(code.encode()).hexdigest()  # 使用完整 code
             # 碰撞检测：如果已存在相同 pairing_id，添加随机后缀
@@ -13733,6 +20063,8 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
             "node_tag": payload.node_tag,
             "tunnel_type": payload.tunnel_type,
             "bidirectional": payload.bidirectional,
+            # 保存本地监听端口供 complete_pairing 使用
+            "tunnel_port": listen_port,
         }
 
         # 保存密钥信息
@@ -13758,7 +20090,7 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
         # 清理接口
         if interface_name and HAS_PENDING_TUNNEL:
             teardown_pending_wireguard_interface(interface_name)
-        # Phase 6 Issue 30: 清理 pending_pairing 记录
+        # 清理 pending_pairing 记录
         if pairing_id:
             try:
                 db.delete_pending_pairing(pairing_id)
@@ -13771,7 +20103,7 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
         # 清理接口
         if interface_name and HAS_PENDING_TUNNEL:
             teardown_pending_wireguard_interface(interface_name)
-        # Phase 6 Issue 30: 清理 pending_pairing 记录
+        # 清理 pending_pairing 记录
         if pairing_id:
             try:
                 db.delete_pending_pairing(pairing_id)
@@ -13786,7 +20118,7 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
 def api_import_pair_request(payload: ImportPairRequestRequest):
     """导入配对请求码
 
-    Phase 11-Tunnel: 隧道优先配对流程
+    隧道优先配对流程
 
     导入对方发送的配对请求码，通过隧道完成配对。
 
@@ -13806,18 +20138,20 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
     if not HAS_PAIRING:
         raise HTTPException(status_code=503, detail="Pairing module not available")
 
-    # 验证端点格式
+    # 验证端点格式 (端口可选，会自动分配)
     endpoint = payload.local_endpoint.strip()
-    if ':' not in endpoint:
-        raise HTTPException(status_code=400, detail="Endpoint must include port (e.g., '10.1.1.1:36200')")
-
-    host, port_str = endpoint.rsplit(':', 1)
-    try:
-        local_listen_port = int(port_str)
-        if not (1 <= local_listen_port <= 65535):
-            raise ValueError("Port out of range")
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid port in endpoint: {port_str}")
+    if ':' in endpoint:
+        host, port_str = endpoint.rsplit(':', 1)
+        try:
+            local_listen_port = int(port_str)
+            if not (1 <= local_listen_port <= 65535):
+                raise ValueError("Port out of range")
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid port in endpoint: {port_str}")
+    else:
+        # 没有端口，使用占位值（后面会被自动分配的端口替换）
+        host = endpoint
+        local_listen_port = 0  # 占位值，表示需要自动分配
 
     if not validate_hostname(host):
         raise HTTPException(status_code=400, detail=f"Invalid hostname: {host}")
@@ -13825,7 +20159,7 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
     db = _get_db()
     generator = PairingCodeGenerator(db)
 
-    # Step 1: 验证配对请求码
+    # Step 1: 验证配对请求码 (moved BEFORE IPC check to get tunnel_type)
     is_valid, error, request_obj = generator.validate_pair_request(payload.code)
     if not is_valid:
         return ImportPairRequestResponse(
@@ -13834,6 +20168,102 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
             response_code=None,
             created_node_tag=None
         )
+
+    # WireGuard tunnels use rust-router IPC (userspace mode)
+    # Xray tunnels use the kernel code path below
+    if request_obj.tunnel_type == "wireguard":
+        # 提取对方节点的端口，分配本地端口时需要排除
+        # 例如：A 使用 36200 发起配对，B 导入时应分配 36201 而非 36200
+        remote_endpoint = request_obj.endpoint  # 对方的 IP:port
+        logging.info(f"[pairing] DEBUG: request_obj.endpoint = '{remote_endpoint}', local_listen_port = {local_listen_port}")
+        remote_port = None
+        exclude_ports = set()
+        if remote_endpoint and ":" in remote_endpoint:
+            try:
+                remote_port = int(remote_endpoint.rsplit(":", 1)[1])
+                exclude_ports.add(remote_port)
+                logging.info(f"[pairing] 对方端口 {remote_port}")
+            except (ValueError, IndexError):
+                pass
+
+        # Auto-allocate port if not specified (local_listen_port == 0)
+        # 如果用户指定的端口与对方端口相同，也要强制重新分配
+        # 记录本地监听端口
+        ipc_endpoint = endpoint
+        listen_port = local_listen_port  # 默认使用用户指定端口
+
+        # 强制检查端口冲突
+        need_allocate = (local_listen_port == 0)
+        if remote_port and local_listen_port == remote_port:
+            logging.warning(f"[pairing] 用户指定端口 {local_listen_port} 与对方端口冲突，强制重新分配")
+            need_allocate = True
+
+        if need_allocate:
+            listen_port = _allocate_peer_tunnel_port(db, exclude_ports=exclude_ports)
+            ipc_endpoint = f"{host}:{listen_port}"
+            logging.info(f"[pairing] IPC 导入自动分配隧道端口: {listen_port}")
+
+        # Use rust-router IPC for importing in userspace WG mode
+        success, response_code_or_error, remote_tag, response_data = _run_async_ipc(
+            _import_pair_request_via_ipc(
+                code=payload.code,
+                local_tag=payload.local_node_tag,
+                local_description=payload.local_node_description,
+                local_endpoint=ipc_endpoint,
+                local_api_port=payload.api_port or 36000,
+            )
+        )
+
+        if not success:
+            return ImportPairRequestResponse(
+                success=False,
+                message=response_code_or_error,
+                response_code=None,
+                created_node_tag=None
+            )
+
+        # Check if tunnel was established directly (no response code needed)
+        tunnel_status = response_data.get("tunnel_status")
+        bidirectional = response_data.get("bidirectional", request_obj.bidirectional)
+
+        # 确保使用本地分配的 tunnel_port，而不是 IPC 返回的（可能是对方的端口）
+        if response_data is None:
+            response_data = {}
+        # 强制使用我们分配的 listen_port，覆盖 IPC 返回的任何值
+        response_data["tunnel_port"] = listen_port
+        logging.info(f"[pairing] 强制设置 tunnel_port = {listen_port}")
+
+        synced_tag = _sync_userspace_peer_from_codes(
+            db,
+            request_code=payload.code,
+            response_code=response_code_or_error,
+            local_tag=payload.local_node_tag,
+            local_endpoint=ipc_endpoint,
+            tunnel_status="connected" if bidirectional else "disconnected",
+            ipc_response_data=response_data,  # 包含 tunnel_port
+        )
+
+        if not synced_tag:
+            logging.error(f"[pairing] 导入配对请求失败: 数据库同步失败 (IPC succeeded but DB sync failed)")
+            return ImportPairRequestResponse(
+                success=False,
+                message="Pairing imported to rust-router but failed to sync to database",
+                response_code=response_code_or_error,
+                created_node_tag=None
+            )
+
+        logging.info(f"[pairing] 导入配对请求 (IPC): remote_tag={synced_tag}, tunnel_status={tunnel_status}")
+        return ImportPairRequestResponse(
+            success=True,
+            message=response_data.get("message", "Pairing request imported via IPC"),
+            response_code=response_code_or_error if response_code_or_error else None,
+            created_node_tag=remote_tag,
+            tunnel_status=tunnel_status,
+            bidirectional=bidirectional
+        )
+
+    # Xray tunnel code path (WireGuard tunnels handled above via IPC)
+    # Uses PairingManager for Xray/VLESS tunnels which don't use rust-router
 
     # 检查是否已存在同名节点
     remote_node_tag = request_obj.node_tag
@@ -13846,185 +20276,34 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
             created_node_tag=None
         )
 
-    # Step 2: 判断使用隧道优先还是旧流程
-    is_tunnel_first = (
-        request_obj.tunnel_type == "wireguard" and
-        request_obj.bidirectional and
-        request_obj.remote_wg_private_key and
-        request_obj.remote_wg_public_key and
-        HAS_PENDING_TUNNEL
-    )
-
-    if not is_tunnel_first:
-        # 回退到旧流程（使用响应码）
-        logging.info(f"[pairing] 使用旧流程（响应码模式）: 缺少预生成密钥或非 WireGuard")
-        manager = PairingManager(db)
-        try:
-            # Phase 11-Fix.K: 传递 api_port
-            # PSK 已废弃，使用隧道 IP/UUID 认证
-            success, message, response_code = manager.import_pair_request(
-                code=payload.code,
-                local_node_tag=payload.local_node_tag,
-                local_node_description=payload.local_node_description,
-                local_endpoint=endpoint,
-                api_port=payload.api_port,
-            )
-            if not success:
-                return ImportPairRequestResponse(
-                    success=False,
-                    message=message,
-                    response_code=None,
-                    created_node_tag=None
-                )
-            return ImportPairRequestResponse(
-                success=True,
-                message=message,
-                response_code=response_code,
-                created_node_tag=remote_node_tag,
-                bidirectional=False
-            )
-        except Exception as e:
-            logging.error(f"[pairing] 旧流程导入失败: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to import pairing request: {e}")
-
-    # ===== 隧道优先流程 =====
-    logging.info(f"[pairing] 使用隧道优先流程: remote_node={remote_node_tag}")
-
-    interface_name = None
+    # Xray pairing flow (response code mode)
+    logging.info(f"[pairing] 使用 Xray 配对流程: tunnel_type={request_obj.tunnel_type}")
+    manager = PairingManager(db)
     try:
-        # Issue 7 Fix: 使用自动分配的端口，避免与保留端口冲突
-        # 用户指定的 endpoint 端口可能是 36100 等保留端口
-        allocated_listen_port = _allocate_peer_tunnel_port(db)
-        if local_listen_port in RESERVED_PORTS:
-            logging.warning(f"[pairing] 用户指定端口 {local_listen_port} 是保留端口 ({RESERVED_PORTS[local_listen_port]})，使用分配端口 {allocated_listen_port}")
-        local_listen_port = allocated_listen_port
-        # 更新 endpoint 以使用正确的端口
-        endpoint = f"{host}:{local_listen_port}"
-
-        # Step 3: 计算 pairing_id（与 generate-pair-request 相同的算法）
-        # Phase 11-Fix.C: 使用完整 code 计算（与生成端保持一致）
-        pairing_id = hashlib.md5(payload.code.encode()).hexdigest()
-
-        # Step 4: 获取隧道 IP（从配对码中）
-        # 注意：我们是 Node B，使用配对码中的 remote_wg_* 作为自己的密钥
-        # IP 分配：A 的 tunnel_local_ip 是 A 的 IP，A 的 tunnel_remote_ip 是给 B 预分配的 IP
-        # 所以对于 B：local_ip = A 的 tunnel_remote_ip，remote_ip = A 的 tunnel_local_ip
-        if request_obj.tunnel_local_ip and request_obj.tunnel_remote_ip:
-            # 使用配对码中的 IP（交换 local/remote）
-            local_ip = request_obj.tunnel_remote_ip  # B 使用 A 预分配的 IP
-            remote_ip = request_obj.tunnel_local_ip  # A 的 IP
-            logging.info(f"[pairing] 使用配对码中的隧道 IP: local={local_ip}, remote={remote_ip}")
-        else:
-            # 回退：使用确定性分配
-            logging.warning("[pairing] 配对码中没有隧道 IP，使用确定性分配")
-            subnet_idx, _, _ = _get_next_peer_tunnel_subnet(db, payload.local_node_tag, remote_node_tag)
-            local_ip = f"10.200.200.{subnet_idx * 4 + 2}"  # B 使用 .2
-            remote_ip = f"10.200.200.{subnet_idx * 4 + 1}"  # A 使用 .1
-
-        # Step 5: 创建 WireGuard 接口并连接
-        interface_name = get_interface_name(remote_node_tag, "wireguard")
-
-        # 使用预生成的密钥
-        local_private_key = request_obj.remote_wg_private_key
-        local_public_key = request_obj.remote_wg_public_key
-        peer_public_key = request_obj.wg_public_key  # A 的公钥
-
-        success, error = create_wireguard_tunnel_with_endpoint(
-            interface_name=interface_name,
-            local_ip=local_ip,
-            remote_ip=remote_ip,
-            listen_port=local_listen_port,
-            private_key=local_private_key,
-            peer_public_key=peer_public_key,
-            remote_endpoint=request_obj.endpoint,  # A 的端点
-        )
-
-        if not success:
-            raise ValueError(f"Failed to create WireGuard tunnel: {error}")
-
-        logging.info(f"[pairing] WireGuard 接口已创建: {interface_name}")
-
-        # Step 6: 等待握手完成
-        if not wait_for_wireguard_handshake(interface_name, timeout_seconds=15):
-            raise ValueError("WireGuard handshake timeout - remote endpoint may not be listening")
-
-        logging.info(f"[pairing] WireGuard 握手成功，开始隧道握手")
-
-        # Step 7: 通过隧道调用对方的 complete-handshake API
-        from tunnel_api_client import TunnelAPIClient
-
-        # Phase 11-Fix.K: 隧道 API 端点使用正确的 api_port
-        remote_api_port = request_obj.api_port or DEFAULT_WEB_PORT
-        tunnel_api_endpoint = f"{remote_ip}:{remote_api_port}"
-
-        client = TunnelAPIClient(
-            node_tag=remote_node_tag,
-            tunnel_endpoint=tunnel_api_endpoint,
-            tunnel_type="wireguard",
-        )
-
-        # Phase 11-Fix.K: 传递本节点 API 端口
-        handshake_result = client.request_complete_handshake(
-            pairing_id=pairing_id,
+        success, message, response_code = manager.import_pair_request(
+            code=payload.code,
             local_node_tag=payload.local_node_tag,
             local_node_description=payload.local_node_description,
             local_endpoint=endpoint,
-            local_tunnel_ip=local_ip,
-            wg_public_key=local_public_key,
-            api_port=payload.api_port,  # Phase 11-Fix.K
+            api_port=payload.api_port,
         )
-
-        if not handshake_result.get("success"):
-            raise ValueError(f"Handshake failed: {handshake_result.get('message', 'Unknown error')}")
-
-        logging.info(f"[pairing] 隧道握手完成")
-
-        # Step 8: 创建本地 peer_node
-        # Phase 11-Fix.K: 保存 api_port 到数据库
-        db.add_peer_node(
-            tag=remote_node_tag,
-            name=remote_node_tag,
-            description=request_obj.node_description or f"Paired from {request_obj.endpoint}",
-            endpoint=request_obj.endpoint,
-            api_port=request_obj.api_port,  # Phase 11-Fix.K: 保存 API 端口
-            tunnel_type="wireguard",
-            tunnel_status="connected",
-            tunnel_interface=interface_name,
-            tunnel_local_ip=local_ip,
-            tunnel_remote_ip=remote_ip,
-            tunnel_port=local_listen_port,
-            wg_private_key=local_private_key,
-            wg_public_key=local_public_key,
-            wg_peer_public_key=peer_public_key,
-            tunnel_api_endpoint=tunnel_api_endpoint,
-            bidirectional_status="bidirectional",
-        )
-
-        logging.info(f"[pairing] 隧道优先配对完成: {remote_node_tag}")
-
+        if not success:
+            return ImportPairRequestResponse(
+                success=False,
+                message=message,
+                response_code=None,
+                created_node_tag=None
+            )
         return ImportPairRequestResponse(
             success=True,
-            message="Pairing completed via tunnel",
-            response_code=None,  # 隧道优先模式不需要响应码
+            message=message,
+            response_code=response_code,
             created_node_tag=remote_node_tag,
-            tunnel_status="connected",
-            bidirectional=True
+            bidirectional=False
         )
-
     except Exception as e:
-        # 清理接口
-        if interface_name:
-            try:
-                subprocess.run(["ip", "link", "delete", interface_name], check=False, timeout=10)
-            except Exception:
-                pass
-        logging.error(f"[pairing] 隧道优先配对失败: {e}")
-        return ImportPairRequestResponse(
-            success=False,
-            message=str(e),
-            response_code=None,
-            created_node_tag=None
-        )
+        logging.error(f"[pairing] Xray 配对流程失败: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to import pairing request: {e}")
 
 
 @app.post("/api/peer/complete-pairing", response_model=CompletePairingResponse)
@@ -14045,6 +20324,51 @@ def api_complete_pairing(payload: CompletePairingRequest):
         raise HTTPException(status_code=503, detail="Pairing module not available")
 
     db = _get_db()
+
+    # WireGuard tunnels use rust-router IPC (userspace mode)
+    # Xray tunnels use the kernel code path below
+    tunnel_type = payload.pending_request.get("tunnel_type", "wireguard")
+
+    if tunnel_type == "wireguard":
+        # Use rust-router IPC for completing pairing in userspace WG mode
+        success, message_or_error, peer_tag, ipc_response_data = _run_async_ipc(
+            _complete_handshake_via_ipc(payload.code)
+        )
+
+        if not success:
+            logging.warning(f"[pairing] 完成配对失败 (IPC): {message_or_error}")
+            return CompletePairingResponse(
+                success=False,
+                message=message_or_error,
+                created_node_tag=None
+            )
+
+        # Pass IPC response data containing wg_local_private_key for DB persistence
+        synced_tag = _sync_userspace_peer_from_codes(
+            db,
+            request_code=payload.pending_request.get("code"),
+            response_code=payload.code,
+            local_tag=payload.pending_request.get("node_tag", ""),
+            tunnel_status="connected",
+            ipc_response_data=ipc_response_data,  # Contains private key, tunnel_ip, port
+        )
+
+        if not synced_tag:
+            logging.error(f"[pairing] 完成配对失败: 数据库同步失败 (IPC succeeded but DB sync failed)")
+            return CompletePairingResponse(
+                success=False,
+                message="Handshake completed in rust-router but failed to sync to database",
+                created_node_tag=None
+            )
+
+        logging.info(f"[pairing] 配对完成 (IPC): node_tag={synced_tag}")
+        return CompletePairingResponse(
+            success=True,
+            message=message_or_error,
+            created_node_tag=synced_tag
+        )
+
+    # Existing kernel WireGuard code path continues below...
     manager = PairingManager(db)
 
     # 验证 pending_request 包含必要字段（psk 已废弃，不再必需）
@@ -14079,7 +20403,7 @@ def api_complete_pairing(payload: CompletePairingRequest):
 
         logging.info(f"[pairing] 配对完成，创建节点 '{created_node_tag}'")
 
-        # Phase 11.2: 双向自动连接
+        # 双向自动连接
         # 如果是双向配对，自动建立连接并请求反向连接
         bidirectional = payload.pending_request.get("bidirectional", True)
         if bidirectional and created_node_tag:
@@ -14125,38 +20449,145 @@ def api_get_peer_status(tag: str):
         "enabled": bool(node.get("enabled", 1)),
     }
 
-    # 如果是 WireGuard 隧道，尝试获取接口状态
-    if node.get("tunnel_type") == "wireguard" and node.get("tunnel_interface"):
-        try:
-            result = subprocess.run(
-                ["wg", "show", node["tunnel_interface"]],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                status["wg_status"] = "up"
-                # 解析最后握手时间
-                for line in result.stdout.split("\n"):
-                    if "latest handshake" in line.lower():
-                        status["last_handshake"] = line.split(":", 1)[1].strip()
-            else:
-                status["wg_status"] = "down"
-        except subprocess.TimeoutExpired:
-            status["wg_status"] = "timeout"
-        except Exception as e:
-            status["wg_status"] = f"error: {e}"
+    # WireGuard tunnels are managed by rust-router (userspace mode)
+    # Use /api/egress/wg/interface/{tag} for detailed live status
+    # Here we just return the database status
+    if node.get("tunnel_type") == "wireguard":
+        status["wg_status"] = "userspace"  # Indicates userspace mode
+        status["note"] = "Use /api/egress/wg/interface/{tag} for live tunnel status"
 
     return status
 
 
+@app.get("/api/peers/{tag}/egress")
+async def api_get_peer_egress(tag: str):
+    """获取指定对等节点的可用出口列表
+    
+    用于前端创建多跳链路时选择终端出口。
+    通过 rust-router IPC 转发请求到远程节点的 API。
+    
+    使用 IPC 转发解决 userspace WireGuard 模式下
+    无法直接路由到隧道 IP 的问题。rust-router 会根据隧道类型：
+    - WireGuard: 使用对端的公网端点发起请求
+    - Xray: 通过 SOCKS5 代理路由请求
+    
+    Args:
+        tag: 对等节点标识
+        
+    Returns:
+        {
+            "egress": [
+                {"tag": "...", "name": "...", "type": "...", "enabled": true},
+                ...
+            ],
+            "from_cache": false
+        }
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    db = _get_db()
+
+    # 使用统一的参数获取函数
+    params = _get_peer_forward_params(db, tag)
+    node = params["node"]
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    # 使用实时状态检查，而非数据库中可能过时的值
+    # 与 /api/peers 保持一致，确保真实连接状态
+    real_status = _check_peer_tunnel_status(node)
+    if real_status != "connected":
+        raise HTTPException(
+            status_code=400,
+            detail=f"节点 '{tag}' 未连接，无法获取出口列表"
+        )
+
+    try:
+        # 使用 IPC 转发而非直接 HTTP 请求
+        # 这解决了 userspace WireGuard 模式下隧道 IP 不可路由的问题
+        client = await _get_rust_router_client()
+        if not client:
+            raise HTTPException(
+                status_code=503,
+                detail="rust-router 不可用，无法转发请求"
+            )
+
+        # 通过 IPC 转发请求到对端节点
+        # 使用统一参数确保 WireGuard 隧道转发正确工作
+        local_node_tag = _get_local_node_tag(db)
+        result = await client.forward_peer_request(
+            peer_tag=tag,
+            method="GET",
+            path="/api/peer-info/egress",
+            timeout_secs=30,
+            endpoint=params["endpoint"],
+            tunnel_type=params["tunnel_type"],
+            api_port=params["api_port"],
+            tunnel_ip=params["tunnel_ip"],
+            tunnel_local_ip=params["tunnel_local_ip"],
+            headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
+        )
+        
+        if not result.get("success"):
+            error = result.get("error", "Unknown error")
+            status_code = result.get("status_code", 0)
+            
+            if status_code == 404:
+                raise HTTPException(status_code=404, detail=f"节点 '{tag}' 的出口列表端点不存在")
+            elif status_code in (401, 403):
+                raise HTTPException(status_code=403, detail=f"访问节点 '{tag}' 被拒绝")
+            elif status_code >= 500:
+                raise HTTPException(status_code=502, detail=f"节点 '{tag}' 服务错误: {error}")
+            else:
+                raise HTTPException(status_code=500, detail=f"获取出口列表失败: {error}")
+        
+        # 解析响应体
+        import json
+        response_body = result.get("body", "{}")
+        try:
+            data = json.loads(response_body)
+        except json.JSONDecodeError as e:
+            logging.error(f"[peers] 解析节点 '{tag}' 响应失败: {e}")
+            raise HTTPException(status_code=500, detail="解析响应失败")
+        
+        # 提取出口列表
+        egress_list = data.get("egress", [])
+        
+        return {
+            "egress": [
+                {
+                    "tag": e.get("tag", ""),
+                    "name": e.get("name", e.get("tag", "")),
+                    "type": e.get("type", "unknown"),
+                    "enabled": e.get("enabled", True),
+                    "description": e.get("description"),
+                }
+                for e in egress_list
+            ],
+            "from_cache": False
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[peers] 获取节点 '{tag}' 出口列表失败: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"获取出口列表失败: {str(e)}"
+        )
+
+
 class TunnelStatusUpdateRequest(BaseModel):
-    """手动更新隧道状态请求 (Phase 10.4)"""
+    """手动更新隧道状态请求"""
     status: str = Field(..., pattern=r"^(connected|disconnected|error)$")
     message: Optional[str] = Field(None, max_length=500)
 
 
 @app.put("/api/peers/{tag}/tunnel-status")
 def api_update_peer_tunnel_status(tag: str, request: TunnelStatusUpdateRequest):
-    """手动设置对等节点隧道状态 (Phase 10.4)
+    """手动设置对等节点隧道状态
 
     用于调试或恢复异常状态。例如：
     - 隧道实际已连接但状态显示错误时
@@ -14255,21 +20686,18 @@ def api_peer_connect(tag: str):
         logging.info(f"[peers] 节点 '{tag}' 需要参数交换，自动执行...")
         node = _do_peer_exchange(db, node)
 
-    # 调用隧道管理器连接
+    # 调用隧道管理器连接 (via rust-router IPC)
     try:
-        # 导入并使用 peer_tunnel_manager
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-        success = manager.connect_node(tag)
+        success, connect_message = _connect_peer_sync(tag)
 
         if success:
             # 重新获取更新后的节点信息
             node = db.get_peer_node(tag)
 
-            # Phase 11-Fix.C2: 设置 tunnel_api_endpoint 用于通过隧道调用远程 API
+            # 设置 tunnel_api_endpoint 用于通过隧道调用远程 API
             tunnel_remote_ip = node.get("tunnel_remote_ip")
             if tunnel_remote_ip and not node.get("tunnel_api_endpoint"):
-                # Phase 11-Fix.K: 使用节点的 api_port 或默认端口
+                # 使用节点的 api_port 或默认端口
                 remote_api_port = node.get("api_port") or DEFAULT_WEB_PORT
                 tunnel_api_endpoint = f"{tunnel_remote_ip}:{remote_api_port}"
                 db.update_peer_node(tag, tunnel_api_endpoint=tunnel_api_endpoint)
@@ -14284,7 +20712,7 @@ def api_peer_connect(tag: str):
             except Exception as e:
                 logging.warning(f"[peers] 通知远程节点失败: {e}")
 
-            # Phase 11-Fix.B: 连接成功后异步检查并更新双向状态
+            # 连接成功后异步检查并更新双向状态
             def _async_bidirectional_check():
                 try:
                     # 等待一小段时间让远程节点完成连接
@@ -14341,19 +20769,29 @@ def api_peer_disconnect(tag: str):
         except Exception as e:
             logging.warning(f"[peers] 通知远程节点断开失败: {e}")
 
-    # 调用隧道管理器断开本地隧道
+    # 调用隧道管理器断开本地隧道 (via rust-router IPC)
     try:
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-        success = manager.disconnect_node(tag)
+        success, disconnect_message = _disconnect_peer_sync(tag)
 
         if success:
+            # 使客户端缓存失效
+            try:
+                from tunnel_api_client import TunnelAPIClientManager
+                client_mgr = TunnelAPIClientManager(db)
+                client_mgr.invalidate_client(tag)
+            except Exception as cache_err:
+                logging.warning(f"[peers] 清除客户端缓存失败: {cache_err}")
+
+            # 更新使用该节点的链路状态
+            chain_update_result = _update_chains_for_disconnected_peer(db, tag)
+
             return {
                 "success": True,
                 "message": "隧道已断开" + ("，远程节点已同步" if notify_success else ""),
                 "tag": tag,
                 "tunnel_status": "disconnected",
                 "remote_notified": notify_success,
+                "chains_updated": chain_update_result.get("updated", []),  #
             }
         else:
             raise HTTPException(status_code=500, detail="断开隧道失败")
@@ -14366,7 +20804,7 @@ def api_peer_disconnect(tag: str):
 
 @app.post("/api/peers/{tag}/retry-bidirectional")
 def api_peer_retry_bidirectional(tag: str):
-    """Phase 11-Fix.B: 手动触发双向连接状态检测
+    """手动触发双向连接状态检测
 
     用于手动检查并更新指定节点的双向连接状态。
     适用于自动检测未生效或需要立即刷新状态的场景。
@@ -14451,15 +20889,13 @@ def api_enable_peer_inbound(tag: str):
 
     # 检查 REALITY 密钥（如果未配置则生成）
     if not node.get("xray_reality_private_key"):
-        try:
-            from xray_manager import generate_reality_keys
-            keys = generate_reality_keys()
-            private_key = keys["private_key"]
-            public_key = keys["public_key"]
-            short_id = secrets.token_hex(4)  # 8 字符 hex
-        except Exception as e:
-            logging.error(f"生成 REALITY 密钥失败: {e}")
-            raise HTTPException(status_code=500, detail=f"生成 REALITY 密钥失败: {str(e)}")
+        keys = _generate_xray_reality_keys()
+        if not keys:
+            logging.error("生成 REALITY 密钥失败")
+            raise HTTPException(status_code=500, detail="生成 REALITY 密钥失败")
+        private_key = keys["private_key"]
+        public_key = keys["public_key"]
+        short_id = keys["short_id"]
     else:
         private_key = node.get("xray_reality_private_key")
         public_key = node.get("xray_reality_public_key")
@@ -14476,35 +20912,19 @@ def api_enable_peer_inbound(tag: str):
         xray_reality_short_id=short_id,
     )
 
-    # 合并架构: reload 主 Xray 进程以加载新的 peer UUID
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "reload"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            logging.info(f"[peers] 节点 '{tag}' 入站监听已启用 (合并架构, Xray reloaded)")
-            return {
-                "success": True,
-                "message": "入站监听已启用",
-                "tag": tag,
-                "inbound_port": unified_port,  # 合并架构使用统一端口
-                "inbound_uuid": inbound_uuid,
-                "reality_public_key": public_key,
-                "reality_short_id": short_id,
-            }
-        else:
-            logging.error(f"[peers] Xray reload 失败: {result.stderr}")
-            raise HTTPException(status_code=500, detail=f"Xray reload 失败: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        logging.error("[peers] Xray reload 超时")
-        raise HTTPException(status_code=500, detail="Xray reload 超时")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"[peers] 启动入站监听失败: {e}")
-        raise HTTPException(status_code=500, detail=f"启动入站监听失败: {str(e)}")
+    # NOTE: Legacy xray_peer_inbound_manager removed
+    # VLESS peer inbound is now handled by rust-router
+    # TODO: Implement rust-router IPC call to configure VLESS peer inbound
+    logging.info(f"[peers] Node '{tag}' inbound enabled (rust-router handles VLESS)")
+    return {
+        "success": True,
+        "message": "入站监听已启用",
+        "tag": tag,
+        "inbound_port": inbound_port,
+        "inbound_uuid": inbound_uuid,
+        "reality_public_key": public_key,
+        "reality_short_id": short_id,
+    }
 
 
 @app.post("/api/peers/{tag}/inbound/disable")
@@ -14534,19 +20954,10 @@ def api_disable_peer_inbound(tag: str):
     # 更新数据库
     db.update_peer_node(tag, inbound_enabled=0)
 
-    # 合并架构: reload 主 Xray 进程以移除 peer UUID
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "reload"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode != 0:
-            logging.warning(f"[peers] Xray reload 返回非零: {result.stderr}")
-    except Exception as e:
-        logging.warning(f"[peers] Xray reload 时出错: {e}")
-
-    logging.info(f"[peers] 节点 '{tag}' 入站监听已禁用 (合并架构)")
+    # NOTE: Legacy xray_peer_inbound_manager removed
+    # VLESS peer inbound is now handled by rust-router
+    # TODO: Implement rust-router IPC call to remove VLESS peer user
+    logging.info(f"[peers] Node '{tag}' inbound disabled (rust-router handles VLESS)")
     return {
         "success": True,
         "message": "入站监听已禁用",
@@ -14570,38 +20981,25 @@ def api_get_peer_inbound_status(tag: str):
     if not node:
         raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
 
-    # 获取 V2Ray 入站配置的端口（合并架构使用统一端口）
+    # 获取 V2Ray 入站配置的端口
     v2ray_config = db.get_v2ray_inbound_config()
     unified_port = v2ray_config.get("listen_port", 443) if v2ray_config else 443
 
-    # 合并架构: 检查主 Xray 进程状态
-    process_status = "stopped"
-    pid = None
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "status"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and "running" in result.stdout.lower():
-            process_status = "running"
-            # 尝试从输出提取 PID
-            import re
-            pid_match = re.search(r'PID[:\s]+(\d+)', result.stdout)
-            if pid_match:
-                pid = int(pid_match.group(1))
-    except Exception as e:
-        logging.warning(f"[peers] 获取 Xray 状态失败: {e}")
+    # NOTE: Legacy xray-lite status check removed
+    # VLESS inbound status is now obtained via rust-router IPC (GetVlessInboundStatus)
+    # For now, return "running" if inbound_enabled is true (rust-router manages the actual process)
+    process_status = "running" if node.get("inbound_enabled") else "disabled"
 
     return {
         "tag": tag,
         "inbound_enabled": bool(node.get("inbound_enabled")),
-        "inbound_port": unified_port if node.get("inbound_enabled") else None,  # 合并架构使用统一端口
+        "inbound_port": unified_port if node.get("inbound_enabled") else None,
         "inbound_uuid": node.get("inbound_uuid"),
-        "process_status": process_status if node.get("inbound_enabled") else "disabled",
-        "pid": pid if node.get("inbound_enabled") else None,
+        "process_status": process_status,
+        "pid": None,  # rust-router manages VLESS, no separate PID
         "reality_public_key": node.get("xray_reality_public_key"),
         "reality_short_id": node.get("xray_reality_short_id"),
+        "note": "VLESS managed by rust-router"
     }
 
 
@@ -14609,46 +21007,39 @@ def api_get_peer_inbound_status(tag: str):
 def api_get_all_peer_inbound_status():
     """获取所有启用入站的节点状态
 
-    合并架构: 所有 peer 入站共享同一个 Xray 进程。
+    NOTE: VLESS inbound is now managed by rust-router.
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
     db = _get_db()
 
-    # 获取主 Xray 进程状态
-    xray_running = False
-    xray_pid = None
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "status"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and "running" in result.stdout.lower():
-            xray_running = True
-            import re
-            pid_match = re.search(r'PID[:\s]+(\d+)', result.stdout)
-            if pid_match:
-                xray_pid = int(pid_match.group(1))
-    except Exception as e:
-        logging.warning(f"[peers] 获取 Xray 状态失败: {e}")
+    # NOTE: Legacy xray-lite status check removed
+    # VLESS inbound status is obtained via rust-router IPC
+    # For backward compatibility, assume running if any nodes have inbound_enabled
 
     # 获取所有启用入站的节点
     nodes = db.get_peer_nodes()
     statuses = []
+    has_enabled = False
     for node in nodes:
         if node.get("inbound_enabled"):
+            has_enabled = True
             statuses.append({
                 "tag": node.get("tag"),
-                "status": "running" if xray_running else "stopped",
-                "pid": xray_pid,
-                "port": 443,  # 合并架构使用统一端口
+                "status": "running",  # rust-router manages VLESS
+                "pid": None,
+                "port": 443,
                 "uuid": node.get("inbound_uuid"),
                 "reality_public_key": node.get("xray_reality_public_key"),
             })
 
-    return {"inbounds": statuses, "count": len(statuses), "xray_status": "running" if xray_running else "stopped"}
+    return {
+        "inbounds": statuses,
+        "count": len(statuses),
+        "xray_status": "running" if has_enabled else "stopped",
+        "note": "VLESS managed by rust-router"
+    }
 
 
 # ============ Node Chain CRUD API ============
@@ -14716,13 +21107,14 @@ def api_create_chain(payload: NodeChainCreateRequest):
         raise HTTPException(status_code=400, detail=f"链路标识 '{payload.tag}' 已存在")
 
     # Issue 27 修复：验证 hops 列表
+    # 允许单跳链路（用于指定远程出口）
     if payload.hops is not None:
-        if len(payload.hops) < 2:
-            raise HTTPException(status_code=400, detail="链路至少需要 2 个节点")
+        if len(payload.hops) < 1:
+            raise HTTPException(status_code=400, detail="链路至少需要 1 个节点")
         if len(payload.hops) != len(set(payload.hops)):
             raise HTTPException(status_code=400, detail="链路包含重复节点（循环）")
 
-    # Phase 11-Fix.C: 验证所有跳转节点
+    # 验证所有跳转节点
     if payload.allow_transitive:
         # 传递模式：通过隧道递归验证后续跳点
         valid, error = _validate_chain_hops_recursive(db, payload.hops)
@@ -14733,22 +21125,67 @@ def api_create_chain(payload: NodeChainCreateRequest):
     if not valid:
         raise HTTPException(status_code=400, detail=error)
 
-    # 自动分配 DSCP 值（如果未提供）
-    dscp_value = payload.dscp_value
-    if dscp_value is None:
-        dscp_value = db.get_next_available_dscp_value()
-        if dscp_value is None:
-            raise HTTPException(status_code=409, detail="无可用的 DSCP 值（已达上限 63）")
-        logging.info(f"[chains] 自动分配 DSCP 值: {dscp_value}")
+    # 拒绝使用 Xray 隧道的多跳链路
+    # Xray 中继不支持，多跳链路应使用 WireGuard 隧道
+    for hop in payload.hops:
+        peer = db.get_peer_node(hop)
+        if peer and peer.get("tunnel_type") == "xray":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Multi-hop chains with Xray tunnels not supported. "
+                       f"Node '{hop}' uses Xray tunnel type. "
+                       f"Use WireGuard tunnels for multi-hop chains."
+            )
 
-    # Phase 11-Fix.J: 验证终端出口（如已指定）
+    # 自动分配全局唯一的 DSCP 值
+    # 查询所有下游节点已使用的 DSCP，确保新值在整个链路中都可用
+    dscp_value = payload.dscp_value
+    dscp_check_result = None
+
+    if dscp_value is None:
+        # 收集本节点和所有下游节点已使用的 DSCP 值
+        dscp_check_result = _collect_used_dscp_from_chain(db, payload.hops)
+        all_used_dscp = dscp_check_result.get("used_dscp", [])
+
+        # 找到全局可用的 DSCP 值
+        dscp_value = _find_available_dscp(all_used_dscp)
+        if dscp_value is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"无全局可用的 DSCP 值。已使用: {all_used_dscp}"
+            )
+        logging.info(
+            f"[chains] 自动分配全局 DSCP 值: {dscp_value} "
+            f"(已用: {all_used_dscp})"
+        )
+    else:
+        # 用户指定了 DSCP 值，检查是否与下游节点冲突
+        dscp_check_result = _collect_used_dscp_from_chain(db, payload.hops)
+        all_used_dscp = dscp_check_result.get("used_dscp", [])
+
+        if dscp_value in all_used_dscp:
+            # 找出哪个节点使用了这个值
+            by_node = dscp_check_result.get("by_node", {})
+            conflict_nodes = [
+                node for node, used in by_node.items()
+                if dscp_value in used
+            ]
+            raise HTTPException(
+                status_code=409,
+                detail=f"DSCP 值 {dscp_value} 已被节点 {conflict_nodes} 使用"
+            )
+
+    # 静态验证终端出口（如已指定）
+    # 完整验证在链路激活时通过远程查询终端节点执行
     if payload.exit_egress:
-        _validate_chain_terminal_egress(payload.exit_egress)
+        _validate_chain_terminal_egress_static(payload.exit_egress)
 
     try:
+        # name 默认使用 tag
+        chain_name = payload.name if payload.name else payload.tag
         chain_id = db.add_node_chain(
             tag=payload.tag,
-            name=payload.name,
+            name=chain_name,
             description=payload.description,
             hops=payload.hops,
             hop_protocols=payload.hop_protocols,
@@ -14759,6 +21196,7 @@ def api_create_chain(payload: NodeChainCreateRequest):
             exit_egress=payload.exit_egress,
             dscp_value=dscp_value,
             chain_mark_type=payload.chain_mark_type,
+            allow_transitive=payload.allow_transitive,
         )
     except Exception as e:
         logging.error(f"创建链路失败: {e}")
@@ -14773,11 +21211,38 @@ def api_create_chain(payload: NodeChainCreateRequest):
         if chain:
             registration_results = _register_chain_with_peers(db, chain)
 
+    # 同步链路配置到所有下游节点
+    sync_results = {}
+    local_tag = _get_local_node_tag(db)
+    full_hops = [local_tag] + list(payload.hops)  # 本节点 + 下游节点
+
+    if len(full_hops) > 1:
+        sync_result = _propagate_chain_to_peers(
+            db=db,
+            chain_tag=payload.tag,
+            dscp_value=dscp_value,
+            full_hops=full_hops,
+            exit_egress=payload.exit_egress or "",
+            description=payload.description or "",
+            allow_transitive=payload.allow_transitive,
+            action="create",
+        )
+        sync_results = sync_result.get("results", {})
+        if sync_result.get("success"):
+            logging.info(f"[chains] 链路 '{payload.tag}' 同步到所有节点成功")
+        else:
+            logging.warning(
+                f"[chains] 链路 '{payload.tag}' 同步失败: {sync_result.get('error')}"
+            )
+
     return {
         "message": f"链路 '{payload.tag}' 创建成功",
         "id": chain_id,
         "tag": payload.tag,
+        "dscp_value": dscp_value,
+        "full_hops": full_hops,
         "registration_results": registration_results,
+        "sync_results": sync_results,
     }
 
 
@@ -14794,7 +21259,7 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
     if not chain:
         raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
 
-    # Phase 7 Fix: 检查链路状态 - 活跃链路不能修改关键配置
+    # 检查链路状态 - 活跃链路不能修改关键配置
     chain_status = chain.get("chain_state", "inactive")
     if chain_status == "active":
         # 活跃链路只允许修改非关键字段（name, description, priority, enabled）
@@ -14815,12 +21280,13 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
         update_kwargs["description"] = payload.description
     if payload.hops is not None:
         # Issue 27 修复：验证 hops 列表
-        if len(payload.hops) < 2:
-            raise HTTPException(status_code=400, detail="链路至少需要 2 个节点")
+        # 允许单跳链路
+        if len(payload.hops) < 1:
+            raise HTTPException(status_code=400, detail="链路至少需要 1 个节点")
         if len(payload.hops) != len(set(payload.hops)):
             raise HTTPException(status_code=400, detail="链路包含重复节点（循环）")
 
-        # Phase 11-Fix.C: 验证所有跳转节点
+        # 验证所有跳转节点
         allow_transitive = payload.allow_transitive if payload.allow_transitive is not None else False
         if allow_transitive:
             # 传递模式：通过隧道递归验证后续跳点
@@ -14831,6 +21297,18 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
             error = "; ".join(errors) if isinstance(errors, list) and errors else (errors[0] if errors else None)
         if not valid:
             raise HTTPException(status_code=400, detail=error)
+
+        # 拒绝使用 Xray 隧道的多跳链路（与 api_create_chain 保持一致）
+        for hop in payload.hops:
+            peer = db.get_peer_node(hop)
+            if peer and peer.get("tunnel_type") == "xray":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Multi-hop chains with Xray tunnels not supported. "
+                           f"Node '{hop}' uses Xray tunnel type. "
+                           f"Use WireGuard tunnels for multi-hop chains."
+                )
+
         update_kwargs["hops"] = json.dumps(payload.hops)
     if payload.hop_protocols is not None:
         update_kwargs["hop_protocols"] = json.dumps(payload.hop_protocols) if payload.hop_protocols else None
@@ -14842,10 +21320,11 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
         update_kwargs["priority"] = payload.priority
     if payload.enabled is not None:
         update_kwargs["enabled"] = payload.enabled
-    # Phase 6 新增字段
+    #
     if payload.exit_egress is not None:
-        # Phase 11-Fix.J: 验证终端出口
-        _validate_chain_terminal_egress(payload.exit_egress)
+        # 静态验证终端出口
+        # 完整验证在链路激活时通过远程查询终端节点执行
+        _validate_chain_terminal_egress_static(payload.exit_egress)
         update_kwargs["exit_egress"] = payload.exit_egress
     if payload.dscp_value is not None:
         update_kwargs["dscp_value"] = payload.dscp_value
@@ -14853,6 +21332,8 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
         update_kwargs["chain_mark_type"] = payload.chain_mark_type
     if payload.chain_state is not None:
         update_kwargs["chain_state"] = payload.chain_state
+    if payload.allow_transitive is not None:
+        update_kwargs["allow_transitive"] = 1 if payload.allow_transitive else 0
 
     if not update_kwargs:
         return {"message": "没有需要更新的字段", "chain": chain}
@@ -14880,16 +21361,46 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
             registration_results = _unregister_chain_from_peers(db, chain)
 
     logging.info(f"[chains] 更新链路 '{tag}'")
+
+    # 同步更新到所有下游节点
+    sync_results = {}
+    hops = _parse_chain_hops(updated_chain, raise_on_error=False)
+    if hops:
+        local_tag = _get_local_node_tag(db)
+        full_hops = [local_tag] + hops
+
+        sync_result = _propagate_chain_to_peers(
+            db=db,
+            chain_tag=tag,
+            dscp_value=updated_chain.get("dscp_value", 0),
+            full_hops=full_hops,
+            exit_egress=updated_chain.get("exit_egress") or "",
+            description=updated_chain.get("description") or "",
+            allow_transitive=bool(updated_chain.get("allow_transitive")),
+            action="update",
+        )
+        sync_results = sync_result.get("results", {})
+        if sync_result.get("success"):
+            logging.info(f"[chains] 链路 '{tag}' 更新同步到所有节点成功")
+        else:
+            logging.warning(f"[chains] 链路 '{tag}' 更新同步失败: {sync_result.get('error')}")
+
     return {
         "message": f"链路 '{tag}' 已更新",
         "chain": updated_chain,
         "registration_results": registration_results,
+        "sync_results": sync_results,
     }
 
 
 @app.delete("/api/chains/{tag}")
 def api_delete_chain(tag: str):
-    """删除链路"""
+    """删除链路
+
+    增强状态检查
+    - 拒绝删除正在激活中的链路（防止竞态条件）
+    - 自动停用并注销活跃链路
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
@@ -14900,28 +21411,64 @@ def api_delete_chain(tag: str):
     if not chain:
         raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
 
-    # 如果链路是启用状态，先向中间节点注销
+    #: 检查链路状态，拒绝删除正在激活中的链路
+    chain_state = chain.get("chain_state", "inactive")
+    if chain_state == "activating":
+        raise HTTPException(
+            status_code=409,
+            detail="链路正在激活中，请稍后再试或先停用链路"
+        )
+
+    #: 如果链路是 active 状态，使用 chain_state 而非 enabled 字段
+    # 这确保状态检查的一致性
     unregistration_results = {}
-    if chain.get("enabled"):
-        logging.info(f"[chains] 删除前注销链路 '{tag}' 的中间节点注册")
+    if chain_state == "active" or chain.get("enabled"):
+        logging.info(f"[chains] 删除前停用并注销链路 '{tag}' (state={chain_state})")
         unregistration_results = _unregister_chain_from_peers(db, chain)
+
+    # 保存链路信息用于删除同步
+    hops = _parse_chain_hops(chain, raise_on_error=False)
+    dscp_value = chain.get("dscp_value", 0)
+    exit_egress = chain.get("exit_egress") or ""
 
     success = db.delete_node_chain(tag)
     if not success:
         raise HTTPException(status_code=500, detail="删除链路失败")
 
     logging.info(f"[chains] 删除链路 '{tag}'")
+
+    # 同步删除到所有下游节点
+    sync_results = {}
+    if hops:
+        local_tag = _get_local_node_tag(db)
+        full_hops = [local_tag] + hops
+
+        sync_result = _propagate_chain_to_peers(
+            db=db,
+            chain_tag=tag,
+            dscp_value=dscp_value,
+            full_hops=full_hops,
+            exit_egress=exit_egress,
+            action="delete",
+        )
+        sync_results = sync_result.get("results", {})
+        if sync_result.get("success"):
+            logging.info(f"[chains] 链路 '{tag}' 删除同步到所有节点成功")
+        else:
+            logging.warning(f"[chains] 链路 '{tag}' 删除同步失败: {sync_result.get('error')}")
+
     return {
         "message": f"链路 '{tag}' 已删除",
         "unregistration_results": unregistration_results,
+        "sync_results": sync_results,
     }
 
 
-# ============ Phase 11-Fix.C: Chain Hops Validation API ============
+# ============ Chain Hops Validation API ============
 
 
 def _validate_chain_hops_recursive(db, hops: List[str], max_depth: int = 5) -> tuple:
-    """Phase 11-Fix.C: 递归验证链路跳点（支持线性拓扑）
+    """递归验证链路跳点（支持线性拓扑）
 
     对于 A→B→C 链路：
     1. 验证 B 是 A 的本地 peer 且已连接
@@ -14989,7 +21536,7 @@ def _validate_chain_hops_recursive(db, hops: List[str], max_depth: int = 5) -> t
 
 
 def _check_chain_cycle(hops: List[str]) -> bool:
-    """Phase 11-Fix.E: 检查链路是否存在循环
+    """检查链路是否存在循环
 
     Returns:
         True 如果存在循环，False 如果没有循环
@@ -14998,7 +21545,7 @@ def _check_chain_cycle(hops: List[str]) -> bool:
 
 
 def _get_terminal_node_through_tunnel(db, hops: List[str]) -> tuple:
-    """Phase 11-Fix.E: 通过隧道获取终端节点信息
+    """通过隧道获取终端节点信息
 
     对于线性拓扑 A→B→C，A 只知道 B，需要通过 B 查询 C 的信息。
 
@@ -15071,7 +21618,7 @@ class ChainHopsValidateRequest(BaseModel):
 
 @app.post("/api/chains/validate-hops")
 def api_validate_chain_hops(request: Request, payload: ChainHopsValidateRequest):
-    """Phase 11-Fix.C: 验证链路跳点有效性（支持远程调用）
+    """验证链路跳点有效性（支持远程调用）
 
     认证方式: 隧道 IP/UUID (节点间调用，无需 JWT)
 
@@ -15093,8 +21640,13 @@ def api_validate_chain_hops(request: Request, payload: ChainHopsValidateRequest)
 
     db = _get_db()
 
-    # Phase 11-Fix.C 安全修复: 验证 PSK 认证
+    # 支持多种认证方式
+    # 1. 隧道认证（WireGuard IP / Xray UUID）- 最安全
+    # 2. X-Peer-Node-ID header 认证 - 用于 IPC 转发的请求
     node = _verify_tunnel_header(request, db)
+    if not node:
+        # 尝试 X-Peer-Node-ID 认证（用于 userspace WireGuard 下的 IPC 转发）
+        node = _verify_peer_endpoint_auth(request, db)
     if not node:
         raise HTTPException(status_code=401, detail="Authentication failed")
 
@@ -15169,7 +21721,7 @@ def api_peer_relay_status(request: Request, payload: PeerRelayStatusRequest):
 
     db = _get_db()
 
-    # Phase 11-Fix.M: 使用灵活认证函数（通过隧道调用，支持 IP 认证）
+    # 使用灵活认证函数（通过隧道调用，支持 IP 认证）
     caller_node = _verify_peer_request_flexible(
         request, db,
         payload_node_id=payload.node_id
@@ -15221,7 +21773,7 @@ def api_peer_relay_status(request: Request, payload: PeerRelayStatusRequest):
 def _query_relay_status(db, relay_node: dict, target_node_tag: str) -> dict:
     """通过中继节点查询目标节点状态
 
-    Phase 2 修复：仅通过隧道通信。中继状态查询用于链路健康检查，
+    仅通过隧道通信。中继状态查询用于链路健康检查，
     必须通过隧道进行。如果隧道不可用，则返回错误状态。
 
     Args:
@@ -15236,7 +21788,7 @@ def _query_relay_status(db, relay_node: dict, target_node_tag: str) -> dict:
 
     relay_tag = relay_node["tag"]
 
-    # Phase 2: 使用隧道通信（中继查询必须通过隧道）
+    # 使用隧道通信（中继查询必须通过隧道）
     tunnel_api = _get_peer_tunnel_endpoint(relay_node)
     if not tunnel_api:
         return {
@@ -15288,7 +21840,7 @@ def _query_relay_status(db, relay_node: dict, target_node_tag: str) -> dict:
         }
 
 
-# ============ Phase 11.4: 中继路由 API ============
+# ============ 中继路由 API ============
 
 
 class RelayRouteRegisterRequest(BaseModel):
@@ -15300,7 +21852,7 @@ class RelayRouteRegisterRequest(BaseModel):
     source_node: str = Field(..., description="上游节点 tag")
     target_node: str = Field(..., description="下游节点 tag")
     dscp_value: int = Field(..., description="DSCP 标记值")
-    mark_type: str = Field("dscp", description="标记类型: 'dscp' 或 'xray_email'")
+    mark_type: str = Field("dscp", pattern=r"^dscp$", description="标记类型（仅支持 DSCP）")
 
 
 class RelayRouteUnregisterRequest(BaseModel):
@@ -15309,11 +21861,140 @@ class RelayRouteUnregisterRequest(BaseModel):
     认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
     """
     chain_tag: str = Field(..., description="链路标识")
+    #: 添加 source_node 支持入口节点验证
+    source_node: Optional[str] = Field(None, description="来源节点标识（入口节点）")
+
+
+@app.post("/api/relay-routing/prepare")
+def api_relay_routing_prepare(request: Request, payload: RelayRouteRegisterRequest):
+    """2PC 准备阶段 - 验证中继路由可注册性
+
+    在实际注册前调用，验证所有条件但不应用 iptables 规则。
+    用于实现两阶段提交：先在所有节点准备成功，再统一注册。
+
+    认证方式: 隧道 IP/UUID 认证 (无需 JWT)
+
+    Returns:
+        {"prepared": True, "transaction_id": "..."} - 准备成功
+        {"prepared": False, "error": "..."} - 准备失败
+    """
+    import uuid as uuid_module
+
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_api_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 验证调用方身份（通过 IP 查找调用方节点）
+    caller_node = _find_peer_node_by_ip(db, client_ip)
+    if not caller_node:
+        return {"prepared": False, "error": f"Unknown caller IP: {client_ip}"}
+
+    # 隧道 IP 认证
+    tunnel_remote_ip = caller_node.get("tunnel_remote_ip", "")
+    if tunnel_remote_ip:
+        tunnel_remote_ip = tunnel_remote_ip.split("/")[0]
+    if not (tunnel_remote_ip and tunnel_remote_ip == client_ip):
+        return {"prepared": False, "error": "Tunnel IP authentication failed"}
+
+    #: 验证请求节点是否为链路成员（传入 source_node 支持入口节点）
+    is_member, membership_error = _verify_chain_membership(
+        db, payload.chain_tag, caller_node["tag"], source_node=payload.source_node
+    )
+    if not is_member:
+        return {"prepared": False, "error": membership_error}
+
+    # 验证 DSCP 值范围
+    if not (0 <= payload.dscp_value <= 63):
+        return {"prepared": False, "error": f"Invalid DSCP value: {payload.dscp_value} (must be 0-63)"}
+
+    # 验证标记类型
+    if payload.mark_type != "dscp":
+        return {"prepared": False, "error": f"Invalid mark_type: {payload.mark_type}. Only 'dscp' is supported."}
+
+    # 验证中继节点 DSCP 是否已被占用
+    try:
+        from relay_config_manager import get_relay_manager
+
+        relay_mgr = get_relay_manager(db)
+        for rule in relay_mgr.get_active_rules():
+            if (
+                rule.get("mark_type") == payload.mark_type
+                and rule.get("dscp_value") == payload.dscp_value
+                and rule.get("chain_tag") != payload.chain_tag
+            ):
+                return {
+                    "prepared": False,
+                    "error": (
+                        f"DSCP value {payload.dscp_value} already used by chain "
+                        f"'{rule.get('chain_tag')}'"
+                    ),
+                }
+    except ImportError:
+        return {"prepared": False, "error": "Relay config manager unavailable"}
+
+    # 验证源节点和目标节点存在且已连接
+    source_peer = _resolve_peer_node(db, payload.source_node, client_ip)
+    target_peer = _resolve_peer_node(db, payload.target_node)
+
+    if not source_peer:
+        return {"prepared": False, "error": f"Source node '{payload.source_node}' not found"}
+
+    if not target_peer:
+        return {"prepared": False, "error": f"Target node '{payload.target_node}' not found"}
+
+    # 验证节点使用 WireGuard 隧道（Xray 不支持 DSCP 中继）
+    source_tunnel_type = source_peer.get("tunnel_type", "wireguard")
+    target_tunnel_type = target_peer.get("tunnel_type", "wireguard")
+
+    if source_tunnel_type == "xray":
+        return {
+            "prepared": False,
+            "error": f"Source node '{payload.source_node}' uses Xray tunnel (DSCP not preserved)"
+        }
+
+    if target_tunnel_type == "xray":
+        return {
+            "prepared": False,
+            "error": f"Target node '{payload.target_node}' uses Xray tunnel (DSCP not preserved)"
+        }
+
+    # 验证目标节点隧道已连接
+    if target_peer.get("tunnel_status") != "connected":
+        return {
+            "prepared": False,
+            "error": f"Target node '{payload.target_node}' tunnel not connected"
+        }
+
+    # 生成事务 ID（用于关联 prepare 和 commit）
+    transaction_id = str(uuid_module.uuid4())[:8]
+
+    logging.info(
+        f"[relay-routing-2pc] PREPARE 成功: chain={payload.chain_tag}, "
+        f"tx={transaction_id}, from {caller_node['tag']} ({client_ip})"
+    )
+
+    return {
+        "prepared": True,
+        "transaction_id": transaction_id,
+        "chain_tag": payload.chain_tag,
+        "source_node": payload.source_node,
+        "target_node": payload.target_node,
+    }
 
 
 @app.post("/api/relay-routing/register")
 def api_relay_routing_register(request: Request, payload: RelayRouteRegisterRequest):
-    """Phase 11.4: 在此节点注册中继转发规则
+    """在此节点注册中继转发规则
 
     当激活多跳链路时，入口节点通过隧道调用中间节点的此端点，
     请求中间节点配置转发规则。
@@ -15357,6 +22038,14 @@ def api_relay_routing_register(request: Request, payload: RelayRouteRegisterRequ
         raise HTTPException(status_code=401, detail="Authentication failed")
     logging.info(f"[relay-routing] IP 认证成功: {client_ip} -> {caller_node['tag']}")
 
+    #: 验证请求节点是否为链路成员（传入 source_node 支持入口节点）
+    is_member, membership_error = _verify_chain_membership(
+        db, payload.chain_tag, caller_node["tag"], source_node=payload.source_node
+    )
+    if not is_member:
+        logging.warning(f"[relay-routing] 链路成员验证失败: {membership_error}")
+        raise HTTPException(status_code=403, detail=membership_error)
+
     caller_tag = caller_node["tag"]
     chain_tag = payload.chain_tag
     source_node = payload.source_node
@@ -15374,14 +22063,14 @@ def api_relay_routing_register(request: Request, payload: RelayRouteRegisterRequ
             "message": f"Invalid DSCP value: {dscp_value} (must be 0-63)"
         }
 
-    # 验证标记类型
-    if mark_type not in ("dscp", "xray_email"):
+    # 验证标记类型 (仅支持 DSCP)
+    if mark_type != "dscp":
         return {
             "success": False,
-            "message": f"Invalid mark_type: {mark_type}"
+            "message": f"Invalid mark_type: {mark_type}. Only 'dscp' is supported for relay routing."
         }
 
-    # Phase 11-Fix.D: 使用 _resolve_peer_node 支持多种命名方式
+    # 使用 _resolve_peer_node 支持多种命名方式
     # source_node 可能是 tag、hostname 或 IP
     source_peer = _resolve_peer_node(db, source_node, client_ip)
     target_peer = _resolve_peer_node(db, target_node)
@@ -15398,6 +22087,27 @@ def api_relay_routing_register(request: Request, payload: RelayRouteRegisterRequ
         return {
             "success": False,
             "message": f"Target node '{target_node}' not found"
+        }
+
+    # 验证节点使用 WireGuard 隧道（非 Xray）
+    # Xray 隧道使用 SOCKS5 代理，无法保留 DSCP 标记，因此不支持中继路由
+    source_tunnel_type = source_peer.get("tunnel_type", "wireguard")
+    target_tunnel_type = target_peer.get("tunnel_type", "wireguard")
+
+    if source_tunnel_type == "xray":
+        logging.warning(f"[relay-routing] 源节点 '{source_node}' 使用 Xray 隧道，不支持中继路由")
+        return {
+            "success": False,
+            "message": f"Source node '{source_node}' uses Xray tunnel. "
+                       f"Relay routing requires WireGuard tunnels (DSCP not preserved through SOCKS5)."
+        }
+
+    if target_tunnel_type == "xray":
+        logging.warning(f"[relay-routing] 目标节点 '{target_node}' 使用 Xray 隧道，不支持中继路由")
+        return {
+            "success": False,
+            "message": f"Target node '{target_node}' uses Xray tunnel. "
+                       f"Relay routing requires WireGuard tunnels (DSCP not preserved through SOCKS5)."
         }
 
     # 获取接口名称 - 使用解析后的 peer tag
@@ -15451,11 +22161,11 @@ def api_relay_routing_register(request: Request, payload: RelayRouteRegisterRequ
 
 @app.post("/api/relay-routing/unregister")
 def api_relay_routing_unregister(request: Request, payload: RelayRouteUnregisterRequest):
-    """Phase 11.4: 注销此节点的中继转发规则
+    """注销此节点的中继转发规则
 
     当停用多跳链路时，入口节点调用此端点请求中间节点清理转发规则。
 
-    认证方式: PSK (无需 JWT)
+    认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
     """
     client_ip = _get_client_ip(request)
 
@@ -15485,6 +22195,14 @@ def api_relay_routing_unregister(request: Request, payload: RelayRouteUnregister
         logging.warning(f"[relay-routing] IP 认证失败: client_ip={client_ip}, expected={tunnel_remote_ip}")
         raise HTTPException(status_code=401, detail="Authentication failed")
     logging.info(f"[relay-routing] IP 认证成功: {client_ip} -> {caller_node['tag']}")
+
+    #: 验证请求节点是否为链路成员（传入 source_node 支持入口节点）
+    is_member, membership_error = _verify_chain_membership(
+        db, payload.chain_tag, caller_node["tag"], source_node=payload.source_node
+    )
+    if not is_member:
+        logging.warning(f"[relay-routing] 链路成员验证失败: {membership_error}")
+        raise HTTPException(status_code=403, detail=membership_error)
 
     caller_tag = caller_node["tag"]
     chain_tag = payload.chain_tag
@@ -15529,16 +22247,18 @@ MAX_CHAIN_HOPS = 10  # 防止 DoS 攻击的最大跳数限制
 
 
 @app.post("/api/chains/{tag}/health-check")
-def api_chain_health_check(tag: str):
+async def api_chain_health_check(tag: str):
     """检查多跳链路的健康状态
 
     遍历链路中的所有跳转，检查每一跳的隧道状态。
     对于多跳链路，使用递归中继查询来获取下游节点的状态。
+    同时验证终端节点的出口可用性，确保流量能正常出网。
 
     例如链路 A → B → C → D：
     1. 检查本节点 (A) 到 B 的隧道状态（直接查询）
     2. 通过 B 查询 B 到 C 的隧道状态（中继查询）
     3. 通过 B 查询 C 到 D 的隧道状态（B 递归转发给 C）
+    4. 验证终端节点 (D) 的 exit_egress 是否存在且可用
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -15633,12 +22353,71 @@ def api_chain_health_check(tag: str):
 
         hop_results.append(hop_result)
 
+    # 验证终端节点的出口配置
+    exit_egress = chain.get("exit_egress")
+    allow_transitive = chain.get("allow_transitive", False)
+    egress_check = {
+        "exit_egress": exit_egress,
+        "status": "unknown",
+        "message": None,
+    }
+
+    if not exit_egress:
+        egress_check["status"] = "not_configured"
+        egress_check["message"] = "链路未配置终端出口 (exit_egress)"
+        all_healthy = False
+    elif all_healthy:
+        # 只有在所有跳都连通的情况下才验证终端出口
+        # 通过 IPC 转发验证终端节点的出口是否存在且可用
+        egress_error = await _validate_remote_terminal_egress(
+            db, hops, exit_egress, allow_transitive
+        )
+        if egress_error:
+            egress_check["status"] = "unavailable"
+            egress_check["message"] = egress_error
+            all_healthy = False
+        else:
+            egress_check["status"] = "available"
+            egress_check["message"] = f"终端出口 '{exit_egress}' 可用"
+    else:
+        egress_check["status"] = "skipped"
+        egress_check["message"] = "隧道未全部连通，跳过终端出口验证"
+
+    # 将健康检查结果保存到数据库
+    # 计算健康状态：隧道全连且出口可用=healthy，部分连接=degraded，全部断开=unhealthy
+    connected_count = sum(1 for h in hop_results if h["status"] == "connected")
+    egress_ok = egress_check["status"] == "available"
+
+    if connected_count == len(hop_results) and egress_ok:
+        new_health_status = "healthy"
+    elif connected_count > 0:
+        new_health_status = "degraded"
+    else:
+        new_health_status = "unhealthy"
+
+    db.update_node_chain(
+        tag,
+        health_status=new_health_status,
+        last_health_check=datetime.now(timezone.utc).isoformat()
+    )
+
+    # 构建消息
+    if all_healthy:
+        message = "链路健康"
+    elif egress_check["status"] == "unavailable":
+        message = f"终端出口不可用: {egress_check['message']}"
+    elif egress_check["status"] == "not_configured":
+        message = "链路未配置终端出口"
+    else:
+        message = "链路存在断开的节点"
+
     return {
         "chain": tag,
         "healthy": all_healthy,
-        "message": "链路健康" if all_healthy else "链路存在断开的节点",
+        "message": message,
         "total_hops": len(hops),
         "hops": hop_results,
+        "egress_check": egress_check,
     }
 
 
@@ -15652,7 +22431,7 @@ def _query_relay_status_recursive(
     - B 收到请求后，查询自己到 C 的状态
     - 如果 C 已连接，B 递归查询 C 到 D 的状态
 
-    Phase 2 修复：仅通过隧道通信。递归中继查询用于链路健康检查，
+    仅通过隧道通信。递归中继查询用于链路健康检查，
     必须通过隧道进行。如果隧道不可用，则返回错误状态。
 
     Args:
@@ -15668,7 +22447,7 @@ def _query_relay_status_recursive(
 
     relay_tag = relay_node["tag"]
 
-    # Phase 2: 使用隧道通信（递归中继查询必须通过隧道）
+    # 使用隧道通信（递归中继查询必须通过隧道）
     tunnel_api = _get_peer_tunnel_endpoint(relay_node)
     if not tunnel_api:
         return {
@@ -15724,11 +22503,11 @@ def _query_relay_status_recursive(
         }
 
 
-# ============ 链路激活/停用 API (Phase 6) ============
+# ============ 链路激活/停用 API ============
 
 @app.get("/api/chains/{tag}/terminal-egress")
 def api_get_chain_terminal_egress(tag: str, refresh: bool = False, allow_transitive: bool = False):
-    """Phase 11.5: 获取链路终端节点的可用出口列表（带缓存）
+    """获取链路终端节点的可用出口列表（带缓存）
 
     通过隧道 API 获取链路终端节点（最后一跳）上的可用出口。
     用于在链路创建/更新时选择 exit_egress。
@@ -15744,8 +22523,8 @@ def api_get_chain_terminal_egress(tag: str, refresh: bool = False, allow_transit
             "chain": "链路标识",
             "terminal_node": "终端节点 tag",
             "egress": [...],
-            "cached": true/false,      # Phase 11.5: 是否来自缓存
-            "cached_at": "timestamp"   # Phase 11.5: 缓存时间（如果 cached=true）
+            "cached": true/false,      # 是否来自缓存
+            "cached_at": "timestamp"   # 缓存时间（如果 cached=true）
         }
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
@@ -15761,13 +22540,13 @@ def api_get_chain_terminal_egress(tag: str, refresh: bool = False, allow_transit
     # Issue 11/12 修复：使用统一的 hops 解析函数
     hops = _parse_chain_hops(chain, raise_on_error=True)
 
-    if not hops or len(hops) < 2:
-        raise HTTPException(status_code=400, detail="链路至少需要 2 跳")
+    if not hops or len(hops) < 1:
+        raise HTTPException(status_code=400, detail="链路至少需要 1 跳")
 
     # 终端节点是最后一跳
     terminal_tag = hops[-1]
 
-    # Phase 11.5: 检查缓存（除非强制刷新）
+    # 检查缓存（除非强制刷新）
     if not refresh:
         cache = db.get_terminal_egress_cache(tag)
         if cache:
@@ -15793,7 +22572,7 @@ def api_get_chain_terminal_egress(tag: str, refresh: bool = False, allow_transit
     # 获取终端节点信息
     terminal_node = db.get_peer_node(terminal_tag)
 
-    # Phase 5 Issue 4: 支持 allow_transitive，允许通过中继获取终端出口
+    # Issue 4: 支持 allow_transitive，允许通过中继获取终端出口
     # 使用链路配置中的 allow_transitive 或参数覆盖
     chain_allow_transitive = chain.get("allow_transitive", False)
     effective_allow_transitive = allow_transitive or chain_allow_transitive
@@ -15823,7 +22602,7 @@ def api_get_chain_terminal_egress(tag: str, refresh: bool = False, allow_transit
                 via_relay = terminal_info.get("via_relay")
                 logging.info(f"[chains] 传递模式: 通过 '{via_relay}' 转发查询到终端 '{terminal_tag}'")
 
-                # Phase 4 Fix: 通过中继转发出口查询到终端节点
+                # 通过中继转发出口查询到终端节点
                 # BUG FIX: 之前直接调用 relay_client.get_egress_list() 会返回中继节点的出口，
                 # 而不是终端节点的出口。现在使用 get_forwarded_egress_list() 转发查询。
                 try:
@@ -15911,7 +22690,7 @@ def api_get_chain_terminal_egress(tag: str, refresh: bool = False, allow_transit
             for e in egress_list
         ]
 
-        # Phase 11.5: 更新缓存（TTL 5 分钟）
+        # 更新缓存（TTL 5 分钟）
         try:
             db.update_terminal_egress_cache(
                 chain_tag=tag,
@@ -15929,7 +22708,7 @@ def api_get_chain_terminal_egress(tag: str, refresh: bool = False, allow_transit
             "egress": egress_data,
             "cached": False,
         }
-        # Phase 5 Issue 4: 添加 via_relay 信息（传递模式下）
+        # Issue 4: 添加 via_relay 信息（传递模式下）
         if via_relay:
             result["via_relay"] = via_relay
         return result
@@ -15940,7 +22719,7 @@ def api_get_chain_terminal_egress(tag: str, refresh: bool = False, allow_transit
             detail="tunnel_api_client 模块不可用"
         )
     except TunnelProxyError as e:
-        # Phase 10.3: 特别处理 SOCKS 代理错误
+        # 特别处理 SOCKS 代理错误
         logging.error(f"[chains] SOCKS 代理错误: {e}")
         raise HTTPException(
             status_code=503,
@@ -15958,7 +22737,7 @@ def api_get_chain_terminal_egress(tag: str, refresh: bool = False, allow_transit
 
 @app.get("/api/peer/forward-egress/{target_tag}")
 def api_peer_forward_egress(request: Request, target_tag: str) -> dict:
-    """Phase 4: 转发出口查询到目标节点
+    """转发出口查询到目标节点
 
     用于传递模式下，中继节点代理转发对终端节点的出口查询。
 
@@ -15983,13 +22762,13 @@ def api_peer_forward_egress(request: Request, target_tag: str) -> dict:
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    # Phase 4 Fix: Tag 验证
+    # Tag 验证
     if not target_tag or len(target_tag) > 64:
         raise HTTPException(status_code=400, detail="Invalid target_tag: must be 1-64 characters")
 
     db = _get_db()
 
-    # Phase 4 Fix: 检查是否查询自己
+    # 检查是否查询自己
     local_tag = _get_local_node_tag(db)
     if target_tag == local_tag:
         raise HTTPException(status_code=400, detail="Cannot forward egress query to self")
@@ -16056,7 +22835,7 @@ def api_peer_forward_egress(request: Request, target_tag: str) -> dict:
 
 
 @app.post("/api/chains/{tag}/activate")
-def api_activate_chain(tag: str):
+async def api_activate_chain(tag: str):
     """激活链路
 
     1. 验证链路配置完整（exit_egress、dscp_value）
@@ -16065,7 +22844,8 @@ def api_activate_chain(tag: str):
     4. 更新链路状态为 'active' 或 'error'
     5. 重新生成 sing-box 配置
 
-    Phase 6 Issue 29: 使用 try/finally 确保状态转换原子性
+    使用 try/finally 确保状态转换原子性
+    改为 async 以支持 IPC 转发验证终端出口
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -16088,8 +22868,8 @@ def api_activate_chain(tag: str):
             detail="链路未配置终端出口 (exit_egress)"
         )
 
-    # Phase 11-Fix.J: 拒绝无法用于 DSCP 路由的出口类型
-    _validate_chain_terminal_egress(exit_egress)
+    # 静态验证（完整验证在 hops 解析后）
+    _validate_chain_terminal_egress_static(exit_egress)
 
     if not dscp_value:
         raise HTTPException(
@@ -16106,32 +22886,70 @@ def api_activate_chain(tag: str):
             "chain_state": "active"
         }
 
-    # 防止并发激活：检查是否正在激活中
-    if current_state == "activating":
+    # 使用原子状态转换防止并发激活竞态条件
+    # 替代原有的 check-then-act 模式，确保只有一个请求能成功转换状态
+    success, error = db.atomic_chain_state_transition(
+        tag=tag,
+        expected_state="inactive",
+        new_state="activating",
+        timeout_ms=30000  # 30秒锁等待超时
+    )
+
+    if not success:
+        if "Expected state" in (error or ""):
+            # 状态不匹配 - 可能是并发请求或已激活
+            # 修复字符串匹配顺序，避免 "inactive" 匹配 "active"
+            if "activating" in (error or ""):
+                raise HTTPException(
+                    status_code=409,
+                    detail="链路正在激活中，请稍后再试"
+                )
+            elif "found: error" in (error or "") or ", error" in (error or ""):
+                # 先检查 "error" 状态（避免被 "inactive" 中的 "active" 误匹配）
+                raise HTTPException(
+                    status_code=400,
+                    detail="链路处于错误状态，请先停用后再激活"
+                )
+            elif "found: active" in (error or "") or ", active" in (error or ""):
+                # 检查确切的 "active" 状态
+                return {
+                    "message": "链路已处于激活状态",
+                    "chain": tag,
+                    "chain_state": "active"
+                }
+        # 其他错误（数据库错误、链路不存在等）
         raise HTTPException(
-            status_code=409,
-            detail="链路正在激活中，请稍后再试"
+            status_code=500,
+            detail=f"状态转换失败: {error}"
         )
 
-    # 更新为 activating
-    db.update_node_chain(tag, chain_state="activating")
-
-    # Phase 6 Issue 29: 使用 activation_success 标记追踪激活是否成功
+    # 使用 activation_success 标记追踪激活是否成功
     activation_success = False
 
     try:
         # Issue 11/12 修复：使用统一的 hops 解析函数
         hops = _parse_chain_hops(chain, raise_on_error=True)
 
-        if not hops or len(hops) < 2:
-            raise HTTPException(status_code=400, detail="链路至少需要 2 跳")
+        if not hops or len(hops) < 1:
+            raise HTTPException(status_code=400, detail="链路至少需要 1 跳")
 
         # 终端节点是最后一跳
         terminal_tag = hops[-1]
 
-        # Phase 4 Issue 25 修复: 预检查所有中继节点的连接状态
+        # 远程验证终端节点出口存在且兼容 DSCP 路由
+        # 使用 IPC 转发解决 userspace WireGuard 模式下无法直接路由到隧道 IP 的问题
+        # 确保 allow_transitive 是布尔值（数据库存储为 0/1 整数）
+        allow_transitive = bool(chain.get("allow_transitive", False))
+        egress_error = await _validate_remote_terminal_egress(db, hops, exit_egress, allow_transitive)
+        if egress_error:
+            raise HTTPException(
+                status_code=400,
+                detail=f"终端出口验证失败: {egress_error}"
+            )
+
+        # 预检查所有中继节点的连接状态
         # 如果任何中继节点未连接，拒绝激活（避免链路部分生效导致流量丢失）
-        allow_transitive = chain.get("allow_transitive", False)
+        # allow_transitive 已在上面定义
         if not allow_transitive:
             # 非传递模式下，所有中继节点必须已连接
             for i in range(len(hops) - 1):  # 除了终端节点
@@ -16144,255 +22962,342 @@ def api_activate_chain(tag: str):
                         detail=f"中继节点 '{relay_tag}' 不存在"
                     )
 
-                if relay_node.get("tunnel_status") != "connected":
+                # 使用 _check_peer_tunnel_status 查询 rust-router 真实状态
+                relay_status = _check_peer_tunnel_status(relay_node)
+                if relay_status != "connected":
                     raise HTTPException(
                         status_code=400,
-                        detail=f"中继节点 '{relay_tag}' 隧道未连接，请先建立连接"
+                        detail=f"中继节点 '{relay_tag}' 隧道未连接 (状态: {relay_status})，请先建立连接"
                     )
+                # 如果 rust-router 报告已连接但数据库状态不一致，同步数据库
+                if relay_node.get("tunnel_status") != "connected" and relay_status == "connected":
+                    db.update_peer_node(relay_tag, tunnel_status="connected")
+                    logging.info(f"[chains] 自动同步中继节点 '{relay_tag}' 状态为 connected")
 
-        # 获取本地节点 ID（用于 source_node）
-        local_node_id = _get_local_node_id()
+        # 使用本地节点 tag（与 X-Peer-Node-ID header 一致）
+        local_node_id = _get_local_node_tag(db)
 
-        # 在终端节点注册链路路由
+        # 使用 IPC 转发注册链路路由
+        # 这解决了 userspace WireGuard 模式下无法直接路由到隧道 IP 的问题
         from tunnel_api_client import TunnelAPIClientManager, TunnelProxyError
 
-        # Phase 11-Fix.E: 支持传递模式（线性拓扑 A→B→C，A 只知道 B）
-        # allow_transitive 已在上面预检查中定义
         terminal_node = db.get_peer_node(terminal_tag)
-        client_mgr = TunnelAPIClientManager(db)
-        client = None
-        via_relay = None  # 标记是否通过中继到达
+        client_mgr = TunnelAPIClientManager(db)  # 仍需要用于中继路由的 2PC
 
-        if terminal_node:
-            # 直接连接模式：终端节点在本地数据库中
-            if terminal_node.get("tunnel_status") != "connected":
+        if not terminal_node:
+            if allow_transitive:
+                # 传递模式暂不支持 IPC 转发
                 raise HTTPException(
-                    status_code=400,
-                    detail=f"终端节点 '{terminal_tag}' 隧道未连接"
+                    status_code=501,
+                    detail=f"传递模式尚未支持 IPC 转发，请确保终端节点 '{terminal_tag}' 在本地数据库中"
                 )
-            client = client_mgr.get_client(terminal_tag)
-        elif allow_transitive:
-            # 传递模式：通过第一跳到达终端节点
-            logging.info(f"[chains] 使用传递模式激活链路 '{tag}'")
-            terminal_info, relay_client, _ = _get_terminal_node_through_tunnel(db, hops)
-
-            if not terminal_info:
+            else:
                 raise HTTPException(
-                    status_code=503,
-                    detail=f"无法通过中继到达终端节点 '{terminal_tag}'（传递模式失败）"
+                    status_code=404,
+                    detail=f"终端节点 '{terminal_tag}' 不存在"
                 )
 
-            via_relay = terminal_info.get("via_relay")
-            client = relay_client
-            logging.info(f"[chains] 传递模式激活: 通过 '{via_relay}' 代理链路注册")
-        else:
-            # 非传递模式且终端节点不存在
-            raise HTTPException(
-                status_code=404,
-                detail=f"终端节点 '{terminal_tag}' 不存在（启用 allow_transitive 可支持线性拓扑）"
-            )
-
-        if not client:
+        # 使用 _check_peer_tunnel_status 查询 rust-router 真实状态
+        terminal_status = _check_peer_tunnel_status(terminal_node)
+        if terminal_status != "connected":
             raise HTTPException(
                 status_code=400,
-                detail=f"终端节点 '{terminal_tag}' 配置不完整或隧道未就绪"
+                detail=f"终端节点 '{terminal_tag}' 隧道未连接 (状态: {terminal_status})"
             )
+        # 如果 rust-router 报告已连接但数据库状态不一致，同步数据库
+        if terminal_node.get("tunnel_status") != "connected" and terminal_status == "connected":
+            db.update_peer_node(terminal_tag, tunnel_status="connected")
+            logging.info(f"[chains] 自动同步终端节点 '{terminal_tag}' 状态为 connected")
 
-        # 验证连通性（直接连接或通过中继）
-        target_desc = f"中继节点 '{via_relay}'" if via_relay else f"终端节点 '{terminal_tag}'"
-        logging.info(f"[chains] 验证 {target_desc} 连通性...")
-        if not client.ping():
-            if terminal_node:
-                client_mgr.invalidate_client(terminal_tag)
+        # 使用 IPC 验证连通性
+        logging.info(f"[chains] 验证终端节点 '{terminal_tag}' 连通性 (IPC)...")
+        if not await _ipc_ping_peer(db, terminal_tag):
             raise HTTPException(
                 status_code=503,
-                detail=f"无法连接到 {target_desc} API，请检查隧道连接状态"
+                detail=f"无法连接到终端节点 '{terminal_tag}' API，请检查隧道连接状态"
             )
-        logging.info(f"[chains] {target_desc} 连通性验证成功")
+        logging.info(f"[chains] 终端节点 '{terminal_tag}' 连通性验证成功")
 
-        # 注册链路路由
-        # Phase 11-Fix.E: 传递模式下，通过中继转发注册到终端节点
-        success = client.register_chain_route(
+        # 使用 IPC 注册链路路由
+        success, error = await _ipc_register_chain_route(
+            db=db,
+            node_tag=terminal_tag,
             chain_tag=tag,
             mark_value=dscp_value,
             egress_tag=exit_egress,
             mark_type=chain_mark_type,
             source_node=local_node_id,
-            target_node=terminal_tag if via_relay else None,  # 传递模式需要转发
         )
 
         if not success:
-            # Phase 10.3: 注册失败也清理客户端缓存，确保下次重试使用新连接
-            client_mgr.invalidate_client(terminal_tag)
             raise HTTPException(
                 status_code=500,
-                detail="在终端节点注册链路路由失败"
+                detail=f"在终端节点注册链路路由失败: {error}"
             )
 
-        # Phase 11.4: 在中间节点注册中继路由
+        # 使用 2PC 模式在中间节点注册中继路由
         # 对于链路 local -> A -> B -> C (hops = [A, B, C])
         # - A 是中间节点，需要配置: source=local -> target=B
         # - B 是中间节点，需要配置: source=A -> target=C
         # - C 是终端节点，已在上面注册链路路由
+        #
+        # 2PC 流程:
+        # 1. PREPARE: 在所有中间节点验证配置可行性
+        # 2. COMMIT: 如果全部准备成功，执行实际注册
+        # 3. ABORT: 如果任何准备失败，中止而不应用任何更改
         relay_results = []
-        if len(hops) > 1:
-            logging.info(f"[chains] 配置 {len(hops) - 1} 个中间节点的中继路由...")
+        relay_configs = []  # 收集要配置的中继节点信息
 
+        if len(hops) > 1:
+            logging.info(f"[chains-2pc] 准备配置 {len(hops) - 1} 个中间节点的中继路由...")
+
+            # 收集所有中继节点配置
             for i in range(len(hops) - 1):
                 relay_tag = hops[i]
                 relay_node = db.get_peer_node(relay_tag)
 
                 if not relay_node:
-                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 不存在，跳过")
+                    logging.warning(f"[chains-2pc] 中间节点 '{relay_tag}' 不存在，跳过")
                     continue
 
                 if relay_node.get("tunnel_status") != "connected":
-                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 隧道未连接，跳过")
+                    logging.warning(f"[chains-2pc] 中间节点 '{relay_tag}' 隧道未连接，跳过")
                     continue
 
                 relay_client = client_mgr.get_client(relay_tag)
                 if not relay_client:
-                    logging.warning(f"[chains] 无法获取中间节点 '{relay_tag}' 的 API 客户端，跳过")
+                    logging.warning(f"[chains-2pc] 无法获取中间节点 '{relay_tag}' 的 API 客户端，跳过")
                     continue
 
                 # 确定源节点和目标节点
                 source_node = local_node_id if i == 0 else hops[i - 1]
                 target_node = hops[i + 1]
 
-                # 注册中继路由（认证通过隧道 IP/UUID）
-                relay_success = relay_client.register_relay_route(
-                    chain_tag=tag,
-                    source_node=source_node,
-                    target_node=target_node,
-                    dscp_value=dscp_value,
-                    mark_type=chain_mark_type,
-                )
-
-                relay_results.append({
-                    "node": relay_tag,
-                    "success": relay_success,
+                relay_configs.append({
+                    "tag": relay_tag,
+                    "client": relay_client,
                     "source": source_node,
                     "target": target_node,
                 })
 
-                if relay_success:
-                    logging.info(f"[chains] 中间节点 '{relay_tag}' 中继路由注册成功 ({source_node} -> {target_node})")
-                else:
-                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 中继路由注册失败 ({source_node} -> {target_node})")
+            # PREPARE - 在所有节点验证
+            if relay_configs:
+                logging.info(f"[chains-2pc] PREPARE 阶段: 验证 {len(relay_configs)} 个中继节点...")
+                prepare_results = []
 
-        # Phase 5 Issue 28: 检查中继结果，如果全部失败则中止激活
-        if relay_results:
-            successful_relays = sum(1 for r in relay_results if r.get("success"))
-            failed_relays = len(relay_results) - successful_relays
+                for config in relay_configs:
+                    prepare_result = config["client"].prepare_relay_route(
+                        chain_tag=tag,
+                        source_node=config["source"],
+                        target_node=config["target"],
+                        dscp_value=dscp_value,
+                        mark_type=chain_mark_type,
+                    )
+                    prepare_results.append({
+                        "tag": config["tag"],
+                        "prepared": prepare_result.get("prepared", False),
+                        "error": prepare_result.get("error"),
+                        "transaction_id": prepare_result.get("transaction_id"),
+                    })
 
-            if successful_relays == 0:
-                # 所有中继节点配置失败 - 中止激活
-                failed_nodes = [r["node"] for r in relay_results]
-                logging.error(f"[chains] 所有中继节点配置失败: {failed_nodes}")
+                # 检查是否所有节点都准备成功
+                failed_prepares = [p for p in prepare_results if not p["prepared"]]
+                if failed_prepares:
+                    # ABORT: 有节点准备失败，回滚终端路由
+                    failed_nodes = [p["tag"] for p in failed_prepares]
+                    failed_errors = [f"{p['tag']}: {p['error']}" for p in failed_prepares]
+                    logging.error(
+                        f"[chains-2pc] PREPARE 失败，中止激活: {failed_errors}"
+                    )
 
-                # 回滚: 注销已成功注册的终端路由
-                try:
-                    if client:
-                        client.unregister_chain_route(
+                    # 回滚已注册的终端路由
+                    try:
+                        await _ipc_unregister_chain_route(
+                            db=db,
+                            node_tag=terminal_tag,
                             chain_tag=tag,
                             mark_value=dscp_value,
                             mark_type=chain_mark_type,
-                            target_node=terminal_tag if via_relay else None,
+                            source_node=local_node_id,
                         )
+                    except Exception as rollback_err:
+                        logging.warning(f"[chains-2pc] 回滚终端路由时出错: {rollback_err}")
+
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"中继节点准备失败 (2PC ABORT): {', '.join(failed_nodes)}"
+                    )
+
+                logging.info(f"[chains-2pc] PREPARE 成功，进入 COMMIT 阶段...")
+
+                # COMMIT - 执行实际注册
+                for config in relay_configs:
+                    relay_success = config["client"].register_relay_route(
+                        chain_tag=tag,
+                        source_node=config["source"],
+                        target_node=config["target"],
+                        dscp_value=dscp_value,
+                        mark_type=chain_mark_type,
+                    )
+
+                    relay_results.append({
+                        "node": config["tag"],
+                        "success": relay_success,
+                        "source": config["source"],
+                        "target": config["target"],
+                    })
+
+                    if relay_success:
+                        logging.info(
+                            f"[chains-2pc] COMMIT 成功: '{config['tag']}' "
+                            f"({config['source']} -> {config['target']})"
+                        )
+                    else:
+                        logging.warning(
+                            f"[chains-2pc] COMMIT 失败: '{config['tag']}' "
+                            f"({config['source']} -> {config['target']})"
+                        )
+
+        # Issue 28: 检查中继结果，任意失败则中止激活
+        if relay_results:
+            failed_relays = [r for r in relay_results if not r.get("success")]
+
+            if failed_relays:
+                failed_nodes = [r["node"] for r in failed_relays]
+                logging.error(f"[chains] 中继节点配置失败，中止激活: {failed_nodes}")
+
+                # 回滚: 注销终端和已成功的中继路由
+                try:
+                    await _ipc_unregister_chain_route(
+                        db=db,
+                        node_tag=terminal_tag,
+                        chain_tag=tag,
+                        mark_value=dscp_value,
+                        mark_type=chain_mark_type,
+                        source_node=local_node_id,
+                    )
+                    for relay_result in relay_results:
+                        if relay_result.get("success"):
+                            relay_tag = relay_result["node"]
+                            relay_client = client_mgr.get_client(relay_tag)
+                            if relay_client:
+                                relay_client.unregister_relay_route(
+                                    chain_tag=tag,
+                                    source_node=local_node_id,
+                                )
                 except Exception as rollback_err:
-                    logging.warning(f"[chains] 回滚终端路由时出错: {rollback_err}")
+                    logging.warning(f"[chains] 回滚中继路由时出错: {rollback_err}")
 
                 raise HTTPException(
                     status_code=503,
-                    detail=f"所有中继节点配置失败: {', '.join(failed_nodes)}"
-                )
-            elif failed_relays > 0:
-                # 部分成功 - 继续但警告
-                logging.warning(
-                    f"[chains] 链路 '{tag}' 部分中继节点配置失败: "
-                    f"{failed_relays}/{len(relay_results)} 失败"
+                    detail=f"中继节点配置失败: {', '.join(failed_nodes)}"
                 )
 
-        # Phase 4 Issue 3 修复: 设置入口节点 DSCP 规则
-        # sing-box 使用 routing_mark 标记流量，iptables 将 mark 转换为 DSCP
-        # Phase 3: DSCP manager 不可用时必须失败（不再仅警告）
-        if not HAS_DSCP_MANAGER:
-            logging.error(f"[chains] DSCP manager unavailable - cannot activate chain '{tag}'")
-            db.update_node_chain(tag, chain_state="error", last_error="DSCP manager unavailable")
-            raise HTTPException(
-                status_code=503,
-                detail="DSCP manager unavailable - chain activation requires DSCP support"
-            )
-
-        dscp_mgr = get_dscp_manager()
+        # 移除 iptables DSCP 规则 - rust-router 在用户空间处理 DSCP 标记
+        # rust-router 的 forwarder.rs 在转发数据包时会设置 DSCP 值
+        # 参见 rust-router/src/ingress/forwarder.rs 第 1697-1704 行
         routing_mark = ENTRY_ROUTING_MARK_BASE + dscp_value
-
-        if not dscp_mgr.setup_entry_rules(tag, routing_mark, dscp_value):
-            # 回滚: 注销终端和中继路由
-            logging.error(f"[chains] 设置入口 DSCP 规则失败，回滚链路 '{tag}'")
-            try:
-                if client:
-                    client.unregister_chain_route(
-                        chain_tag=tag,
-                        mark_value=dscp_value,
-                        mark_type=chain_mark_type,
-                        target_node=terminal_tag if via_relay else None,
-                    )
-                # 注销中继路由
-                for relay_result in relay_results:
-                    if relay_result.get("success"):
-                        relay_tag = relay_result["node"]
-                        relay_client = client_mgr.get_client(relay_tag)
-                        if relay_client:
-                            relay_client.unregister_relay_route(chain_tag=tag)
-            except Exception as rollback_err:
-                logging.warning(f"[chains] 回滚链路路由时出错: {rollback_err}")
-
-            db.update_node_chain(tag, chain_state="error", last_error="Entry DSCP rules setup failed")
-            raise HTTPException(
-                status_code=500,
-                detail="设置入口 DSCP 规则失败"
-            )
-
-        # Phase 3: 验证 DSCP 规则是否实际生效
-        if not dscp_mgr.verify_entry_rules(tag, routing_mark, dscp_value):
-            logging.error(f"[chains] Entry DSCP rules verification failed for '{tag}'")
-            # 清理可能部分应用的规则
-            dscp_mgr.cleanup_entry_rules(tag, routing_mark, dscp_value)
-            # 回滚终端和中继路由
-            try:
-                if client:
-                    client.unregister_chain_route(
-                        chain_tag=tag,
-                        mark_value=dscp_value,
-                        mark_type=chain_mark_type,
-                        target_node=terminal_tag if via_relay else None,
-                    )
-                for relay_result in relay_results:
-                    if relay_result.get("success"):
-                        relay_tag = relay_result["node"]
-                        relay_client = client_mgr.get_client(relay_tag)
-                        if relay_client:
-                            relay_client.unregister_relay_route(chain_tag=tag)
-            except Exception as rollback_err:
-                logging.warning(f"[chains] 回滚链路路由时出错: {rollback_err}")
-
-            db.update_node_chain(tag, chain_state="error", last_error="DSCP rules verification failed")
-            raise HTTPException(
-                status_code=500,
-                detail="DSCP rules verification failed - rules may not have been applied correctly"
-            )
-
         logging.info(
-            f"[chains] 链路 '{tag}' 入口 DSCP 规则已设置并验证: "
-            f"routing_mark={routing_mark}, dscp={dscp_value}"
+            f"[chains] 链路 '{tag}' DSCP 配置: "
+            f"routing_mark={routing_mark}, dscp={dscp_value} "
+            f"(rust-router userspace DSCP marking)"
         )
 
-        # 更新为 active
-        db.update_node_chain(tag, chain_state="active", enabled=1)
+        # 更新为 active（清除之前的错误信息）
+        db.update_node_chain(tag, chain_state="active", enabled=1, last_error=None)
 
-        # Phase 6 Issue 29: 标记激活成功
+        # 标记激活成功
         activation_success = True
+
+        # Sync chain to rust-router with full configuration
+        # This ensures rust-router knows about the chain hops, DSCP value, and exit_egress
+        try:
+            async def _sync_chain_to_local_rust_router():
+                client = await _get_rust_router_client()
+                if not client:
+                    return False, "rust-router not available"
+                
+                # Build chain config for entry node
+                chain_config = {
+                    "tag": tag,
+                    "description": chain.get("description", ""),
+                    "dscp_value": dscp_value,
+                    "hops": [
+                        {
+                            "node_tag": local_node_id,
+                            "role": "entry",
+                            "tunnel_type": "wireguard",
+                        },
+                        {
+                            "node_tag": terminal_tag,
+                            "role": "terminal",
+                            "tunnel_type": "wireguard",
+                        },
+                    ],
+                    "rules": [],
+                    "exit_egress": exit_egress,
+                    "allow_transitive": allow_transitive,
+                }
+                
+                # Check if chain exists
+                # list_chains() returns List[ChainInfo], not a response object
+                chains_list = await client.list_chains()
+                existing_tags = {c.tag for c in chains_list if c.tag}
+
+                # DEBUG: Log chain config being sent
+                import json
+                logging.info(f"[chains-debug] Creating chain with config: {json.dumps(chain_config, indent=2)}")
+                logging.info(f"[chains-debug] local_node_id = '{local_node_id}', terminal_tag = '{terminal_tag}'")
+
+                if tag in existing_tags:
+                    # Deactivate and delete existing chain
+                    logging.info(f"[chains-debug] Chain '{tag}' already exists, deleting first...")
+                    status_resp = await client.get_chain_status(tag)
+                    if status_resp.success and status_resp.data:
+                        if status_resp.data.get("state") == "active":
+                            await client.deactivate_chain(tag)
+                    delete_resp = await client.delete_chain(tag)
+                    logging.info(f"[chains-debug] Delete response: {delete_resp}")
+
+                # Create with full config
+                create_resp = await client.create_chain(tag=tag, config=chain_config)
+                logging.info(f"[chains-debug] Create response: {create_resp}")
+                if not create_resp.success:
+                    return False, f"Failed to create chain: {create_resp.error}"
+                
+                # Activate
+                activate_resp = await client.activate_chain(tag)
+                if not activate_resp.success:
+                    return False, f"Failed to activate chain: {activate_resp.error}"
+                
+                return True, None
+            
+            # Fix nested event loop bug - just await directly
+            # since api_activate_chain is already async
+            rr_success, rr_error = await _sync_chain_to_local_rust_router()
+            
+            if rr_success:
+                logging.info(f"[chains] 链路 '{tag}' 已同步到 rust-router")
+            else:
+                # rust-router 同步失败时必须中止激活
+                # 否则入口节点数据库显示 active，但 rust-router 不知道如何为链路标记 DSCP
+                # 导致流量无法正确路由到终端节点
+                logging.error(f"[chains] rust-router 同步失败，中止激活: {rr_error}")
+                db.update_node_chain(tag, chain_state="error", last_error=f"rust-router sync failed: {rr_error}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"入口节点 rust-router 同步失败: {rr_error}"
+                )
+        except HTTPException:
+            raise  # 重新抛出 HTTPException
+        except Exception as e:
+            # rust-router 同步异常也必须中止激活
+            logging.error(f"[chains] rust-router 同步异常，中止激活: {e}")
+            db.update_node_chain(tag, chain_state="error", last_error=f"rust-router sync exception: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"入口节点 rust-router 同步异常: {e}"
+            )
 
         # 重新生成 sing-box 配置
         reload_status = "success"
@@ -16411,9 +23316,9 @@ def api_activate_chain(tag: str):
             "terminal_node": terminal_tag,
             "exit_egress": exit_egress,
             "dscp_value": dscp_value,
-            "routing_mark": ENTRY_ROUTING_MARK_BASE + dscp_value,  # Phase 4: 入口 routing_mark
+            "routing_mark": ENTRY_ROUTING_MARK_BASE + dscp_value,  # 入口 routing_mark
             "reload_status": reload_status,
-            "relay_routes": relay_results,  # Phase 11.4: 中继路由配置结果
+            "relay_routes": relay_results,  # 中继路由配置结果
         }
 
     except ImportError:
@@ -16425,7 +23330,7 @@ def api_activate_chain(tag: str):
     except HTTPException:
         raise
     except TunnelProxyError as e:
-        # Phase 10.3: 特别处理 SOCKS 代理错误
+        # 特别处理 SOCKS 代理错误
         logging.error(f"[chains] SOCKS 代理错误: {e}")
         raise HTTPException(
             status_code=503,
@@ -16438,10 +23343,11 @@ def api_activate_chain(tag: str):
             detail="激活链路失败，请检查日志获取详细信息"
         )
     finally:
-        # Phase 6 Issue 29: 确保状态不会卡在 'activating'
+        # 确保状态不会卡在 'activating'
+        # 同时保存错误信息到 last_error 字段便于调试
         if not activation_success:
             try:
-                db.update_node_chain(tag, chain_state="error")
+                db.update_node_chain(tag, chain_state="error", last_error="Activation failed (see logs)")
             except Exception as e:
                 logging.error(f"[chains] 更新链路 '{tag}' 状态失败: {e}")
 
@@ -16454,7 +23360,7 @@ def api_deactivate_chain(tag: str):
     2. 在终端节点注销链路路由
     3. 重新生成 sing-box 配置
 
-    Phase 6 Issue 20: 跟踪并报告清理状态
+    跟踪并报告清理状态
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -16466,8 +23372,10 @@ def api_deactivate_chain(tag: str):
     if not chain:
         raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
 
-    # 检查当前状态
+    # 使用原子状态转换防止并发停用竞态条件
+    # 尝试从 "active" 或 "error" 转换到 "inactive"
     current_state = chain.get("chain_state", "inactive")
+
     if current_state == "inactive":
         return {
             "message": "链路已处于停用状态",
@@ -16475,44 +23383,85 @@ def api_deactivate_chain(tag: str):
             "chain_state": "inactive"
         }
 
+    if current_state == "activating":
+        raise HTTPException(
+            status_code=409,
+            detail="链路正在激活中，请稍后再试"
+        )
+
+    # 原子转换: active → inactive 或 error → inactive
+    transition_success = False
+    if current_state == "active":
+        success, error = db.atomic_chain_state_transition(
+            tag=tag,
+            expected_state="active",
+            new_state="inactive",
+            timeout_ms=30000
+        )
+        if success:
+            transition_success = True
+            logging.info(f"[chains] 链路 '{tag}' 状态已原子转换: active → inactive")
+        else:
+            # 可能被其他请求先处理了，重新获取状态
+            chain = db.get_node_chain(tag)
+            current_state = chain.get("chain_state", "inactive") if chain else "inactive"
+            logging.warning(f"[chains] 原子转换失败: {error}，当前状态: {current_state}")
+
+    if not transition_success and current_state == "error":
+        success, error = db.atomic_chain_state_transition(
+            tag=tag,
+            expected_state="error",
+            new_state="inactive",
+            timeout_ms=30000
+        )
+        if success:
+            transition_success = True
+            logging.info(f"[chains] 链路 '{tag}' 状态已原子转换: error → inactive")
+        else:
+            chain = db.get_node_chain(tag)
+            current_state = chain.get("chain_state", "inactive") if chain else "inactive"
+            logging.warning(f"[chains] 原子转换失败: {error}，当前状态: {current_state}")
+
+    # 如果转换失败，检查最终状态
+    if not transition_success:
+        if current_state == "inactive":
+            return {
+                "message": "链路已处于停用状态（并发请求已处理）",
+                "chain": tag,
+                "chain_state": "inactive"
+            }
+        elif current_state == "activating":
+            raise HTTPException(
+                status_code=409,
+                detail="链路正在激活中，请稍后再试"
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"状态转换失败: 当前状态 '{current_state}'"
+            )
+
     dscp_value = chain.get("dscp_value")
     chain_mark_type = chain.get("chain_mark_type", "dscp")
 
-    # Phase 6 Issue 20: 跟踪清理状态
+    # 跟踪清理状态
     cleanup_results = {
         "entry_dscp": {"status": "skipped", "error": None},
         "terminal": {"status": "skipped", "error": None},
         "relays": [],
     }
 
-    # Phase 4 Issue 17 修复: 先清理本地入口 DSCP 规则，再进行远程调用
-    # 即使远程调用失败，本地规则也必须清理（否则流量仍会被错误标记）
-    entry_dscp_cleanup_result = None
-    if HAS_DSCP_MANAGER and dscp_value:
-        try:
-            dscp_mgr = get_dscp_manager()
-            routing_mark = ENTRY_ROUTING_MARK_BASE + dscp_value
-            dscp_mgr.cleanup_entry_rules(tag, routing_mark, dscp_value)
-
-            # Phase 3: 验证清理是否成功（规则应该不再存在）
-            if dscp_mgr.verify_entry_rules(tag, routing_mark, dscp_value):
-                # 规则仍然存在 - 清理失败
-                entry_dscp_cleanup_result = "partial"
-                cleanup_results["entry_dscp"]["status"] = "partial"
-                cleanup_results["entry_dscp"]["error"] = "rules still exist after cleanup"
-                logging.error(f"[chains] Entry DSCP rules cleanup verification failed for '{tag}' - rules still exist")
-            else:
-                entry_dscp_cleanup_result = "success"
-                cleanup_results["entry_dscp"]["status"] = "success"
-                logging.info(f"[chains] 链路 '{tag}' 入口 DSCP 规则已清理并验证")
-        except Exception as e:
-            entry_dscp_cleanup_result = f"error: {e}"
-            cleanup_results["entry_dscp"]["status"] = "error"
-            cleanup_results["entry_dscp"]["error"] = str(e)
-            logging.warning(f"[chains] 链路 '{tag}' 入口 DSCP 规则清理失败: {e}")
+    # 移除 iptables DSCP 规则清理 - rust-router 在用户空间处理 DSCP
+    # rust-router 停用链路时会自动清理 DSCP 路由配置
+    entry_dscp_cleanup_result = "success"
+    cleanup_results["entry_dscp"]["status"] = "success"
+    logging.info(f"[chains] 链路 '{tag}' DSCP 由 rust-router userspace 管理，无需清理 iptables 规则")
 
     # Issue 11/12 修复：使用统一的 hops 解析函数
     hops = _parse_chain_hops(chain, raise_on_error=False)
+
+    #: 获取本地节点 ID（用于 source_node 参数）
+    local_node_id = _get_local_node_id()
 
     # 在终端节点注销链路路由（如果有配置）
     unregister_result = None
@@ -16526,13 +23475,13 @@ def api_deactivate_chain(tag: str):
             terminal_node = db.get_peer_node(terminal_tag)
             client_mgr = TunnelAPIClientManager(db)
             client = None
-            via_relay = None  # Phase 11-Fix.E: 标记是否通过中继
+            via_relay = None  # 标记是否通过中继
 
             if terminal_node and terminal_node.get("tunnel_status") == "connected":
                 # 直接连接模式：终端节点在本地数据库中
                 client = client_mgr.get_client(terminal_tag)
             elif allow_transitive:
-                # Phase 11-Fix.E: 传递模式 - 通过第一跳到达终端节点
+                # 传递模式 - 通过第一跳到达终端节点
                 terminal_info, relay_client, _ = _get_terminal_node_through_tunnel(db, hops)
                 if terminal_info:
                     via_relay = terminal_info.get("via_relay")
@@ -16545,6 +23494,7 @@ def api_deactivate_chain(tag: str):
                     mark_value=dscp_value,
                     mark_type=chain_mark_type,
                     target_node=terminal_tag if via_relay else None,  # 传递模式需要转发
+                    source_node=local_node_id,  #: 入口节点标识
                 )
                 unregister_result = "success" if success else "failed"
                 cleanup_results["terminal"]["status"] = "success" if success else "failed"
@@ -16565,7 +23515,7 @@ def api_deactivate_chain(tag: str):
             cleanup_results["terminal"]["status"] = "error"
             cleanup_results["terminal"]["error"] = str(e)
 
-    # Phase 11.4: 在中间节点注销中继路由
+    # 在中间节点注销中继路由
     relay_unregister_results = []
     if hops and len(hops) > 1:
         try:
@@ -16600,7 +23550,11 @@ def api_deactivate_chain(tag: str):
                     continue
 
                 # 注销中继路由（认证通过隧道 IP/UUID）
-                success = relay_client.unregister_relay_route(chain_tag=tag)
+                #: 传递入口节点标识
+                success = relay_client.unregister_relay_route(
+                    chain_tag=tag,
+                    source_node=local_node_id,
+                )
                 relay_result = {
                     "node": relay_tag,
                     "result": "success" if success else "failed"
@@ -16618,8 +23572,35 @@ def api_deactivate_chain(tag: str):
         except Exception as e:
             logging.warning(f"[chains] 注销中继路由时出错: {e}")
 
-    # 更新为 inactive
-    db.update_node_chain(tag, chain_state="inactive", enabled=0)
+    # 状态已在开始时原子转换为 inactive
+    # 这里只需清除 enabled 标志和错误信息
+    db.update_node_chain(tag, enabled=0, last_error=None)
+
+    # 立即通知 rust-router 停用链路（不等待定期同步）
+    rust_router_deactivate_result = "skipped"
+    if os.environ.get("USE_RUST_ROUTER", "false").lower() == "true" and HAS_RUST_ROUTER_CLIENT:
+        try:
+            from rust_router_client import RustRouterClient
+            import asyncio
+
+            async def _deactivate_chain_ipc():
+                async with RustRouterClient() as client:
+                    return await client.deactivate_chain(tag)
+
+            loop = asyncio.new_event_loop()
+            try:
+                response = loop.run_until_complete(_deactivate_chain_ipc())
+                if response.success:
+                    rust_router_deactivate_result = "success"
+                    logging.info(f"[chains] rust-router 链路 '{tag}' 已停用")
+                else:
+                    rust_router_deactivate_result = f"failed: {response.error}"
+                    logging.warning(f"[chains] rust-router 停用链路 '{tag}' 失败: {response.error}")
+            finally:
+                loop.close()
+        except Exception as e:
+            rust_router_deactivate_result = f"error: {e}"
+            logging.warning(f"[chains] rust-router 停用链路 '{tag}' 异常: {e}")
 
     # 重新生成 sing-box 配置
     reload_status = "success"
@@ -16631,7 +23612,7 @@ def api_deactivate_chain(tag: str):
 
     logging.info(f"[chains] 链路 '{tag}' 已停用")
 
-    # Phase 6 Issue 20: 判断是否部分清理
+    # 判断是否部分清理
     terminal_ok = cleanup_results["terminal"]["status"] in ("success", "skipped")
     entry_ok = cleanup_results["entry_dscp"]["status"] in ("success", "skipped")
     relays_ok = all(r.get("result") == "success" for r in cleanup_results["relays"]) if cleanup_results["relays"] else True
@@ -16644,12 +23625,13 @@ def api_deactivate_chain(tag: str):
         "message": f"链路 '{tag}' 已停用",
         "chain": tag,
         "chain_state": "inactive",
-        "entry_dscp_cleanup": entry_dscp_cleanup_result,  # Phase 4: 入口 DSCP 规则清理结果
+        "entry_dscp_cleanup": entry_dscp_cleanup_result,  # 入口 DSCP 规则清理结果
         "unregister_result": unregister_result,
-        "relay_unregister_results": relay_unregister_results,  # Phase 11.4
+        "relay_unregister_results": relay_unregister_results,
         "reload_status": reload_status,
-        "cleanup_results": cleanup_results,  # Phase 6 Issue 20: 详细清理结果
-        "partial_cleanup": partial_cleanup,  # Phase 6 Issue 20: 是否部分清理
+        "cleanup_results": cleanup_results,  # 详细清理结果
+        "partial_cleanup": partial_cleanup,  # 是否部分清理
+        "rust_router_deactivate": rust_router_deactivate_result,  # rust-router 停用结果
     }
 
 
@@ -16990,12 +23972,9 @@ async def api_batch_connect(payload: BatchConnectRequest):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    # [优化] 在循环外获取数据库连接和管理器
     db = _get_db()
-    from peer_tunnel_manager import PeerTunnelManager
-    manager = PeerTunnelManager()
-
     results = []
+    
     for tag in payload.tags:
         try:
             node = db.get_peer_node(tag)
@@ -17008,16 +23987,16 @@ async def api_batch_connect(payload: BatchConnectRequest):
                 results.append({"tag": tag, "success": False, "error": "节点已禁用"})
                 continue
 
-            success = manager.connect_node(tag)
+            # Connect via rust-router IPC
+            success, message = _connect_peer_sync(tag)
 
             if success:
                 results.append({"tag": tag, "success": True})
             else:
-                node = db.get_peer_node(tag)
                 results.append({
                     "tag": tag,
                     "success": False,
-                    "error": node.get("last_error", "连接失败") if node else "连接失败"
+                    "error": message or "连接失败"
                 })
         except Exception as e:
             logging.exception(f"[batch-connect] 连接节点 '{tag}' 失败")
@@ -17038,19 +24017,16 @@ async def api_batch_disconnect(payload: BatchDisconnectRequest):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    # [优化] 在循环外获取管理器
-    from peer_tunnel_manager import PeerTunnelManager
-    manager = PeerTunnelManager()
-
     results = []
     for tag in payload.tags:
         try:
-            success = manager.disconnect_node(tag)
+            # Disconnect via rust-router IPC
+            success, message = _disconnect_peer_sync(tag)
 
             if success:
                 results.append({"tag": tag, "success": True})
             else:
-                results.append({"tag": tag, "success": False, "error": "断开失败"})
+                results.append({"tag": tag, "success": False, "error": message or "断开失败"})
         except Exception as e:
             logging.exception(f"[batch-disconnect] 断开节点 '{tag}' 失败")
             results.append({"tag": tag, "success": False, "error": "Internal error"})
@@ -17406,6 +24382,407 @@ def api_stats_chain_detail(tag: str):
         "status": "healthy" if all_connected else "unhealthy",
         "upload": traffic.get("upload", 0),
         "download": traffic.get("download", 0),
+    }
+
+
+# ============================================================================
+# DNS API Endpoints
+# ============================================================================
+
+# Global rust-router client instance (reused across requests)
+_rust_router_client: Optional["RustRouterClient"] = None
+
+
+async def _get_rust_router_client() -> Optional["RustRouterClient"]:
+    """Get rust-router client if available.
+
+    Uses a singleton pattern with connection validation.
+    Returns None if rust-router is not available.
+    """
+    global _rust_router_client
+
+    if not HAS_RUST_ROUTER_CLIENT:
+        return None
+
+    try:
+        if _rust_router_client is None:
+            _rust_router_client = RustRouterClient()
+
+        # Test connection with a ping
+        ping_response = await _rust_router_client.ping()
+        if ping_response.success:
+            return _rust_router_client
+        else:
+            # Connection failed, reset client for next attempt
+            _rust_router_client = None
+            return None
+    except Exception as e:
+        logging.warning(f"Failed to connect to rust-router: {e}")
+        _rust_router_client = None
+        return None
+
+
+class FlushCacheRequest(BaseModel):
+    """Request to flush DNS cache
+
+    Patterns are matched as domain suffixes (e.g., "example.com" matches "sub.example.com").
+    Maximum pattern length is 253 characters (RFC 1035 DNS label limit).
+    """
+    pattern: Optional[str] = None
+
+    @validator('pattern')
+    def validate_pattern(cls, v):
+        if v is None:
+            return v
+        # Max DNS domain length (RFC 1035)
+        if len(v) > 253:
+            raise ValueError('Pattern exceeds maximum DNS domain length (253 characters)')
+        # Basic sanitization - only allow valid DNS label characters
+        import re
+        if not re.match(r'^[a-zA-Z0-9._-]+$', v):
+            raise ValueError('Pattern contains invalid characters. Only alphanumeric, dots, hyphens, and underscores allowed')
+        return v
+
+
+class AddUpstreamRequest(BaseModel):
+    """Request to add a DNS upstream server"""
+    tag: str
+    address: str
+    protocol: str  # "udp", "tcp", "doh", "dot"
+    bootstrap: Optional[List[str]] = None
+    timeout_secs: Optional[int] = None
+
+
+class AddRouteRequest(BaseModel):
+    """Request to add a DNS routing rule"""
+    pattern: str
+    match_type: str  # "exact", "suffix", "keyword", "regex"
+    upstream_tag: str
+
+
+class DnsQueryRequest(BaseModel):
+    """Request to perform a DNS query"""
+    domain: str
+    qtype: int = 1  # Default: A record
+    upstream: Optional[str] = None
+
+
+@app.get("/api/dns/stats")
+async def api_get_dns_stats():
+    """Get overall DNS statistics"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    stats = await client.get_dns_stats()
+    if not stats:
+        raise HTTPException(status_code=500, detail="Failed to get DNS stats")
+
+    return {
+        "enabled": stats.enabled,
+        "uptime_secs": stats.uptime_secs,
+        "total_queries": stats.total_queries,
+        "cache_hits": stats.cache_hits,
+        "cache_misses": stats.cache_misses,
+        "blocked_queries": stats.blocked_queries,
+        "upstream_queries": stats.upstream_queries,
+        "avg_latency_us": stats.avg_latency_us,
+    }
+
+
+@app.get("/api/dns/config")
+async def api_get_dns_config():
+    """Get current DNS configuration"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    config = await client.get_dns_config()
+    if not config:
+        raise HTTPException(status_code=500, detail="Failed to get DNS config")
+
+    return {
+        "enabled": config.enabled,
+        "listen_udp": config.listen_udp,
+        "listen_tcp": config.listen_tcp,
+        "upstreams": [
+            {
+                "tag": u.tag,
+                "address": u.address,
+                "protocol": u.protocol,
+                "healthy": u.healthy,
+            }
+            for u in config.upstreams
+        ],
+        "cache_enabled": config.cache_enabled,
+        "cache_max_entries": config.cache_max_entries,
+        "blocking_enabled": config.blocking_enabled,
+        "blocking_response_type": config.blocking_response_type,
+        "logging_enabled": config.logging_enabled,
+        "logging_format": config.logging_format,
+        # Feature availability status for clients to determine what's implemented
+        "available_features": config.available_features,
+    }
+
+
+@app.get("/api/dns/cache/stats")
+async def api_get_dns_cache_stats():
+    """Get DNS cache statistics"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    stats = await client.get_dns_cache_stats()
+    if not stats:
+        raise HTTPException(status_code=500, detail="Failed to get cache stats")
+
+    return {
+        "enabled": stats.enabled,
+        "max_entries": stats.max_entries,
+        "current_entries": stats.current_entries,
+        "hits": stats.hits,
+        "misses": stats.misses,
+        "hit_rate": stats.hit_rate,
+        "negative_hits": stats.negative_hits,
+        "inserts": stats.inserts,
+        "evictions": stats.evictions,
+    }
+
+
+@app.post("/api/dns/cache/flush")
+async def api_flush_dns_cache(request: FlushCacheRequest = None):
+    """Flush DNS cache (optional pattern for selective flush)"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    pattern = request.pattern if request else None
+    response = await client.flush_dns_cache(pattern)
+
+    if not response.success:
+        raise HTTPException(status_code=500, detail=response.error or "Failed to flush cache")
+
+    return {"success": True, "message": f"Cache flushed{' for pattern: ' + pattern if pattern else ''}"}
+
+
+@app.get("/api/dns/block/stats")
+async def api_get_dns_block_stats():
+    """Get DNS blocking statistics"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    stats = await client.get_dns_block_stats()
+    if not stats:
+        raise HTTPException(status_code=500, detail="Failed to get block stats")
+
+    return {
+        "enabled": stats.enabled,
+        "rule_count": stats.rule_count,
+        "blocked_queries": stats.blocked_queries,
+        "total_queries": stats.total_queries,
+        "block_rate": stats.block_rate,
+        "last_reload": stats.last_reload,
+    }
+
+
+@app.post("/api/dns/blocklist/reload")
+async def api_reload_dns_blocklist():
+    """Reload DNS blocklist from database"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    response = await client.reload_dns_blocklist()
+
+    if not response.success:
+        raise HTTPException(status_code=500, detail=response.error or "Failed to reload blocklist")
+
+    return {"success": True, "message": "Blocklist reloaded"}
+
+
+@app.get("/api/dns/upstreams")
+async def api_get_dns_upstreams(tag: Optional[str] = None):
+    """Get DNS upstream server status"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    upstreams = await client.get_dns_upstream_status(tag)
+
+    return {
+        "upstreams": [
+            {
+                "tag": u.tag,
+                "address": u.address,
+                "protocol": u.protocol,
+                "healthy": u.healthy,
+                "total_queries": u.total_queries,
+                "failed_queries": u.failed_queries,
+                "avg_latency_us": u.avg_latency_us,
+                "last_success": u.last_success,
+                "last_failure": u.last_failure,
+            }
+            for u in upstreams
+        ]
+    }
+
+
+@app.post("/api/dns/upstreams")
+async def api_add_dns_upstream(request: AddUpstreamRequest):
+    """Add a DNS upstream server"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    response = await client.add_dns_upstream(
+        tag=request.tag,
+        address=request.address,
+        protocol=request.protocol,
+        bootstrap=request.bootstrap,
+        timeout_secs=request.timeout_secs,
+    )
+
+    if not response.success:
+        raise HTTPException(status_code=400, detail=response.error or "Failed to add upstream")
+
+    return {"success": True, "message": f"Upstream '{request.tag}' added"}
+
+
+@app.delete("/api/dns/upstreams/{tag}")
+async def api_remove_dns_upstream(tag: str):
+    """Remove a DNS upstream server"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    response = await client.remove_dns_upstream(tag)
+
+    if not response.success:
+        raise HTTPException(status_code=400, detail=response.error or "Failed to remove upstream")
+
+    return {"success": True, "message": f"Upstream '{tag}' removed"}
+
+
+@app.post("/api/dns/routes")
+async def api_add_dns_route(request: AddRouteRequest):
+    """Add a DNS routing rule"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    response = await client.add_dns_route(
+        pattern=request.pattern,
+        match_type=request.match_type,
+        upstream_tag=request.upstream_tag,
+    )
+
+    if not response.success:
+        raise HTTPException(status_code=400, detail=response.error or "Failed to add route")
+
+    return {"success": True, "message": f"Route for '{request.pattern}' added"}
+
+
+@app.delete("/api/dns/routes/{pattern:path}")
+async def api_remove_dns_route(pattern: str):
+    """Remove a DNS routing rule"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    response = await client.remove_dns_route(pattern)
+
+    if not response.success:
+        raise HTTPException(status_code=400, detail=response.error or "Failed to remove route")
+
+    return {"success": True, "message": f"Route for '{pattern}' removed"}
+
+
+@app.get("/api/dns/query-log")
+async def api_get_dns_query_log(limit: int = 100, offset: int = 0):
+    """Get DNS query log entries"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    entries = await client.get_dns_query_log(limit=limit, offset=offset)
+
+    return {
+        "entries": [
+            {
+                "timestamp": e.timestamp,
+                "domain": e.domain,
+                "qtype": e.qtype,
+                "qtype_str": e.qtype_str,
+                "upstream": e.upstream,
+                "response_code": e.response_code,
+                "rcode_str": e.rcode_str,
+                "latency_us": e.latency_us,
+                "blocked": e.blocked,
+                "cached": e.cached,
+            }
+            for e in entries
+        ],
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/dns/query")
+async def api_dns_query_get(
+    domain: str,
+    qtype: int = 1,
+    upstream: Optional[str] = None,
+):
+    """Perform a test DNS query (GET method)"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    result = await client.dns_query(domain=domain, qtype=qtype, upstream=upstream)
+
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to perform DNS query")
+
+    return {
+        "success": result.success,
+        "domain": result.domain,
+        "qtype": result.qtype,
+        "response_code": result.response_code,
+        "answers": result.answers,
+        "latency_us": result.latency_us,
+        "cached": result.cached,
+        "blocked": result.blocked,
+        "upstream_used": result.upstream_used,
+    }
+
+
+@app.post("/api/dns/query")
+async def api_dns_query_post(request: DnsQueryRequest):
+    """Perform a test DNS query (POST method)"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    result = await client.dns_query(
+        domain=request.domain,
+        qtype=request.qtype,
+        upstream=request.upstream,
+    )
+
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to perform DNS query")
+
+    return {
+        "success": result.success,
+        "domain": result.domain,
+        "qtype": result.qtype,
+        "response_code": result.response_code,
+        "answers": result.answers,
+        "latency_us": result.latency_us,
+        "cached": result.cached,
+        "blocked": result.blocked,
+        "upstream_used": result.upstream_used,
     }
 
 

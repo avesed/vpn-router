@@ -1,10 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# VPN Router Entrypoint - Userspace WireGuard Only
+# All traffic is handled by rust-router with boringtun userspace WireGuard
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+# Unified iptables backend selection
+select_iptables_backend() {
+  local nft_pkts legacy_pkts
+  nft_pkts=$(iptables-nft -t mangle -L -v -n 2>/dev/null | grep -E "^[[:space:]]*[0-9]+" | awk '{sum+=$1} END {print sum+0}')
+  legacy_pkts=$(iptables-legacy -t mangle -L -v -n 2>/dev/null | grep -E "^[[:space:]]*[0-9]+" | awk '{sum+=$1} END {print sum+0}')
+
+  if [ "$nft_pkts" -gt "$legacy_pkts" ] 2>/dev/null; then
+    echo "iptables-nft"
+  elif [ "$legacy_pkts" -gt 0 ] 2>/dev/null; then
+    echo "iptables-legacy"
+  else
+    echo "iptables-nft"
+  fi
+}
+
+IPTABLES_BACKEND=$(select_iptables_backend)
+IPTABLES="${IPTABLES_BACKEND}"
+IP6TABLES="${IPTABLES_BACKEND/iptables/ip6tables}"
+echo "[entrypoint] Using iptables backend: ${IPTABLES_BACKEND}"
+
+run_iptables() {
+  ${IPTABLES} "$@"
+}
+
+# ============================================================================
+# Cleanup Functions
+# ============================================================================
+
 cleanup() {
   echo "[entrypoint] cleanup: stopping all managed processes..."
 
-  # Stop health checker first (depends on other services)
+  # Stop rust-router
+  if [ -n "${RUST_ROUTER_PID:-}" ] && kill -0 "${RUST_ROUTER_PID}" >/dev/null 2>&1; then
+    echo "[entrypoint] stopping rust-router (PID ${RUST_ROUTER_PID})"
+    kill "${RUST_ROUTER_PID}" >/dev/null 2>&1 || true
+  fi
+
+  # Stop health checker
   if [ -n "${HEALTH_CHECKER_PID:-}" ] && kill -0 "${HEALTH_CHECKER_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping health checker (PID ${HEALTH_CHECKER_PID})"
     kill "${HEALTH_CHECKER_PID}" >/dev/null 2>&1 || true
@@ -44,38 +85,15 @@ cleanup() {
     kill "${API_PID}" >/dev/null 2>&1 || true
   fi
 
-  # Cleanup DSCP rules (chain routes)
+  # Cleanup DSCP rules
   echo "[entrypoint] cleaning up DSCP rules..."
   python3 /usr/local/bin/dscp_manager.py cleanup 2>/dev/null || true
 
-  # Cleanup WireGuard interfaces created by this container
-  cleanup_wireguard_interfaces
+  # Cleanup rust-router socket
+  rm -f "${RUST_ROUTER_SOCKET}" 2>/dev/null || true
 
-  echo "[entrypoint] cleanup complete"
-}
-trap cleanup EXIT
-API_PID=""
-NGINX_PID=""
-OPENVPN_MGR_PID=""
-XRAY_MGR_PID=""
-XRAY_EGRESS_MGR_PID=""
-WARP_MGR_PID=""
-HEALTH_CHECKER_PID=""
-PEER_TUNNEL_MGR_PID=""
-
-# Cleanup WireGuard interfaces created by this container
-# This is important for network_mode: host to prevent stale interfaces
-cleanup_wireguard_interfaces() {
-  echo "[entrypoint] cleaning up WireGuard interfaces..."
-
-  # Cleanup ingress interface
-  if ip link show wg-ingress >/dev/null 2>&1; then
-    echo "[entrypoint] removing wg-ingress interface"
-    ip link delete wg-ingress 2>/dev/null || true
-  fi
-
-  # Cleanup egress interfaces (wg-pia-*, wg-eg-*, wg-warp-*, wg-peer-*)
-  for iface in $(ip -br link show type wireguard 2>/dev/null | awk '{print $1}' | grep -E '^wg-(pia|eg|warp|peer)-'); do
+  # Cleanup stale WireGuard egress interfaces (wg-warp-*, wg-peer-*)
+  for iface in $(ip -br link show type wireguard 2>/dev/null | awk '{print $1}' | grep -E '^wg-(warp|peer)-'); do
     echo "[entrypoint] removing interface: ${iface}"
     ip link delete "${iface}" 2>/dev/null || true
   done
@@ -86,33 +104,31 @@ cleanup_wireguard_interfaces() {
     ip link delete xray-tun0 2>/dev/null || true
   fi
 
-  # Cleanup iptables rules (TPROXY and NAT)
-  echo "[entrypoint] cleaning up iptables rules..."
-  iptables -t mangle -F PREROUTING 2>/dev/null || true
-  iptables -t nat -D POSTROUTING -s "10.25.0.0/24" ! -o "wg-ingress" -j MASQUERADE 2>/dev/null || true
-  iptables -t nat -D POSTROUTING -s "10.24.0.0/24" ! -o "xray-tun0" -j MASQUERADE 2>/dev/null || true
-
-  # Cleanup ip rules
-  ip rule del fwmark 1 lookup 100 2>/dev/null || true
+  echo "[entrypoint] cleanup complete"
 }
 
-# Cleanup any stale interfaces from previous runs before starting
-cleanup_stale_interfaces() {
-  echo "[entrypoint] checking for stale interfaces from previous runs..."
+trap cleanup EXIT
 
-  # Only cleanup if interface exists but process is not running
-  if ip link show wg-ingress >/dev/null 2>&1; then
-    # Check if sing-box is running (it manages the ingress)
-    if ! pgrep -x sing-box >/dev/null 2>&1; then
-      echo "[entrypoint] found stale wg-ingress, cleaning up"
-      ip link delete wg-ingress 2>/dev/null || true
-    fi
-  fi
-}
+# ============================================================================
+# PID Variables
+# ============================================================================
+
+API_PID=""
+NGINX_PID=""
+OPENVPN_MGR_PID=""
+XRAY_MGR_PID=""
+XRAY_EGRESS_MGR_PID=""
+WARP_MGR_PID=""
+HEALTH_CHECKER_PID=""
+PEER_TUNNEL_MGR_PID=""
+RUST_ROUTER_PID=""
+
+# ============================================================================
+# Configuration
+# ============================================================================
 
 BASE_CONFIG_PATH="${SING_BOX_CONFIG:-/etc/sing-box/sing-box.json}"
 GENERATED_CONFIG_PATH="${SING_BOX_GENERATED_CONFIG:-/etc/sing-box/sing-box.generated.json}"
-WG_CONFIG_PATH="${WG_CONFIG_PATH:-/etc/sing-box/wireguard/server.json}"
 RULESET_DIR="${RULESET_DIR:-/etc/sing-box}"
 GEO_DATA_READY_FLAG="${RULESET_DIR}/.geodata-ready"
 USER_DB_PATH="${USER_DB_PATH:-/etc/sing-box/user-config.db}"
@@ -122,20 +138,62 @@ DEFAULT_CONFIG_DIR="/opt/default-config"
 export WEB_PORT="${WEB_PORT:-36000}"
 export WG_LISTEN_PORT="${WG_LISTEN_PORT:-36100}"
 
-# Check for port conflicts before starting services
+# Rust Router configuration
+RUST_ROUTER_BIN="${RUST_ROUTER_BIN:-/usr/local/bin/rust-router}"
+RUST_ROUTER_CONFIG="${RUST_ROUTER_CONFIG:-/etc/rust-router/config.json}"
+RUST_ROUTER_SOCKET="${RUST_ROUTER_SOCKET:-/var/run/rust-router.sock}"
+RUST_ROUTER_LOG="${RUST_ROUTER_LOG:-/var/log/rust-router.log}"
+RUST_ROUTER_DNS_PORT="${RUST_ROUTER_DNS_PORT:-7853}"
+
+# Userspace WireGuard is always enabled (kernel mode removed)
+USERSPACE_WG="true"
+export USERSPACE_WG
+
+# ============================================================================
+# Startup Cleanup (for host network mode)
+# ============================================================================
+
+cleanup_stale_interfaces() {
+  # With host network mode, WireGuard interfaces persist after container exit.
+  # Clean them up at startup to prevent port conflicts.
+  echo "[entrypoint] cleaning up stale interfaces from previous run..."
+
+  # Cleanup wg-ingress if it exists
+  if ip link show wg-ingress >/dev/null 2>&1; then
+    echo "[entrypoint] removing stale wg-ingress interface"
+    ip link delete wg-ingress 2>/dev/null || true
+  fi
+
+  # Cleanup PIA egress interfaces (wg-pia-*)
+  for iface in $(ip -br link show type wireguard 2>/dev/null | awk '{print $1}' | grep -E '^wg-pia-'); do
+    echo "[entrypoint] removing stale interface: ${iface}"
+    ip link delete "${iface}" 2>/dev/null || true
+  done
+
+  # Cleanup WARP and peer interfaces (wg-warp-*, wg-peer-*)
+  for iface in $(ip -br link show type wireguard 2>/dev/null | awk '{print $1}' | grep -E '^wg-(warp|peer)-'); do
+    echo "[entrypoint] removing stale interface: ${iface}"
+    ip link delete "${iface}" 2>/dev/null || true
+  done
+
+  echo "[entrypoint] stale interface cleanup complete"
+}
+
+# ============================================================================
+# Port Conflict Checks
+# ============================================================================
+
 check_port_conflicts() {
   local port="$1"
   local service="$2"
   local protocol="${3:-tcp}"
 
   if [ "${protocol}" = "udp" ]; then
-    # Check UDP port
     if ss -uln "sport = :${port}" 2>/dev/null | grep -q ":${port}"; then
       echo "[entrypoint] ERROR: Port ${port}/udp is already in use (required for ${service})" >&2
       return 1
     fi
   else
-    # Check TCP port
     if ss -tln "sport = :${port}" 2>/dev/null | grep -q ":${port}"; then
       echo "[entrypoint] ERROR: Port ${port}/tcp is already in use (required for ${service})" >&2
       return 1
@@ -144,49 +202,47 @@ check_port_conflicts() {
   return 0
 }
 
-# Verify critical ports are available
 verify_required_ports() {
   local has_conflict=0
 
   echo "[entrypoint] checking for port conflicts..."
 
-  # Check web port
   if ! check_port_conflicts "${WEB_PORT}" "nginx/web UI" "tcp"; then
     has_conflict=1
   fi
 
-  # Check API port
   if ! check_port_conflicts "${API_PORT:-8000}" "API server" "tcp"; then
     has_conflict=1
   fi
 
-  # Check WireGuard port
   if ! check_port_conflicts "${WG_LISTEN_PORT}" "WireGuard ingress" "udp"; then
     has_conflict=1
   fi
 
   if [ ${has_conflict} -eq 1 ]; then
-    echo "[entrypoint] FATAL: Port conflicts detected. Resolve conflicts or change port configuration." >&2
-    echo "[entrypoint] Hint: Set WEB_PORT, API_PORT, or WG_LISTEN_PORT environment variables" >&2
+    echo "[entrypoint] FATAL: Port conflicts detected." >&2
     exit 1
   fi
 
   echo "[entrypoint] no port conflicts detected"
 }
 
+# ============================================================================
+# Initialization
+# ============================================================================
+
+# Copy default configs if not present
 if [ ! -f "${BASE_CONFIG_PATH}" ] && [ -f "${DEFAULT_CONFIG_DIR}/sing-box.json" ]; then
   echo "[entrypoint] initializing sing-box config from default config"
   cp "${DEFAULT_CONFIG_DIR}/sing-box.json" "${BASE_CONFIG_PATH}"
 fi
 
-# 初始化 domain catalog 文件（规则库）
 DOMAIN_CATALOG="${RULESET_DIR}/domain-catalog.json"
 if [ ! -f "${DOMAIN_CATALOG}" ] && [ -f "${DEFAULT_CONFIG_DIR}/domain-catalog.json" ]; then
   echo "[entrypoint] initializing domain catalog from default config"
   cp "${DEFAULT_CONFIG_DIR}/domain-catalog.json" "${DOMAIN_CATALOG}"
 fi
 
-# 初始化 GeoIP catalog 和 IP 数据文件 (JSON 格式，替代 49MB SQLite 数据库)
 GEOIP_CATALOG="${RULESET_DIR}/geoip-catalog.json"
 GEOIP_DIR="${RULESET_DIR}/geoip"
 if [ ! -f "${GEOIP_CATALOG}" ] && [ -f "${DEFAULT_CONFIG_DIR}/geoip-catalog.json" ]; then
@@ -203,24 +259,20 @@ if [ ! -f "${BASE_CONFIG_PATH}" ]; then
   exit 1
 fi
 
-# === SQLCipher 密钥管理 ===
-# 获取或创建数据库加密密钥
+# SQLCipher key management
 echo "[entrypoint] initializing encryption key"
 export SQLCIPHER_KEY=$(python3 -c "from key_manager import KeyManager; print(KeyManager.get_or_create_key())")
 if [ -z "${SQLCIPHER_KEY}" ]; then
   echo "[entrypoint] warning: failed to get encryption key, database will be unencrypted"
 fi
 
-# 检测并迁移未加密数据库
+# Database backup and migration
 if [ -f "${USER_DB_PATH}" ]; then
-  # Create automatic backup before any database operations
   BACKUP_DIR="${RULESET_DIR}/backups"
   mkdir -p "${BACKUP_DIR}"
   BACKUP_FILE="${BACKUP_DIR}/user-config.db.$(date +%Y%m%d_%H%M%S).bak"
   cp "${USER_DB_PATH}" "${BACKUP_FILE}" 2>/dev/null || true
   echo "[entrypoint] created database backup: ${BACKUP_FILE}"
-
-  # Keep only last 5 backups to prevent disk fill
   ls -t "${BACKUP_DIR}"/user-config.db.*.bak 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
 
   python3 -c "
@@ -235,7 +287,7 @@ else:
 "
 fi
 
-# 初始化/升级用户数据库（使用 CREATE TABLE IF NOT EXISTS，安全运行）
+# Initialize user database
 echo "[entrypoint] initializing user database: ${USER_DB_PATH}"
 python3 /usr/local/bin/init_user_db.py /etc/sing-box
 if [ $? -ne 0 ]; then
@@ -243,12 +295,46 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-# Cleanup stale interfaces from previous container runs (important for network_mode: host)
+# Unified node_tag from database
+# All components (rust-router, api_server, rust_router_manager) will use this
+export RUST_ROUTER_NODE_TAG=$(python3 -c "
+from db_helper import get_db
+from key_manager import KeyManager
+import socket
+import re
+import os
+
+key = KeyManager.get_or_create_key()
+geodata_path = os.environ.get('GEODATA_DB_PATH', '/etc/sing-box/geoip-geodata.db')
+user_db_path = os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')
+
+try:
+    db = get_db(geodata_path, user_db_path, key)
+    settings = db.get_all_settings()
+    stored_tag = settings.get('node_tag', '').strip()
+    if stored_tag:
+        print(stored_tag)
+    else:
+        # Fallback to hostname, normalized
+        hostname = socket.gethostname()
+        normalized = re.sub(r'[^a-z0-9-]', '-', hostname.lower())
+        normalized = re.sub(r'-+', '-', normalized).strip('-')
+        if not normalized or not normalized[0].isalpha():
+            normalized = 'node-' + normalized
+        print(normalized[:64])
+except Exception as e:
+    # Ultimate fallback
+    print(socket.gethostname())
+" 2>/dev/null)
+echo "[entrypoint] node_tag: ${RUST_ROUTER_NODE_TAG}"
+
+# Cleanup stale interfaces from previous container run (host network mode)
 cleanup_stale_interfaces
 
-# Verify ports are available before proceeding
+# Verify ports
 verify_required_ports
 
+# System settings
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
@@ -258,155 +344,69 @@ if [ "${DISABLE_IPV6:-1}" = "1" ]; then
   sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null || true
 fi
 
+# Fetch geodata
 /usr/local/bin/fetch-geodata.sh "${RULESET_DIR}" "${GEO_DATA_READY_FLAG}"
 
-# === Kernel WireGuard Setup ===
-# Creates wg-ingress interface and configures TPROXY to sing-box
+# ============================================================================
+# ECMP and Chain Routes
+# ============================================================================
 
-WG_INTERFACE="${WG_INTERFACE:-wg-ingress}"
-WG_SUBNET="${WG_SUBNET:-10.25.0.0/24}"
-TPROXY_PORT="${TPROXY_PORT:-7893}"
-TPROXY_MARK="1"
-TPROXY_TABLE="100"
+# NOTE: sync_ecmp_routes removed - kernel ECMP routes no longer needed.
+# rust-router handles load balancing internally with userspace WireGuard.
+sync_ecmp_routes() {
+  # Legacy function - now a no-op since rust-router handles ECMP internally
+  echo "[entrypoint] ECMP routes managed by rust-router (userspace mode)"
+}
 
-setup_kernel_wireguard() {
-  echo "[entrypoint] setting up kernel WireGuard interface"
+sync_chain_routes() {
+  # No-op - rust-router handles DSCP routing in userspace
+  # Chain routes are managed by rust-router's ChainManager
+  # See rust-router/src/ingress/processor.rs for DSCP routing logic
+  echo "[entrypoint] chain routes managed by rust-router (userspace DSCP routing)"
+}
 
-  # Create WireGuard interface if not exists
-  if ! ip link show "${WG_INTERFACE}" >/dev/null 2>&1; then
-    echo "[entrypoint] creating ${WG_INTERFACE} interface"
-    ip link add "${WG_INTERFACE}" type wireguard
-  fi
+restore_dscp_rules() {
+  # No-op - rust-router handles DSCP routing in userspace
+  # No kernel iptables/policy routing rules needed
+  echo "[entrypoint] DSCP rules managed by rust-router (userspace mode)"
+}
 
-  # Apply WireGuard config from database
-  if ! python3 /usr/local/bin/setup_kernel_wg.py --interface "${WG_INTERFACE}"; then
-    echo "[entrypoint] failed to setup kernel WireGuard" >&2
+sync_ecmp_routes
+sync_chain_routes
+restore_dscp_rules
+
+# ============================================================================
+# Rust Router Sync
+# ============================================================================
+
+sync_rust_router() {
+  local max_wait=30
+  local waited=0
+  while [ ! -S "${RUST_ROUTER_SOCKET}" ] && [ $waited -lt $max_wait ]; do
+    sleep 1
+    waited=$((waited + 1))
+    if [ $((waited % 5)) -eq 0 ]; then
+      echo "[entrypoint] waiting for rust-router socket... (${waited}/${max_wait}s)"
+    fi
+  done
+
+  if [ ! -S "${RUST_ROUTER_SOCKET}" ]; then
+    echo "[entrypoint] WARNING: rust-router socket not available after ${max_wait}s, skipping sync"
     return 1
   fi
 
-  # Get WireGuard server subnet from database
-  WG_SUBNET=$(python3 -c "
-import sys
-sys.path.insert(0, '/usr/local/bin')
-from db_helper import get_db
-import os
-db = get_db(
-    os.environ.get('GEODATA_DB_PATH', '/etc/sing-box/geoip-geodata.db'),
-    os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')
-)
-server = db.get_wireguard_server()
-if server:
-    addr = server.get('address', '10.25.0.1/24')
-    # Convert address to subnet (e.g., 10.25.0.1/24 -> 10.25.0.0/24)
-    import ipaddress
-    net = ipaddress.ip_network(addr, strict=False)
-    print(str(net))
-else:
-    print('10.25.0.0/24')
-" 2>/dev/null || echo "10.25.0.0/24")
-
-  echo "[entrypoint] WireGuard subnet: ${WG_SUBNET}"
-  echo "[entrypoint] kernel WireGuard interface ready"
-}
-
-setup_tproxy_routing() {
-  # Setup TPROXY for transparent proxying of WireGuard traffic to sing-box
-  echo "[entrypoint] setting up TPROXY routing for WireGuard traffic"
-
-  # Enable ip_nonlocal_bind for TPROXY to work correctly
-  # This allows sing-box to send responses with non-local source IPs
-  sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null 2>&1 || true
-  sysctl -w net.ipv6.ip_nonlocal_bind=1 >/dev/null 2>&1 || true
-
-  # Setup routing table for TPROXY marked packets
-  # Marked packets go to local (loopback) for TPROXY processing
-  if ! grep -q "^${TPROXY_TABLE}[[:space:]]" /etc/iproute2/rt_tables 2>/dev/null; then
-    echo "${TPROXY_TABLE} tproxy" >> /etc/iproute2/rt_tables
-    echo "[entrypoint] added routing table tproxy (${TPROXY_TABLE})"
-  fi
-
-  # Clear existing rules (including any stale 'from' rules that might break routing)
-  ip rule del fwmark ${TPROXY_MARK} lookup ${TPROXY_TABLE} 2>/dev/null || true
-  ip rule del from ${WG_SUBNET} lookup ${TPROXY_TABLE} 2>/dev/null || true
-  ip route flush table ${TPROXY_TABLE} 2>/dev/null || true
-
-  # Add policy routing: marked packets -> local delivery
-  ip rule add fwmark ${TPROXY_MARK} lookup ${TPROXY_TABLE}
-  ip route add local 0.0.0.0/0 dev lo table ${TPROXY_TABLE}
-
-  # M12: 幂等的 iptables 规则设置 - 先删除再添加，避免重复
-  # Skip traffic to WireGuard server itself (local subnet)
-  iptables -t mangle -D PREROUTING -i "${WG_INTERFACE}" -d "${WG_SUBNET}" -j RETURN 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -d "${WG_SUBNET}" -j RETURN
-
-  # TPROXY TCP traffic from WireGuard interface to sing-box
-  iptables -t mangle -D PREROUTING -i "${WG_INTERFACE}" -p tcp \
-    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p tcp \
-    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
-
-  # TPROXY UDP traffic from WireGuard interface to sing-box
-  iptables -t mangle -D PREROUTING -i "${WG_INTERFACE}" -p udp \
-    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p udp \
-    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
-
-  echo "[entrypoint] TPROXY configured: ${WG_INTERFACE} -> 127.0.0.1:${TPROXY_PORT}"
-
-  # NAT/MASQUERADE for WireGuard ingress traffic going to internet
-  # Without this, responses from internet can't route back to private WG IPs
-  iptables -t nat -D POSTROUTING -s "${WG_SUBNET}" ! -o "${WG_INTERFACE}" -j MASQUERADE 2>/dev/null || true
-  iptables -t nat -A POSTROUTING -s "${WG_SUBNET}" ! -o "${WG_INTERFACE}" -j MASQUERADE
-  echo "[entrypoint] NAT configured: ${WG_SUBNET} -> MASQUERADE (for internet access)"
-}
-
-# Setup kernel WireGuard ingress before other services
-setup_kernel_wireguard
-
-# === Kernel WireGuard Egress Setup ===
-# Creates wg-pia-* and wg-eg-* interfaces for outbound traffic
-
-setup_kernel_wireguard_egress() {
-  echo "[entrypoint] setting up kernel WireGuard egress interfaces"
-
-  # Apply WireGuard egress config from database
-  if ! python3 /usr/local/bin/setup_kernel_wg_egress.py; then
-    echo "[entrypoint] warning: failed to setup kernel WireGuard egress" >&2
-    # Don't fail the container, just log the warning
-    return 0
-  fi
-
-  echo "[entrypoint] kernel WireGuard egress interfaces ready"
-}
-
-# Setup kernel WireGuard egress interfaces (PIA + custom)
-setup_kernel_wireguard_egress
-
-# === ECMP Routes Setup for Outbound Groups ===
-sync_ecmp_routes() {
-  echo "[entrypoint] syncing ECMP routes for outbound groups"
-  if python3 /usr/local/bin/ecmp_manager.py --sync-all 2>/dev/null; then
-    echo "[entrypoint] ECMP routes synced successfully"
+  echo "[entrypoint] syncing configuration to rust-router via IPC"
+  if python3 /usr/local/bin/rust_router_manager.py sync 2>&1 | head -50; then
+    echo "[entrypoint] rust-router sync completed"
   else
-    echo "[entrypoint] warning: ECMP route sync failed or no groups configured"
+    echo "[entrypoint] WARNING: rust-router sync failed"
+    return 1
   fi
 }
 
-# Sync ECMP routes for outbound groups (after egress interfaces are ready)
-sync_ecmp_routes
-
-# === Chain Routes Setup for Multi-hop Chains ===
-sync_chain_routes() {
-  echo "[entrypoint] syncing chain routes for multi-hop chains"
-  if python3 /usr/local/bin/chain_route_manager.py sync 2>/dev/null; then
-    echo "[entrypoint] chain routes synced successfully"
-  else
-    echo "[entrypoint] warning: chain route sync failed or no chains configured"
-  fi
-}
-
-# Sync chain routes (for terminal node DSCP routing)
-sync_chain_routes
+# ============================================================================
+# Service Start Functions
+# ============================================================================
 
 start_api_server() {
   if [ "${ENABLE_API:-1}" = "1" ]; then
@@ -419,7 +419,6 @@ start_api_server() {
 }
 
 start_openvpn_manager() {
-  # 检查是否有启用的 OpenVPN 配置
   local count
   count=$(python3 -c "
 import sys
@@ -433,83 +432,14 @@ print(len(db.get_openvpn_egress_list(enabled_only=True)))
     echo "[entrypoint] starting OpenVPN manager (${count} tunnels)"
     python3 /usr/local/bin/openvpn_manager.py daemon >/var/log/openvpn-manager.log 2>&1 &
     OPENVPN_MGR_PID=$!
-    echo "[entrypoint] OpenVPN manager started with PID ${OPENVPN_MGR_PID}"
   else
     echo "[entrypoint] no OpenVPN tunnels configured, skipping manager"
   fi
 }
 
-# === Xray TUN + TPROXY Setup ===
-# Xray for V2Ray ingress uses TUN interface similar to WireGuard
-
-XRAY_INTERFACE="${XRAY_INTERFACE:-xray-tun0}"
-XRAY_SUBNET="${XRAY_SUBNET:-10.24.0.0/24}"
-
-setup_xray_tproxy() {
-  # Get Xray TUN configuration from database
-  local xray_config
-  xray_config=$(python3 -c "
-import sys
-sys.path.insert(0, '/usr/local/bin')
-from db_helper import get_db
-import os
-import json
-db = get_db(
-    os.environ.get('GEODATA_DB_PATH', '/etc/sing-box/geoip-geodata.db'),
-    os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')
-)
-config = db.get_v2ray_inbound_config()
-if config and config.get('enabled'):
-    print(json.dumps({
-        'enabled': True,
-        'tun_device': config.get('tun_device', 'xray-tun0'),
-        'tun_subnet': config.get('tun_subnet', '10.24.0.0/24')
-    }))
-else:
-    print(json.dumps({'enabled': False}))
-" 2>/dev/null || echo '{"enabled": false}')
-
-  local enabled
-  enabled=$(echo "${xray_config}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('enabled', False))")
-
-  if [ "${enabled}" != "True" ]; then
-    echo "[entrypoint] Xray V2Ray ingress is disabled, skipping TPROXY setup"
-    return 0
-  fi
-
-  XRAY_INTERFACE=$(echo "${xray_config}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('tun_device', 'xray-tun0'))")
-  XRAY_SUBNET=$(echo "${xray_config}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('tun_subnet', '10.24.0.0/24'))")
-
-  echo "[entrypoint] setting up TPROXY routing for Xray traffic"
-  echo "[entrypoint] Xray TUN interface: ${XRAY_INTERFACE}, subnet: ${XRAY_SUBNET}"
-
-  # M12: 幂等的 iptables 规则设置 - 先删除再添加，避免重复
-  # Skip traffic to Xray server subnet (local subnet)
-  iptables -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -d "${XRAY_SUBNET}" -j RETURN 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -d "${XRAY_SUBNET}" -j RETURN
-
-  # TPROXY TCP traffic from Xray TUN interface to sing-box
-  iptables -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -p tcp \
-    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p tcp \
-    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
-
-  # TPROXY UDP traffic from Xray TUN interface to sing-box
-  iptables -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -p udp \
-    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p udp \
-    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
-
-  echo "[entrypoint] Xray TPROXY configured: ${XRAY_INTERFACE} -> 127.0.0.1:${TPROXY_PORT}"
-
-  # NAT/MASQUERADE for Xray V2Ray ingress traffic going to internet
-  iptables -t nat -D POSTROUTING -s "${XRAY_SUBNET}" ! -o "${XRAY_INTERFACE}" -j MASQUERADE 2>/dev/null || true
-  iptables -t nat -A POSTROUTING -s "${XRAY_SUBNET}" ! -o "${XRAY_INTERFACE}" -j MASQUERADE
-  echo "[entrypoint] NAT configured: ${XRAY_SUBNET} -> MASQUERADE (for internet access)"
-}
-
 start_xray_manager() {
-  # 检查 V2Ray 入口是否启用
+  # VLESS inbound is now handled natively by rust-router
+  # Configure via IPC instead of old xray_manager.py
   local enabled
   enabled=$(python3 -c "
 import sys
@@ -521,17 +451,173 @@ print('1' if config and config.get('enabled') else '0')
 " 2>/dev/null || echo "0")
 
   if [ "${enabled}" = "1" ]; then
-    echo "[entrypoint] starting Xray manager for V2Ray ingress"
-    python3 /usr/local/bin/xray_manager.py daemon >/var/log/xray-manager.log 2>&1 &
-    XRAY_MGR_PID=$!
-    echo "[entrypoint] Xray manager started with PID ${XRAY_MGR_PID}"
+    echo "[entrypoint] configuring VLESS inbound via rust-router IPC"
+    # Configure VLESS inbound through rust-router native implementation
+    python3 -c "
+import sys
+import os
+import asyncio
+from pathlib import Path
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+from rust_router_client import RustRouterClient
+
+async def configure_vless():
+    # Get encryption key from environment or fallback to file
+    encryption_key = os.environ.get('SQLCIPHER_KEY')
+    if not encryption_key:
+        key_file = Path('/etc/sing-box/encryption.key')
+        if key_file.exists():
+            encryption_key = key_file.read_text().strip()
+
+    db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db', encryption_key)
+    config = db.get_v2ray_inbound_config()
+    if not config or not config.get('enabled'):
+        return
+
+    # Get users
+    users = db.get_v2ray_users(enabled_only=True)
+    user_configs = []
+    for user in users:
+        user_configs.append({
+            'uuid': user.get('uuid'),
+            'email': user.get('email'),
+            'flow': user.get('flow', 'xtls-rprx-vision'),
+        })
+
+    if not user_configs:
+        print('[vless] No users configured')
+        return
+
+    listen = f\"0.0.0.0:{config.get('listen_port', 443)}\"
+    tls_cert = config.get('tls_cert_path')
+    tls_key = config.get('tls_key_path')
+    fallback = config.get('fallback_server')
+
+    # REALITY parameters
+    reality_enabled = config.get('reality_enabled')
+    reality_private_key = config.get('reality_private_key')
+    reality_short_ids_raw = config.get('reality_short_ids')
+    reality_dest = config.get('reality_dest')
+    reality_server_names_raw = config.get('reality_server_names')
+
+    # Parse REALITY short_ids and server_names (may be JSON array or comma-separated)
+    import json
+    reality_short_ids = None
+    reality_server_names = None
+    if reality_short_ids_raw:
+        try:
+            reality_short_ids = json.loads(reality_short_ids_raw) if isinstance(reality_short_ids_raw, str) and reality_short_ids_raw.startswith('[') else [s.strip() for s in str(reality_short_ids_raw).split(',')]
+        except:
+            reality_short_ids = [str(reality_short_ids_raw).strip()]
+    if reality_server_names_raw:
+        try:
+            reality_server_names = json.loads(reality_server_names_raw) if isinstance(reality_server_names_raw, str) and reality_server_names_raw.startswith('[') else [s.strip() for s in str(reality_server_names_raw).split(',')]
+        except:
+            reality_server_names = [str(reality_server_names_raw).strip()]
+
+    async with RustRouterClient() as client:
+        kwargs = {
+            'listen': listen,
+            'users': user_configs,
+            'tls_cert_path': tls_cert,
+            'tls_key_path': tls_key,
+            'fallback': fallback,
+        }
+        # Add REALITY parameters if enabled
+        if reality_enabled and reality_private_key:
+            kwargs['reality_private_key'] = reality_private_key
+            kwargs['reality_short_ids'] = reality_short_ids
+            kwargs['reality_dest'] = reality_dest
+            kwargs['reality_server_names'] = reality_server_names
+            kwargs['reality_max_time_diff_ms'] = 120000  # 2 minutes
+            print(f'[vless] REALITY enabled with dest={reality_dest}')
+
+        resp = await client.configure_vless_inbound(**kwargs)
+        if resp.success:
+            mode = 'REALITY' if reality_enabled and reality_private_key else ('TLS' if tls_cert else 'TCP')
+            print(f'[vless] Inbound configured on {listen} with {len(user_configs)} users ({mode} mode)')
+        else:
+            print(f'[vless] Failed to configure: {resp.error}')
+
+asyncio.run(configure_vless())
+" 2>&1 || echo "[entrypoint] VLESS inbound configuration failed"
+    # No daemon PID needed - rust-router handles the listener
+    XRAY_MGR_PID=""
   else
-    echo "[entrypoint] V2Ray ingress not enabled, skipping Xray manager"
+    echo "[entrypoint] V2Ray ingress not enabled, skipping VLESS inbound"
+  fi
+}
+
+start_shadowsocks_inbound() {
+  # Configure Shadowsocks inbound via rust-router IPC
+  local enabled
+  enabled=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
+config = db.get_shadowsocks_inbound_config()
+print('1' if config and config.get('enabled') else '0')
+" 2>/dev/null || echo "0")
+
+  if [ "${enabled}" = "1" ]; then
+    echo "[entrypoint] configuring Shadowsocks inbound via rust-router IPC"
+    python3 -c "
+import sys
+import os
+import asyncio
+from pathlib import Path
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+from rust_router_client import RustRouterClient
+
+async def configure_ss():
+    # Get encryption key from environment or fallback to file
+    encryption_key = os.environ.get('SQLCIPHER_KEY')
+    if not encryption_key:
+        key_file = Path('/etc/sing-box/encryption.key')
+        if key_file.exists():
+            encryption_key = key_file.read_text().strip()
+
+    db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db', encryption_key)
+    config = db.get_shadowsocks_inbound_config()
+    if not config or not config.get('enabled'):
+        return
+
+    listen_addr = config.get('listen_address', '0.0.0.0')
+    listen_port = config.get('listen_port', 8388)
+    listen = f'{listen_addr}:{listen_port}'
+    method = config.get('method', '2022-blake3-aes-256-gcm')
+    password = config.get('password')
+    udp_enabled = bool(config.get('udp_enabled', True))
+
+    if not password:
+        print('[ss] No password configured, skipping')
+        return
+
+    async with RustRouterClient() as client:
+        resp = await client.configure_shadowsocks_inbound(
+            listen=listen,
+            method=method,
+            password=password,
+            udp_enabled=udp_enabled,
+        )
+        if resp.success:
+            udp_status = 'TCP+UDP' if udp_enabled else 'TCP only'
+            print(f'[ss] Inbound configured on {listen} ({method}, {udp_status})')
+        else:
+            print(f'[ss] Failed to configure: {resp.error}')
+
+asyncio.run(configure_ss())
+" 2>&1 || echo "[entrypoint] Shadowsocks inbound configuration failed"
+  else
+    echo "[entrypoint] Shadowsocks ingress not enabled, skipping"
   fi
 }
 
 start_xray_egress_manager() {
-  # 检查是否有启用的 V2Ray 出口
+  # Count only VMess/Trojan egress - VLESS is handled natively by rust-router
   local egress_count
   egress_count=$(python3 -c "
 import sys
@@ -539,44 +625,29 @@ sys.path.insert(0, '/usr/local/bin')
 from db_helper import get_db
 db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
 egress_list = db.get_v2ray_egress_list(enabled_only=True)
-print(len(egress_list))
+# Count only non-VLESS protocols (VMess/Trojan need Xray SOCKS5 proxy)
+non_vless_count = sum(1 for e in egress_list if e.get('protocol', '').lower() != 'vless')
+print(non_vless_count)
 " 2>/dev/null || echo "0")
 
   if [ "${egress_count}" -gt "0" ]; then
-    echo "[entrypoint] starting Xray egress manager for ${egress_count} V2Ray egress"
-    python3 /usr/local/bin/xray_egress_manager.py daemon >/var/log/xray-egress-manager.log 2>&1 &
-    XRAY_EGRESS_MGR_PID=$!
-    echo "[entrypoint] Xray egress manager started with PID ${XRAY_EGRESS_MGR_PID}"
+    # Check if xray_egress_manager.py exists (was removed in favor of native rust-router VLESS)
+    if [ -f "/usr/local/bin/xray_egress_manager.py" ]; then
+      echo "[entrypoint] starting Xray egress manager for ${egress_count} VMess/Trojan egress"
+      python3 /usr/local/bin/xray_egress_manager.py daemon >/var/log/xray-egress-manager.log 2>&1 &
+      XRAY_EGRESS_MGR_PID=$!
+    else
+      echo "[entrypoint] WARNING: ${egress_count} VMess/Trojan egress configured but xray_egress_manager.py not found"
+      echo "[entrypoint] VMess/Trojan egress require xray_egress_manager.py. VLESS egress use native rust-router."
+    fi
   else
-    echo "[entrypoint] No V2Ray egress configured, skipping Xray egress manager"
+    echo "[entrypoint] No VMess/Trojan egress configured (VLESS uses native rust-router)"
   fi
 }
 
-start_warp_manager() {
-  # 检查是否有启用的 WARP 出口
-  local warp_count
-  warp_count=$(python3 -c "
-import sys
-sys.path.insert(0, '/usr/local/bin')
-from db_helper import get_db
-db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
-egress_list = db.get_warp_egress_list(enabled_only=True)
-print(len(egress_list))
-" 2>/dev/null || echo "0")
+# start_warp_manager() removed - MASQUE deprecated, WireGuard managed via rust-router IPC
 
-  if [ "${warp_count}" -gt "0" ]; then
-    echo "[entrypoint] starting WARP manager for ${warp_count} WARP egress"
-    python3 /usr/local/bin/warp_manager.py daemon >/var/log/warp-manager.log 2>&1 &
-    WARP_MGR_PID=$!
-    echo "[entrypoint] WARP manager started with PID ${WARP_MGR_PID}"
-  else
-    echo "[entrypoint] No WARP egress configured, skipping WARP manager"
-  fi
-}
-
-# === Health Checker Daemon ===
 start_health_checker() {
-  # 检查是否有启用的出口组
   local group_count
   group_count=$(python3 -c "
 import sys
@@ -591,65 +662,39 @@ print(len(groups))
     echo "[entrypoint] starting health checker for ${group_count} outbound groups"
     python3 /usr/local/bin/health_checker.py --daemon >/var/log/health-checker.log 2>&1 &
     HEALTH_CHECKER_PID=$!
-    echo "[entrypoint] health checker started with PID ${HEALTH_CHECKER_PID}"
   else
     echo "[entrypoint] No outbound groups configured, skipping health checker"
   fi
 }
 
-# === Peer Tunnel Manager Daemon ===
 start_peer_tunnel_manager() {
-  # 检查是否有启用自动重连的对等节点
-  local peer_count
-  peer_count=$(python3 -c "
-import sys
-sys.path.insert(0, '/usr/local/bin')
-from db_helper import get_db
-db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
-peers = db.get_peer_nodes()
-# 统计启用自动重连的节点数
-count = sum(1 for p in peers if p.get('auto_reconnect', False))
-print(count)
-" 2>/dev/null || echo "0")
-
-  if [ "${peer_count}" -gt "0" ]; then
-    echo "[entrypoint] starting peer tunnel manager for ${peer_count} auto-reconnect peers"
-    python3 /usr/local/bin/peer_tunnel_manager.py daemon >/var/log/peer-tunnel-manager.log 2>&1 &
-    PEER_TUNNEL_MGR_PID=$!
-    echo "[entrypoint] peer tunnel manager started with PID ${PEER_TUNNEL_MGR_PID}"
-  else
-    echo "[entrypoint] No auto-reconnect peers configured, skipping peer tunnel manager"
-  fi
+  # peer_tunnel_manager.py uses kernel WireGuard (wg set/show).
+  # In userspace mode, peer tunnels are managed by rust-router via IPC.
+  # Skip this legacy manager.
+  echo "[entrypoint] peer tunnels managed by rust-router (userspace mode)"
 }
 
 start_nginx() {
   echo "[entrypoint] starting nginx on port ${WEB_PORT}"
 
-  # Ensure nginx log directory exists (may be missing if volume mounted)
   mkdir -p /var/log/nginx
   chown www-data:www-data /var/log/nginx 2>/dev/null || true
 
-  # Generate nginx.conf from template with environment variables
   NGINX_TEMPLATE="/etc/nginx/nginx.conf.template"
   NGINX_CONF="/etc/nginx/conf.d/default.conf"
   if [ -f "${NGINX_TEMPLATE}" ]; then
     envsubst '${WEB_PORT} ${API_PORT}' < "${NGINX_TEMPLATE}" > "${NGINX_CONF}"
-    echo "[entrypoint] generated nginx config with WEB_PORT=${WEB_PORT}, API_PORT=${API_PORT}"
   fi
 
-  # Test nginx configuration
   nginx -t
   if [ $? -ne 0 ]; then
     echo "[entrypoint] nginx configuration test failed" >&2
     exit 1
   fi
 
-  # Start nginx in foreground mode (daemon off)
   nginx -g "daemon off;" &
   NGINX_PID=$!
-  echo "[entrypoint] nginx started with PID ${NGINX_PID}"
 
-  # Verify startup success
   sleep 2
   if ! kill -0 "${NGINX_PID}" 2>/dev/null; then
     echo "[entrypoint] nginx failed to start" >&2
@@ -657,7 +702,105 @@ start_nginx() {
   fi
 }
 
-# PIA provisioning (if credentials provided)
+start_rust_router() {
+  if [ ! -x "${RUST_ROUTER_BIN}" ]; then
+    echo "[entrypoint] rust-router binary not found at ${RUST_ROUTER_BIN}" >&2
+    return 1
+  fi
+
+  if [ ! -f "${RUST_ROUTER_CONFIG}" ]; then
+    echo "[entrypoint] rust-router config not found at ${RUST_ROUTER_CONFIG}" >&2
+    return 1
+  fi
+
+  echo "[entrypoint] starting rust-router with ${RUST_ROUTER_CONFIG}"
+
+  # Environment variables for rust-router
+  export RUST_ROUTER_LISTEN="0.0.0.0:7894"
+  export RUST_ROUTER_CONFIG="${RUST_ROUTER_CONFIG}"
+  export RUST_ROUTER_SOCKET="${RUST_ROUTER_SOCKET}"
+  # Log level: RUST_LOG takes precedence, then RUST_ROUTER_LOG_LEVEL
+  export RUST_LOG="${RUST_LOG:-info}"
+  if [ -n "${RUST_ROUTER_LOG_LEVEL:-}" ]; then
+    export RUST_ROUTER_LOG_LEVEL="${RUST_ROUTER_LOG_LEVEL}"
+  fi
+
+  # Userspace WireGuard configuration
+  export RUST_ROUTER_USERSPACE_WG="true"
+  export RUST_ROUTER_WG_LISTEN_PORT="${WG_LISTEN_PORT}"
+
+  # Get WireGuard private key from database
+  RUST_ROUTER_WG_PRIVATE_KEY=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+import os
+from pathlib import Path
+
+encryption_key = os.environ.get('SQLCIPHER_KEY')
+if not encryption_key:
+    key_file = Path(os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')).parent / 'encryption.key'
+    if key_file.exists():
+        encryption_key = key_file.read_text().strip()
+
+db = get_db(
+    os.environ.get('GEODATA_DB_PATH', '/etc/sing-box/geoip-geodata.db'),
+    os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db'),
+    encryption_key
+)
+server = db.get_wireguard_server()
+if server and server.get('private_key'):
+    print(server['private_key'])
+else:
+    print('')
+" 2>/dev/null || echo "")
+
+  if [ -n "${RUST_ROUTER_WG_PRIVATE_KEY}" ]; then
+    export RUST_ROUTER_WG_PRIVATE_KEY
+    echo "[entrypoint] rust-router userspace WireGuard enabled (port ${WG_LISTEN_PORT})"
+  else
+    echo "[entrypoint] WARNING: No WireGuard private key found in database" >&2
+  fi
+
+  # Start rust-router with backtrace enabled for debugging crashes
+  RUST_BACKTRACE=1 "${RUST_ROUTER_BIN}" >> "${RUST_ROUTER_LOG}" 2>&1 &
+  RUST_ROUTER_PID=$!
+
+  sleep 1
+  if ! kill -0 "${RUST_ROUTER_PID}" 2>/dev/null; then
+    echo "[entrypoint] rust-router failed to start, check ${RUST_ROUTER_LOG}" >&2
+    RUST_ROUTER_PID=""
+    return 1
+  fi
+
+  echo "[entrypoint] rust-router started (PID: ${RUST_ROUTER_PID})"
+  return 0
+}
+
+# ============================================================================
+# Signal Handling
+# ============================================================================
+
+handle_signals() {
+  echo "[entrypoint] received signal, shutting down..."
+
+  if [ -n "${RUST_ROUTER_PID:-}" ] && kill -0 "${RUST_ROUTER_PID}" 2>/dev/null; then
+    echo "[entrypoint] stopping rust-router"
+    kill "${RUST_ROUTER_PID}" 2>/dev/null || true
+    wait "${RUST_ROUTER_PID}" 2>/dev/null || true
+  fi
+
+  cleanup
+  exit 0
+}
+
+trap handle_signals SIGTERM SIGINT
+
+# ============================================================================
+# Config Generation
+# ============================================================================
+
+# PIA provisioning
 if [ -n "${PIA_USERNAME:-}" ] && [ -n "${PIA_PASSWORD:-}" ]; then
   export PIA_PROFILES_FILE="${PIA_PROFILES_FILE:-/etc/sing-box/pia/profiles.yml}"
   export PIA_PROFILES_OUTPUT="${PIA_PROFILES_OUTPUT:-/etc/sing-box/pia-profiles.json}"
@@ -671,102 +814,70 @@ if [ -n "${PIA_USERNAME:-}" ] && [ -n "${PIA_PASSWORD:-}" ]; then
   fi
 fi
 
-# Always render sing-box config (adds wg-server endpoint, sniff action, etc.)
-export SING_BOX_BASE_CONFIG="${BASE_CONFIG_PATH}"
-export SING_BOX_GENERATED_CONFIG="${GENERATED_CONFIG_PATH}"
-echo "[entrypoint] rendering sing-box config"
-if ! python3 /usr/local/bin/render_singbox.py; then
-  echo "[entrypoint] render sing-box config failed" >&2
+# NOTE: render_singbox.py removed - sing-box is no longer used.
+# rust-router handles all routing and WireGuard tunnels in userspace.
+# The sing-box.generated.json file is no longer needed.
+
+# Generate rust-router config
+echo "[entrypoint] rendering rust-router config"
+mkdir -p "$(dirname "${RUST_ROUTER_CONFIG}")"
+export RUST_ROUTER_PORT="7894"
+if ! python3 /usr/local/bin/render_routing_config.py \
+    --format=rust-router \
+    --output="${RUST_ROUTER_CONFIG}"; then
+  echo "[entrypoint] rust-router config generation failed" >&2
   exit 1
 fi
-CONFIG_PATH="${GENERATED_CONFIG_PATH}"
+echo "[entrypoint] rust-router config generated: ${RUST_ROUTER_CONFIG}"
+
+# ============================================================================
+# Start Services
+# ============================================================================
 
 start_api_server
 start_nginx
 start_openvpn_manager
+
+# Start rust-router first (health_checker, VLESS inbound need IPC socket)
+echo "[entrypoint] starting rust-router (userspace WireGuard mode)"
+if start_rust_router; then
+  echo "[entrypoint] rust-router started successfully"
+  sync_rust_router || echo "[entrypoint] WARNING: initial sync failed, will retry later"
+else
+  echo "[entrypoint] FATAL: rust-router failed to start" >&2
+  exit 1
+fi
+
+# Configure VLESS/Shadowsocks inbound AFTER rust-router is ready (needs IPC socket)
 start_xray_manager
+start_shadowsocks_inbound
 start_xray_egress_manager
-start_warp_manager
+
+# Start health checker AFTER rust-router (needs IPC socket)
 start_health_checker
 start_peer_tunnel_manager
 
-echo "[entrypoint] starting sing-box with ${CONFIG_PATH}"
+# WARP manager removed - WARP tunnels managed via rust-router IPC
 
-# 启动 sing-box 并监控，支持 API 触发的重启
-# 不使用 exec，以便 API 可以重启 sing-box 而不影响容器
-SINGBOX_PID=""
+# NOTE: Peer tunnel subnet routing removed - userspace WireGuard mode
+# routes HTTP traffic through rust-router's internal WireGuard implementation
 
-start_singbox() {
-  local config="$1"
-  if [ -z "$config" ]; then
-    # 优先使用生成的配置
-    if [ -f "${GENERATED_CONFIG_PATH}" ]; then
-      config="${GENERATED_CONFIG_PATH}"
-    else
-      config="${BASE_CONFIG_PATH}"
-    fi
-  fi
-  echo "[entrypoint] starting sing-box with ${config}"
-  sing-box run -c "${config}" &
-  SINGBOX_PID=$!
-}
+echo "[entrypoint] DNS engine: enabled (port ${RUST_ROUTER_DNS_PORT})"
 
-handle_signals() {
-  echo "[entrypoint] received signal, shutting down..."
-  if [ -n "${SINGBOX_PID:-}" ] && kill -0 "${SINGBOX_PID}" 2>/dev/null; then
-    kill "${SINGBOX_PID}" 2>/dev/null || true
-    wait "${SINGBOX_PID}" 2>/dev/null || true
-  fi
-  cleanup
-  exit 0
-}
+# ============================================================================
+# Log Rotation
+# ============================================================================
 
-trap handle_signals SIGTERM SIGINT
-
-start_singbox "${CONFIG_PATH}"
-
-# Setup TPROXY routing for WireGuard traffic (no need to wait for sing-box)
-setup_tproxy_routing
-
-# Setup TPROXY routing for Xray V2Ray ingress traffic
-setup_xray_tproxy
-
-# Log rotation configuration
-LOG_MAX_SIZE="${LOG_MAX_SIZE:-10485760}"  # 10 MB default
+LOG_MAX_SIZE="${LOG_MAX_SIZE:-10485760}"
 LOG_ROTATE_COUNT=0
 
 rotate_logs() {
-  # Only check every 60 seconds
   LOG_ROTATE_COUNT=$((LOG_ROTATE_COUNT + 1))
   if [ $((LOG_ROTATE_COUNT % 60)) -ne 0 ]; then
     return
   fi
 
-  # Rotate sing-box log
-  local log_file="/var/log/sing-box.log"
-  if [ -f "${log_file}" ]; then
-    local size
-    size=$(stat -c%s "${log_file}" 2>/dev/null || echo 0)
-    if [ "${size}" -gt "${LOG_MAX_SIZE}" ]; then
-      echo "[entrypoint] rotating ${log_file} (${size} bytes > ${LOG_MAX_SIZE})"
-      # Keep last 1000 lines and truncate
-      tail -n 1000 "${log_file}" > "${log_file}.tmp" && mv "${log_file}.tmp" "${log_file}"
-    fi
-  fi
-
-  # Rotate API server log
-  log_file="/var/log/api-server.log"
-  if [ -f "${log_file}" ]; then
-    local size
-    size=$(stat -c%s "${log_file}" 2>/dev/null || echo 0)
-    if [ "${size}" -gt "${LOG_MAX_SIZE}" ]; then
-      echo "[entrypoint] rotating ${log_file} (${size} bytes)"
-      tail -n 1000 "${log_file}" > "${log_file}.tmp" && mv "${log_file}.tmp" "${log_file}"
-    fi
-  fi
-
-  # Rotate nginx logs
-  for log_file in /var/log/nginx/*.log; do
+  for log_file in /var/log/api-server.log /var/log/rust-router.log /var/log/nginx/*.log; do
     if [ -f "${log_file}" ]; then
       local size
       size=$(stat -c%s "${log_file}" 2>/dev/null || echo 0)
@@ -778,9 +889,23 @@ rotate_logs() {
   done
 }
 
-# 主循环：监控 nginx, API 和 sing-box 进程
+# ============================================================================
+# Main Loop
+# ============================================================================
+
+SYNC_CHECK_COUNT=0
+
 while true; do
   rotate_logs
+
+  # Periodic rust-router sync (every 5 minutes)
+  SYNC_CHECK_COUNT=$((SYNC_CHECK_COUNT + 1))
+  if [ $((SYNC_CHECK_COUNT % 300)) -eq 0 ]; then
+    if [ -S "${RUST_ROUTER_SOCKET}" ]; then
+      sync_rust_router >/dev/null 2>&1 || true
+    fi
+  fi
+
   # Check nginx
   if [ -n "${NGINX_PID}" ] && ! kill -0 "${NGINX_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: nginx died" >&2
@@ -797,7 +922,9 @@ while true; do
     start_openvpn_manager
   fi
 
-  # Check Xray manager (ingress)
+  # Check Xray manager (legacy - now VLESS inbound is handled by rust-router)
+  # XRAY_MGR_PID is always empty since VLESS is native to rust-router
+  # This check is kept for backward compatibility but will never trigger
   if [ -n "${XRAY_MGR_PID}" ] && ! kill -0 "${XRAY_MGR_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: Xray manager died, restarting..." >&2
     start_xray_manager
@@ -809,11 +936,7 @@ while true; do
     start_xray_egress_manager
   fi
 
-  # Check WARP manager
-  if [ -n "${WARP_MGR_PID}" ] && ! kill -0 "${WARP_MGR_PID}" 2>/dev/null; then
-    echo "[entrypoint] WARNING: WARP manager died, restarting..." >&2
-    start_warp_manager
-  fi
+  # WARP manager check removed (deprecated)
 
   # Check health checker
   if [ -n "${HEALTH_CHECKER_PID}" ] && ! kill -0 "${HEALTH_CHECKER_PID}" 2>/dev/null; then
@@ -827,22 +950,23 @@ while true; do
     start_peer_tunnel_manager
   fi
 
-  # Check sing-box
-  if ! kill -0 "${SINGBOX_PID}" 2>/dev/null; then
-    wait "${SINGBOX_PID}" 2>/dev/null || true
+  # Check rust-router
+  if [ -n "${RUST_ROUTER_PID}" ] && ! kill -0 "${RUST_ROUTER_PID}" 2>/dev/null; then
+    wait "${RUST_ROUTER_PID}" 2>/dev/null || true
     EXIT_CODE=$?
-    echo "[entrypoint] sing-box exited with code ${EXIT_CODE}"
+    echo "[entrypoint] rust-router exited with code ${EXIT_CODE}"
 
-    # 检查是否有生成的配置
-    if [ -f "${GENERATED_CONFIG_PATH}" ]; then
-      echo "[entrypoint] restarting sing-box with generated config"
-      start_singbox "${GENERATED_CONFIG_PATH}"
+    if start_rust_router; then
+      echo "[entrypoint] rust-router restarted successfully"
+      sync_rust_router || echo "[entrypoint] WARNING: sync after restart failed"
+      # Re-configure inbounds after restart (VLESS and Shadowsocks)
+      start_xray_manager
+      start_shadowsocks_inbound
     else
-      echo "[entrypoint] sing-box exited, no generated config available"
-      # 等待一段时间后尝试重新启动
-      sleep 5
-      start_singbox "${BASE_CONFIG_PATH}"
+      echo "[entrypoint] FATAL: rust-router restart failed" >&2
+      exit 1
     fi
   fi
+
   sleep 1
 done

@@ -35,8 +35,15 @@ except ImportError:
     HAS_SQLCIPHER = False
     import sqlite3 as sqlcipher
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# 配置日志（统一日志配置，通过 LOG_LEVEL 环境变量控制）
+try:
+    from log_config import setup_logging, get_logger
+    setup_logging()
+    logger = get_logger(__name__)
+except ImportError:
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=getattr(logging, _log_level, logging.INFO))
+    logger = logging.getLogger(__name__)
 
 
 class KeyManager:

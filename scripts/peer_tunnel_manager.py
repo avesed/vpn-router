@@ -2,16 +2,26 @@
 """
 对等节点隧道管理器
 
+.. deprecated::
+    此模块已弃用。rust-router 现在在用户空间管理对等节点隧道。
+    
+    - 在 userspace WireGuard 模式下，此管理器不再启动
+    - 对等节点隧道通过 rust-router IPC 管理
+    - 参见 rust-router/src/ingress/manager.rs
+    
+    保留此文件仅用于向后兼容和参考。entrypoint.sh 中已跳过此管理器的启动。
+
+原始功能说明（已废弃）：
 管理节点间的 WireGuard 和 Xray 隧道连接，支持：
 - 从数据库读取节点配置
 - 建立和维护点对点隧道
 - 自动重连机制
 - 隧道状态监控
 
-WireGuard 隧道创建 wg-peer-{tag} 接口，
+WireGuard 隧道创建 wg-peer-{tag} 接口（内核模式，已废弃），
 Xray 隧道使用 SOCKS5 代理桥接。
 
-使用方法:
+使用方法（已废弃）:
     python3 peer_tunnel_manager.py start      # 启动所有启用的隧道
     python3 peer_tunnel_manager.py stop       # 停止所有隧道
     python3 peer_tunnel_manager.py reload     # 重载配置
@@ -54,12 +64,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from db_helper import get_db
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[peer-tunnel] %(asctime)s %(levelname)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+# 配置日志（统一日志配置，通过 LOG_LEVEL 环境变量控制）
+try:
+    from log_config import setup_logging, get_logger
+    setup_logging()
+    logger = get_logger(__name__)
+except ImportError:
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format='[peer-tunnel] %(asctime)s %(levelname)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger(__name__)
 
 # 配置路径
 PEER_RUN_DIR = Path("/run/peer-tunnels")
@@ -72,7 +89,7 @@ SQLCIPHER_KEY = os.environ.get("SQLCIPHER_KEY")
 # 隧道 IP 子网
 PEER_TUNNEL_SUBNET = "10.200.200"
 
-# ============ Phase 11-Fix.D: 端口分配说明 ============
+# ============ 端口分配说明 ============
 #
 # 端口用途表（可通过环境变量配置）:
 #   WEB_PORT (36000)              Web UI + API（nginx）
@@ -89,19 +106,19 @@ PEER_TUNNEL_SUBNET = "10.200.200"
 #
 # ============================================
 
-# Phase 6 Fix: Peer tunnel port range (must match db_helper.py and CLAUDE.md)
+# Peer tunnel port range (must match db_helper.py and CLAUDE.md)
 # Valid range: 36200-36299 (100 ports for peer tunnels)
 PEER_TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
 PEER_TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
 PEER_XRAY_SOCKS_PORT_START = int(os.environ.get("PEER_XRAY_SOCKS_PORT_START", "37201"))
 
-# Phase 8 Fix: Peer tunnel routing table range (500-599)
+# Peer tunnel routing table range (500-599)
 # Derived from port: table = PEER_TABLE_BASE + (port - PEER_TUNNEL_PORT_MIN)
 PEER_TABLE_BASE = 500
 
 
 def get_peer_routing_table(tunnel_port: int) -> int:
-    """Phase 8 Fix: 从隧道端口计算路由表号（确定性，无冲突）
+    """ 从隧道端口计算路由表号（确定性，无冲突）
 
     端口 36200-36299 映射到路由表 500-599。
     每个 peer 有唯一端口，因此路由表号也唯一。
@@ -130,6 +147,45 @@ RECONNECT_INTERVAL = 30  # 快速重连间隔（秒）
 HEALTH_CHECK_INTERVAL = 60  # 健康检查间隔（秒）
 MAX_FAST_RECONNECT_ATTEMPTS = 5  # 快速重连最大尝试次数
 SLOW_RECONNECT_INTERVAL = 600  # 慢速重连间隔（秒）= 10 分钟
+# 抖动配置（防止 thundering herd）
+JITTER_FACTOR = 0.25  # 抖动因子：±25% 随机偏移
+EXPONENTIAL_BACKOFF_BASE = 2  # 指数退避基数
+MAX_BACKOFF_INTERVAL = 1800  # 最大退避间隔（30 分钟）
+
+
+def calculate_jittered_backoff(attempt: int, base_interval: float) -> float:
+    """ 计算带抖动的指数退避间隔
+
+    防止多个节点同时重连导致的 "thundering herd" 问题。
+
+    算法:
+    - 指数退避: interval = base * (2 ^ attempt)
+    - 添加随机抖动: final = interval * (1 ± jitter_factor)
+    - 限制最大值: min(final, MAX_BACKOFF_INTERVAL)
+
+    Args:
+        attempt: 当前尝试次数 (0-based)
+        base_interval: 基础间隔（秒）
+
+    Returns:
+        带抖动的退避间隔（秒）
+    """
+    import random
+
+    # 指数退避（但在快速重连阶段使用固定间隔）
+    if attempt < MAX_FAST_RECONNECT_ATTEMPTS:
+        interval = base_interval
+    else:
+        # 慢速重连阶段使用指数退避
+        backoff_multiplier = EXPONENTIAL_BACKOFF_BASE ** (attempt - MAX_FAST_RECONNECT_ATTEMPTS)
+        interval = SLOW_RECONNECT_INTERVAL * min(backoff_multiplier, 4)  # 最多 4x
+
+    # 添加随机抖动（±25%）
+    jitter = interval * JITTER_FACTOR * (2 * random.random() - 1)
+    final_interval = interval + jitter
+
+    # 限制最大值
+    return min(final_interval, MAX_BACKOFF_INTERVAL)
 
 
 def write_pid_file_atomic(pid_path: Path, pid: int) -> None:
@@ -454,7 +510,7 @@ def create_wireguard_tunnel_with_endpoint(
     peer_public_key: str,
     remote_endpoint: str,
 ) -> tuple:
-    """Phase 11-Tunnel: 创建 WireGuard 隧道并连接到远程端点
+    """ 创建 WireGuard 隧道并连接到远程端点
 
     用于导入配对请求时，Node B 创建隧道并连接到 Node A。
 
@@ -539,7 +595,7 @@ def create_wireguard_tunnel_with_endpoint(
         )
 
         # 设置策略路由
-        # Phase 8 Fix: 使用端口派生的确定性路由表号（替代 hash() 的非确定性行为）
+        # 使用端口派生的确定性路由表号（替代 hash() 的非确定性行为）
         table_num = get_peer_routing_table(listen_port)
         subprocess.run(
             ["ip", "route", "add", "default", "via", remote_ip, "dev", interface_name, "table", str(table_num)],
@@ -695,7 +751,7 @@ class PeerTunnelManager:
         local_ip = node["tunnel_local_ip"]
         remote_ip = node.get("tunnel_remote_ip", f"{PEER_TUNNEL_SUBNET}.2")
         endpoint = node["endpoint"]
-        # Phase 8 Fix: tunnel_port 必须在创建节点时分配，缺失则报错
+        # tunnel_port 必须在创建节点时分配，缺失则报错
         port = node.get("tunnel_port")
         if not port:
             logger.error(f"[{tag}] tunnel_port 未分配，请检查节点创建流程")
@@ -771,7 +827,7 @@ class PeerTunnelManager:
 
             # 设置策略路由: 从本地隧道 IP 发出的流量通过对端转发
             # 这允许 sing-box 使用 bind_interface 时流量正确路由
-            # Phase 8 Fix: 使用端口派生的确定性路由表号
+            # 使用端口派生的确定性路由表号
             # 路由表分配：ECMP 200-299, DSCP 300-363, 中继 400-463, 对等 500-599
             table_num = get_peer_routing_table(port)
 
@@ -825,7 +881,7 @@ class PeerTunnelManager:
 
             # 清理策略路由规则
             if local_ip and node:
-                # Phase 8 Fix: 使用端口派生的确定性路由表号
+                # 使用端口派生的确定性路由表号
                 tunnel_port = node.get("tunnel_port")
                 if tunnel_port:
                     table_num = get_peer_routing_table(tunnel_port)
@@ -910,7 +966,17 @@ class PeerTunnelManager:
             是否成功
         """
         tag = node["tag"]
-        socks_port = node.get("xray_socks_port") or PEER_XRAY_SOCKS_PORT_START
+        # 必须使用数据库中分配的端口以确保一致性
+        socks_port = node.get("xray_socks_port")
+        if not socks_port:
+            # 基于 tag 计算确定性端口（使用 MD5 而非 hash()）
+            # hash() 在不同 Python 进程间不稳定（hash randomization）
+            # 注意：必须与 xray_manager.py 使用相同的算法
+            tag_hash = int(hashlib.md5(tag.encode()).hexdigest()[:8], 16) % 99
+            socks_port = PEER_XRAY_SOCKS_PORT_START + tag_hash
+            logger.warning(
+                f"[{tag}] 缺少 xray_socks_port，使用基于哈希的端口 {socks_port}"
+            )
         endpoint = node.get("endpoint", "")
         xray_uuid = node.get("xray_uuid")
 
@@ -1087,7 +1153,17 @@ class PeerTunnelManager:
             是否成功
         """
         tag = node["tag"]
-        socks_port = node.get("xray_socks_port") or PEER_XRAY_SOCKS_PORT_START
+        # 必须使用数据库中分配的端口以确保一致性
+        socks_port = node.get("xray_socks_port")
+        if not socks_port:
+            # 基于 tag 计算确定性端口（使用 MD5 而非 hash()）
+            # hash() 在不同 Python 进程间不稳定（hash randomization）
+            # 注意：必须与 xray_manager.py 使用相同的算法
+            tag_hash = int(hashlib.md5(tag.encode()).hexdigest()[:8], 16) % 99
+            socks_port = PEER_XRAY_SOCKS_PORT_START + tag_hash
+            logger.warning(
+                f"[{tag}] 缺少 xray_socks_port，使用基于哈希的端口 {socks_port}"
+            )
         endpoint = node.get("endpoint", "")
 
         # 检查对端是否启用了入站
@@ -1822,18 +1898,30 @@ class PeerTunnelManager:
         now = time.time()
         for tag, tunnel in list(self.tunnels.items()):
             if tunnel.status != "connected":
-                # 尝试重连
+                # 使用抖动退避计算重连间隔
+                required_interval = calculate_jittered_backoff(
+                    tunnel.reconnect_attempts,
+                    RECONNECT_INTERVAL
+                )
+                time_since_last = now - tunnel.last_reconnect_time
+
                 if tunnel.reconnect_attempts < MAX_FAST_RECONNECT_ATTEMPTS:
-                    # 快速重连阶段（前 5 次）
-                    logger.info(f"[{tag}] 快速重连 ({tunnel.reconnect_attempts + 1}/{MAX_FAST_RECONNECT_ATTEMPTS})")
-                    tunnel.reconnect_attempts += 1
-                    tunnel.last_reconnect_time = now
-                    self.connect_node(tag)
+                    # 快速重连阶段（前 5 次）- 使用基础间隔 + 抖动
+                    if time_since_last >= required_interval or tunnel.reconnect_attempts == 0:
+                        logger.info(
+                            f"[{tag}] 快速重连 ({tunnel.reconnect_attempts + 1}/"
+                            f"{MAX_FAST_RECONNECT_ATTEMPTS})，间隔={required_interval:.1f}s"
+                        )
+                        tunnel.reconnect_attempts += 1
+                        tunnel.last_reconnect_time = now
+                        self.connect_node(tag)
                 else:
-                    # 慢速重连阶段（超过 5 次，每 10 分钟一次，不限次数）
-                    time_since_last = now - tunnel.last_reconnect_time
-                    if time_since_last >= SLOW_RECONNECT_INTERVAL:
-                        logger.info(f"[{tag}] 慢速重连（第 {tunnel.reconnect_attempts + 1} 次，每 10 分钟尝试）")
+                    # 慢速重连阶段 - 使用指数退避 + 抖动
+                    if time_since_last >= required_interval:
+                        logger.info(
+                            f"[{tag}] 慢速重连（第 {tunnel.reconnect_attempts + 1} 次，"
+                            f"下次间隔≈{required_interval:.0f}s）"
+                        )
                         tunnel.reconnect_attempts += 1
                         tunnel.last_reconnect_time = now
                         self.connect_node(tag)

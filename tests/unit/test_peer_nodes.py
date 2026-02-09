@@ -1,5 +1,5 @@
 """
-Unit tests for Peer Node Management (Phase 1) - Database and API layer.
+Unit tests for Peer Node Management - Database and API layer.
 """
 
 import json

@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -35,13 +36,22 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+# rust-router IPC socket path
+RUST_ROUTER_SOCKET = os.environ.get("RUST_ROUTER_SOCKET", "/run/rust-router.sock")
+
+# 配置日志（统一日志配置，通过 LOG_LEVEL 环境变量控制）
+try:
+    from log_config import setup_logging, get_logger
+    setup_logging()
+    logger = get_logger(__name__)
+except ImportError:
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger(__name__)
 
 # 数据库路径
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
@@ -57,10 +67,7 @@ _shutdown_event = threading.Event()
 
 def get_interface_for_egress(db, tag: str) -> Optional[str]:
     """获取出口 tag 对应的内核网络接口名"""
-    try:
-        from db_helper import get_egress_interface_name
-    except ImportError:
-        from setup_kernel_wg_egress import get_egress_interface_name
+    from db_helper import get_egress_interface_name
 
     # 检查 PIA profile
     profile = db.get_pia_profile_by_name(tag)
@@ -87,9 +94,155 @@ def get_interface_for_egress(db, tag: str) -> Optional[str]:
 
 def get_warp_interface_name(tag: str) -> Optional[str]:
     """获取 WARP WireGuard 出口的内核接口名"""
-    # setup_kernel_wg_egress.py 的版本支持 egress_type 参数
-    from setup_kernel_wg_egress import get_egress_interface_name
+    from db_helper import get_egress_interface_name
     return get_egress_interface_name(tag, egress_type="warp")
+
+
+def interface_exists(interface: str) -> bool:
+    """检查内核接口是否存在"""
+    try:
+        result = subprocess.run(
+            ["ip", "link", "show", interface],
+            capture_output=True,
+            timeout=5
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def check_health_via_rust_router(tag: str, url: str, timeout: int) -> Tuple[bool, int, str]:
+    """通过 rust-router IPC 检查出口健康状态
+
+    用于 rust-router 管理的用户态 WireGuard 隧道。
+
+    Args:
+        tag: 出口 tag
+        url: 健康检查 URL
+        timeout: 超时时间
+
+    Returns:
+        (healthy: bool, latency_ms: int, error: str)
+    """
+    if not os.path.exists(RUST_ROUTER_SOCKET):
+        return False, 0, "rust-router socket not found"
+
+    try:
+        # 查询 rust-router 获取 outbound 健康状态
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(RUST_ROUTER_SOCKET)
+
+        # 发送 GetOutboundHealth 命令 (IPC v3.2 格式)
+        request = json.dumps({"type": "get_outbound_health"})
+        request_bytes = request.encode('utf-8')
+        length_prefix = len(request_bytes).to_bytes(4, 'big')
+        sock.sendall(length_prefix + request_bytes)
+
+        # 读取响应
+        length_bytes = sock.recv(4)
+        if len(length_bytes) < 4:
+            sock.close()
+            return False, 0, "incomplete response from rust-router"
+
+        response_length = int.from_bytes(length_bytes, 'big')
+        response_data = b''
+        while len(response_data) < response_length:
+            chunk = sock.recv(min(response_length - len(response_data), 4096))
+            if not chunk:
+                break
+            response_data += chunk
+        sock.close()
+
+        response = json.loads(response_data.decode('utf-8'))
+
+        # 检查响应类型 (IPC v3.2 格式)
+        resp_type = response.get("type", "")
+        if resp_type == "outbound_health":
+            outbounds = response.get("outbounds", [])
+            for h in outbounds:
+                if h.get("tag") == tag:
+                    health_status = h.get("health", "unknown")
+                    # active_connections 可以作为延迟的替代指标
+                    active_conns = h.get("active_connections", 0)
+                    error_msg = h.get("error")
+                    if health_status == "healthy":
+                        return True, 0, ""
+                    else:
+                        return False, 0, error_msg or f"status: {health_status}"
+            # Tag not found in health list - try WireGuard tunnel status
+            return _check_wg_tunnel_status(tag, timeout)
+        elif resp_type == "error":
+            return False, 0, response.get("error", "unknown error")
+        else:
+            return False, 0, f"unexpected response type: {resp_type}"
+
+    except socket.timeout:
+        return False, timeout * 1000, "rust-router IPC timeout"
+    except Exception as e:
+        return False, 0, f"rust-router IPC error: {str(e)}"
+
+
+def _check_wg_tunnel_status(tag: str, timeout: int) -> Tuple[bool, int, str]:
+    """通过 GetWgTunnelStatus 检查 WireGuard 隧道状态"""
+    if not os.path.exists(RUST_ROUTER_SOCKET):
+        return False, 0, "rust-router socket not found"
+
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(RUST_ROUTER_SOCKET)
+
+        # 发送 GetWgTunnelStatus 命令
+        request = json.dumps({"type": "get_wg_tunnel_status", "tag": tag})
+        request_bytes = request.encode('utf-8')
+        length_prefix = len(request_bytes).to_bytes(4, 'big')
+        sock.sendall(length_prefix + request_bytes)
+
+        # 读取响应
+        length_bytes = sock.recv(4)
+        if len(length_bytes) < 4:
+            sock.close()
+            return False, 0, "incomplete response"
+
+        response_length = int.from_bytes(length_bytes, 'big')
+        response_data = b''
+        while len(response_data) < response_length:
+            chunk = sock.recv(min(response_length - len(response_data), 4096))
+            if not chunk:
+                break
+            response_data += chunk
+        sock.close()
+
+        response = json.loads(response_data.decode('utf-8'))
+        resp_type = response.get("type", "")
+
+        if resp_type == "wg_tunnel_status":
+            # rust-router IPC returns active: bool instead of state: str
+            is_active = response.get("active", False)
+            last_handshake = response.get("last_handshake", 0)
+            error = response.get("error")
+
+            if error:
+                return False, 0, f"tunnel error: {error}"
+
+            if is_active and last_handshake > 0:
+                # 活跃且有有效握手 = 健康
+                return True, 0, ""
+            elif is_active:
+                # 活跃但无握手（可能刚创建）
+                return True, 0, ""
+            else:
+                return False, 0, "tunnel not active"
+        elif resp_type == "error":
+            return False, 0, response.get("error", f"tunnel '{tag}' not found")
+        else:
+            return False, 0, f"tunnel '{tag}' not found in rust-router"
+
+    except socket.timeout:
+        return False, timeout * 1000, "rust-router IPC timeout"
+    except Exception as e:
+        return False, 0, f"rust-router IPC error: {str(e)}"
 
 
 def check_egress_health(
@@ -215,6 +368,9 @@ def check_member_health(db, member_tag: str, url: str, timeout: int) -> Tuple[bo
     """检查组成员的健康状态
 
     根据成员类型选择合适的检查方法。
+    
+    NOTE: 现在所有 WireGuard 出口都通过 rust-router IPC 检查（用户态模式）。
+    内核接口检查已废弃。
 
     Args:
         db: 数据库管理器
@@ -225,33 +381,39 @@ def check_member_health(db, member_tag: str, url: str, timeout: int) -> Tuple[bo
     Returns:
         (healthy: bool, latency_ms: int, error: str)
     """
-    # 检查 OpenVPN（使用 TUN 设备，direct + bind_interface）
+    # 检查 OpenVPN（使用 TUN 设备）
     openvpn = db.get_openvpn_egress(member_tag)
     if openvpn and openvpn.get("tun_device"):
         return check_egress_health(openvpn["tun_device"], url, timeout)
 
-    # 检查是否有 SOCKS 端口（V2Ray、WARP MASQUE）
+    # 检查是否有 SOCKS 端口（V2Ray）
     v2ray = db.get_v2ray_egress(member_tag)
     if v2ray and v2ray.get("socks_port"):
         return check_egress_health_via_socks(v2ray["socks_port"], url, timeout)
 
+    # WARP egress - 通过 rust-router IPC 检查（用户态 WireGuard）
     warp = db.get_warp_egress(member_tag)
     if warp:
-        # WARP WireGuard 协议使用内核接口
-        if warp.get("protocol") == "wireguard":
-            interface = get_warp_interface_name(member_tag)
-            if interface:
-                return check_egress_health(interface, url, timeout)
-            else:
-                return False, 0, "WARP WireGuard interface not found"
-        # WARP MASQUE 协议使用 SOCKS 代理
-        elif warp.get("socks_port"):
-            return check_egress_health_via_socks(warp["socks_port"], url, timeout)
+        return check_health_via_rust_router(member_tag, url, timeout)
 
-    # 使用接口检查（PIA、Custom WireGuard、Direct）
-    interface = get_interface_for_egress(db, member_tag)
-    if interface:
-        return check_egress_health(interface, url, timeout)
+    # PIA WireGuard - 通过 rust-router IPC 检查（用户态 WireGuard）
+    pia = db.get_pia_profile_by_name(member_tag)
+    if pia:
+        return check_health_via_rust_router(member_tag, url, timeout)
+
+    # Custom WireGuard - 通过 rust-router IPC 检查（用户态 WireGuard）
+    custom = db.get_custom_egress(member_tag)
+    if custom:
+        return check_health_via_rust_router(member_tag, url, timeout)
+
+    # Direct egress - 检查绑定接口（如果有）
+    direct = db.get_direct_egress(member_tag)
+    if direct:
+        bind_iface = direct.get("bind_interface")
+        if bind_iface and interface_exists(bind_iface):
+            return check_egress_health(bind_iface, url, timeout)
+        # 无绑定接口，假设可用
+        return True, 0, ""
 
     # 检查是否是嵌套组
     group = db.get_outbound_group(member_tag)
@@ -302,14 +464,37 @@ def check_group_health(db, group: Dict) -> Dict[str, Dict]:
     return results
 
 
+# 健康状态共享文件路径
+HEALTH_STATUS_FILE = "/run/health_status.json"
+
 def update_health_status(group_tag: str, member_status: Dict[str, Dict]) -> None:
-    """更新内存中的健康状态"""
+    """更新健康状态（写入共享文件供 API 服务器读取）"""
     with _health_status_lock:
         _health_status[group_tag] = member_status
+        # 写入共享文件供其他进程读取
+        try:
+            # 先读取现有状态
+            current = {}
+            if os.path.exists(HEALTH_STATUS_FILE):
+                try:
+                    with open(HEALTH_STATUS_FILE, 'r') as f:
+                        current = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    pass
+            current[group_tag] = member_status
+            # 原子写入
+            tmp_file = HEALTH_STATUS_FILE + ".tmp"
+            with open(tmp_file, 'w') as f:
+                json.dump(current, f)
+            os.replace(tmp_file, HEALTH_STATUS_FILE)
+        except Exception as e:
+            logger.warning(f"Failed to write health status file: {e}")
 
 
 def get_health_status(group_tag: Optional[str] = None) -> Dict:
     """获取健康状态
+
+    优先从共享文件读取（支持跨进程共享），如果文件不存在则使用内存中的状态。
 
     Args:
         group_tag: 可选，指定组的 tag。如果为 None 返回所有组的状态
@@ -317,6 +502,18 @@ def get_health_status(group_tag: Optional[str] = None) -> Dict:
     Returns:
         健康状态字典
     """
+    # 优先从共享文件读取
+    try:
+        if os.path.exists(HEALTH_STATUS_FILE):
+            with open(HEALTH_STATUS_FILE, 'r') as f:
+                file_status = json.load(f)
+            if group_tag:
+                return file_status.get(group_tag, {})
+            return file_status
+    except (json.JSONDecodeError, IOError) as e:
+        logger.warning(f"Failed to read health status file: {e}")
+
+    # 回退到内存中的状态
     with _health_status_lock:
         if group_tag:
             return _health_status.get(group_tag, {})
@@ -324,7 +521,10 @@ def get_health_status(group_tag: Optional[str] = None) -> Dict:
 
 
 def update_ecmp_for_health(db, group: Dict, member_status: Dict[str, Dict]) -> bool:
-    """根据健康状态更新 ECMP 路由
+    """根据健康状态更新 ECMP 路由（已废弃）
+
+    NOTE: 此函数现在是空操作。rust-router 在用户态处理负载均衡，
+    不再需要内核 ECMP 路由。健康状态仅用于 API 显示。
 
     Args:
         db: 数据库管理器
@@ -332,40 +532,16 @@ def update_ecmp_for_health(db, group: Dict, member_status: Dict[str, Dict]) -> b
         member_status: 成员健康状态
 
     Returns:
-        是否成功更新路由
+        总是返回 True（rust-router 内部处理负载均衡）
     """
-    # 导入 ECMP 管理器
-    from ecmp_manager import setup_ecmp_route, get_all_egress_interfaces
-
     tag = group["tag"]
-    table_id = group["routing_table"]
-    weights = group.get("weights")
-
-    # 获取健康的成员
-    healthy_members = [
-        member for member, status in member_status.items()
-        if status.get("healthy", False)
-    ]
-
-    if not healthy_members:
-        logger.warning(f"All members of group {tag} are unhealthy, keeping existing routes")
-        # 保留现有路由以防止完全断开
-        return False
-
-    # 获取健康成员的接口
-    interfaces = get_all_egress_interfaces(db, healthy_members)
-
-    if not interfaces:
-        logger.warning(f"No valid interfaces for healthy members of group {tag}")
-        return False
-
-    # 更新 ECMP 路由（仅使用健康成员）
-    healthy_weights = None
-    if weights:
-        healthy_weights = {k: v for k, v in weights.items() if k in healthy_members}
-
-    logger.info(f"Updating ECMP for group {tag}: {len(healthy_members)}/{len(group['members'])} healthy")
-    return setup_ecmp_route(table_id, interfaces, healthy_weights)
+    healthy_count = sum(1 for s in member_status.values() if s.get("healthy", False))
+    total_count = len(member_status)
+    
+    logger.debug(f"Group {tag}: {healthy_count}/{total_count} healthy (ECMP managed by rust-router)")
+    
+    # rust-router 内部处理负载均衡，不需要更新内核 ECMP 路由
+    return True
 
 
 def check_and_update_group(db, group: Dict) -> Dict[str, Dict]:
@@ -529,39 +705,48 @@ def show_status(db):
     print("Outbound Groups Health Status")
     print(f"{'='*60}\n")
 
-    with _health_status_lock:
-        for group in groups:
-            tag = group["tag"]
-            members = group["members"]
-            enabled = group.get("enabled", True)
+    # 优先从共享文件读取状态（支持跨进程）
+    file_status = {}
+    try:
+        if os.path.exists(HEALTH_STATUS_FILE):
+            with open(HEALTH_STATUS_FILE, 'r') as f:
+                file_status = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        pass
 
-            print(f"Group: {tag}")
-            print(f"  Enabled: {'Yes' if enabled else 'No'}")
-            print(f"  Members:")
+    for group in groups:
+        tag = group["tag"]
+        members = group["members"]
+        enabled = group.get("enabled", True)
 
-            status = _health_status.get(tag, {})
-            for member in members:
-                member_status = status.get(member, {})
-                healthy = member_status.get("healthy")
-                latency = member_status.get("latency_ms", 0)
-                error = member_status.get("error", "")
-                last_check = member_status.get("last_check", 0)
+        print(f"Group: {tag}")
+        print(f"  Enabled: {'Yes' if enabled else 'No'}")
+        print(f"  Members:")
 
-                if healthy is None:
-                    state = "unknown"
-                elif healthy:
-                    state = f"healthy ({latency}ms)"
-                else:
-                    state = f"unhealthy: {error}"
+        # 优先使用文件状态，回退到内存状态
+        status = file_status.get(tag) or _health_status.get(tag, {})
+        for member in members:
+            member_status = status.get(member, {})
+            healthy = member_status.get("healthy")
+            latency = member_status.get("latency_ms", 0)
+            error = member_status.get("error", "")
+            last_check = member_status.get("last_check", 0)
 
-                check_time = ""
-                if last_check:
-                    elapsed = int(time.time() - last_check)
-                    check_time = f" (checked {elapsed}s ago)"
+            if healthy is None:
+                state = "unknown"
+            elif healthy:
+                state = f"healthy ({latency}ms)"
+            else:
+                state = f"unhealthy: {error}"
 
-                print(f"    - {member}: {state}{check_time}")
+            check_time = ""
+            if last_check:
+                elapsed = int(time.time() - last_check)
+                check_time = f" (checked {elapsed}s ago)"
 
-            print()
+            print(f"    - {member}: {state}{check_time}")
+
+        print()
 
 
 def get_db_manager():

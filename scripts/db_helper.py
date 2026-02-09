@@ -96,17 +96,20 @@ def validate_dict(data: Any, field_name: str = "field") -> Optional[Dict]:
 # WireGuard egress interface naming constants
 WG_PIA_PREFIX = "wg-pia-"     # 8 chars, leaves 7 for tag
 WG_CUSTOM_PREFIX = "wg-eg-"   # 6 chars, leaves 9 for tag
+WG_WARP_PREFIX = "wg-warp-"   # 8 chars, leaves 7 for tag
 WG_MAX_IFACE_LEN = 15         # Linux interface name limit
 
 
-def get_egress_interface_name(tag: str, is_pia: bool) -> str:
-    """Generate kernel WireGuard interface name for egress
+def get_egress_interface_name(tag: str, is_pia: bool = False, egress_type: str = None) -> str:
+    """Generate WireGuard tunnel identifier for egress
 
+    用于生成唯一的 WireGuard 隧道标识符，在 rust-router 用户空间模式下用于隧道管理。
     H12 修复: 使用 hash 确保唯一性，避免长标签截断冲突
 
     Naming convention:
     - PIA profiles: wg-pia-{tag} (e.g., wg-pia-new_york)
     - Custom egress: wg-eg-{tag} (e.g., wg-eg-cn2-la)
+    - WARP egress: wg-warp-{tag} (e.g., wg-warp-cf)
 
     For tags that would be truncated, we use a hash-based suffix to ensure uniqueness:
     - If tag fits: wg-pia-hk (full tag)
@@ -114,12 +117,20 @@ def get_egress_interface_name(tag: str, is_pia: bool) -> str:
 
     Args:
         tag: The egress profile tag/name
-        is_pia: True for PIA profiles, False for custom egress
+        is_pia: True for PIA profiles, False for custom egress (legacy parameter)
+        egress_type: One of "pia", "custom", "warp" (takes precedence over is_pia)
 
     Returns:
-        Interface name, max 15 characters (Linux limit), guaranteed unique per tag
+        Tunnel identifier, max 15 characters, guaranteed unique per tag
     """
-    prefix = WG_PIA_PREFIX if is_pia else WG_CUSTOM_PREFIX
+    # Determine prefix based on egress_type or is_pia fallback
+    if egress_type == "warp":
+        prefix = WG_WARP_PREFIX
+    elif egress_type == "pia" or (egress_type is None and is_pia):
+        prefix = WG_PIA_PREFIX
+    else:
+        prefix = WG_CUSTOM_PREFIX
+
     max_tag_len = WG_MAX_IFACE_LEN - len(prefix)
 
     if len(tag) <= max_tag_len:
@@ -375,6 +386,9 @@ class UserDatabase:
                 timeout=30.0
             )
             self._apply_encryption(conn)
+            # [MU-001] 启用外键约束 - 必须在每个连接上设置（SQLite 默认禁用）
+            # 这对于 ON DELETE CASCADE（如删除用户时级联删除其资源）至关重要
+            conn.execute("PRAGMA foreign_keys = ON")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
             logger.debug(f"Created new database connection for thread {threading.current_thread().name}")
@@ -445,41 +459,57 @@ class UserDatabase:
 
     # ============ 路由规则管理 ============
 
-    def get_routing_rules(self, enabled_only: bool = True) -> List[Dict]:
-        """获取路由规则"""
+    def get_routing_rules(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        """获取路由规则
+
+        Args:
+            enabled_only: 只返回启用的规则
+            owner_id: 如果指定，只返回该用户的规则；如果为 None，返回所有规则
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            conditions = []
+            params = []
+
             if enabled_only:
-                rows = cursor.execute("""
-                    SELECT id, rule_type, target, outbound, tag, priority, enabled, created_at, updated_at
-                    FROM routing_rules
-                    WHERE enabled = 1
-                    ORDER BY priority DESC, id ASC
-                """).fetchall()
-            else:
-                rows = cursor.execute("""
-                    SELECT id, rule_type, target, outbound, tag, priority, enabled, created_at, updated_at
-                    FROM routing_rules
-                    ORDER BY priority DESC, id ASC
-                """).fetchall()
+                conditions.append("enabled = 1")
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            rows = cursor.execute(f"""
+                SELECT id, rule_type, target, outbound, tag, priority, enabled, owner_id, created_at, updated_at
+                FROM routing_rules
+                {where_clause}
+                ORDER BY priority DESC, id ASC
+            """, params).fetchall()
             return [dict(row) for row in rows]
 
-    def add_routing_rule(self, rule_type: str, target: str, outbound: str, priority: int = 0, tag: Optional[str] = None) -> int:
-        """添加路由规则"""
+    def add_routing_rule(self, rule_type: str, target: str, outbound: str,
+                        priority: int = 0, tag: Optional[str] = None,
+                        owner_id: Optional[int] = None) -> int:
+        """添加路由规则
+
+        Args:
+            owner_id: 规则所有者 ID，如果为 None 则插入 NULL（系统规则或旧数据兼容）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO routing_rules (rule_type, target, outbound, tag, priority)
-                VALUES (?, ?, ?, ?, ?)
-            """, (rule_type, target, outbound, tag, priority))
+                INSERT INTO routing_rules (rule_type, target, outbound, tag, priority, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (rule_type, target, outbound, tag, priority, owner_id))
             conn.commit()
             return cursor.lastrowid
 
-    def add_routing_rules_batch(self, rules: List[tuple]) -> int:
+    def add_routing_rules_batch(self, rules: List[tuple], owner_id: Optional[int] = None) -> int:
         """批量添加路由规则（使用事务确保原子性）
 
         Args:
             rules: [(rule_type, target, outbound, tag, priority), ...]
+            owner_id: 规则所有者 ID，如果为 None 则插入 NULL（允许无所有者规则）
 
         Returns:
             成功插入的数量
@@ -489,12 +519,15 @@ class UserDatabase:
         """
         if not rules:
             return 0
+        # 为每条规则添加 owner_id（None 会被转为 SQL NULL，不触发 FK 检查）
+        rules_with_owner = [(r[0], r[1], r[2], r[3], r[4], owner_id) for r in rules]
+
         # M4 修复: 使用事务确保批量操作的原子性
         with self._transaction() as (conn, cursor):
             cursor.executemany("""
-                INSERT OR IGNORE INTO routing_rules (rule_type, target, outbound, tag, priority)
-                VALUES (?, ?, ?, ?, ?)
-            """, rules)
+                INSERT OR IGNORE INTO routing_rules (rule_type, target, outbound, tag, priority, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, rules_with_owner)
             return cursor.rowcount
 
     def update_routing_rule(
@@ -542,20 +575,313 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
-    def delete_all_routing_rules(self, preserve_adblock: bool = False) -> int:
+    def delete_routing_rules_by_tag(self, tag: str, owner_id: Optional[int] = None) -> int:
+        """通过 tag 删除路由规则（删除所有匹配的规则）
+
+        Args:
+            tag: 规则标签
+            owner_id: 如果指定，只删除该用户的规则；如果为 None，删除所有用户的规则
+
+        Returns:
+            删除的规则数量
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if owner_id is not None:
+                cursor.execute("DELETE FROM routing_rules WHERE tag = ? AND owner_id = ?", (tag, owner_id))
+            else:
+                cursor.execute("DELETE FROM routing_rules WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount
+
+    def delete_all_routing_rules(self, preserve_adblock: bool = False, owner_id: Optional[int] = None) -> int:
         """删除所有路由规则（用于备份恢复的替换模式）
 
         Args:
             preserve_adblock: 如果为 True，保留以 __adblock__ 开头的规则
+            owner_id: 如果指定，只删除该用户的规则；如果为 None，删除所有用户的规则
         """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            conditions = []
+            params = []
+
             if preserve_adblock:
-                cursor.execute("DELETE FROM routing_rules WHERE tag NOT LIKE '__adblock__%'")
-            else:
-                cursor.execute("DELETE FROM routing_rules")
+                conditions.append("tag NOT LIKE '__adblock__%'")
+
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            cursor.execute(f"DELETE FROM routing_rules {where_clause}", params)
             conn.commit()
             return cursor.rowcount
+
+    # ============ 规则集管理 (Rule Sets) ============
+
+    # 有效的规则集状态
+    VALID_RULE_SET_STATUSES = frozenset({'pending', 'loading', 'loaded', 'error'})
+
+    def get_rule_sets(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        """获取规则集列表
+
+        Args:
+            enabled_only: 是否只返回启用的规则集
+            owner_id: 如果指定，只返回该用户的规则集；如果为 None，返回所有
+
+        Returns:
+            规则集列表
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            conditions = []
+            params = []
+
+            if enabled_only:
+                conditions.append("enabled = 1")
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            rows = cursor.execute(f"""
+                SELECT id, name, rule_type, outbound, rule_count, file_path,
+                       checksum, status, error_message, enabled, priority, owner_id,
+                       created_at, updated_at
+                FROM rule_sets
+                {where_clause}
+                ORDER BY priority DESC, name ASC
+            """, params).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_rule_set(self, set_id: str) -> Optional[Dict]:
+        """获取单个规则集
+
+        Args:
+            set_id: 规则集 ID
+
+        Returns:
+            规则集信息，不存在则返回 None
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT id, name, rule_type, outbound, rule_count, file_path,
+                       checksum, status, error_message, enabled, priority,
+                       created_at, updated_at
+                FROM rule_sets
+                WHERE id = ?
+            """, (set_id,)).fetchone()
+            return dict(row) if row else None
+
+    def add_rule_set(
+        self,
+        set_id: str,
+        name: str,
+        rule_type: str,
+        outbound: str,
+        rule_count: int,
+        file_path: str,
+        checksum: str,
+        priority: int = 0,
+        owner_id: Optional[int] = None
+    ) -> bool:
+        """添加规则集
+
+        Args:
+            set_id: 规则集 ID（如 'geoip-cn', 'custom-streaming'）
+            name: 人类可读名称
+            rule_type: 规则类型（'ip', 'domain', 'domain_suffix', 'domain_keyword'）
+            outbound: 出口标签
+            rule_count: 规则数量
+            file_path: 二进制文件的相对路径
+            checksum: SHA256 校验和
+            priority: 优先级（默认 0）
+            owner_id: 所有者 ID，如果为 None 则默认为 1
+
+        Returns:
+            是否成功添加
+        """
+        with self._transaction() as (conn, cursor):
+            try:
+                cursor.execute("""
+                    INSERT INTO rule_sets (id, name, rule_type, outbound, rule_count,
+                                          file_path, checksum, priority, owner_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (set_id, name, rule_type, outbound, rule_count, file_path, checksum, priority, owner_id))
+                logger.info(f"添加规则集: {set_id} (类型={rule_type}, 规则数={rule_count})")
+                return True
+            except sqlite3.IntegrityError:
+                logger.warning(f"规则集已存在: {set_id}")
+                return False
+
+    def update_rule_set(
+        self,
+        set_id: str,
+        name: str = None,
+        outbound: str = None,
+        rule_count: int = None,
+        file_path: str = None,
+        checksum: str = None,
+        enabled: bool = None,
+        priority: int = None
+    ) -> bool:
+        """更新规则集
+
+        Args:
+            set_id: 规则集 ID
+            name: 新名称（可选）
+            outbound: 新出口（可选）
+            rule_count: 新规则数量（可选）
+            file_path: 新文件路径（可选）
+            checksum: 新校验和（可选）
+            enabled: 是否启用（可选）
+            priority: 新优先级（可选）
+
+        Returns:
+            是否成功更新
+        """
+        updates = []
+        params = []
+
+        if name is not None:
+            updates.append("name = ?")
+            params.append(name)
+        if outbound is not None:
+            updates.append("outbound = ?")
+            params.append(outbound)
+        if rule_count is not None:
+            updates.append("rule_count = ?")
+            params.append(rule_count)
+        if file_path is not None:
+            updates.append("file_path = ?")
+            params.append(file_path)
+        if checksum is not None:
+            updates.append("checksum = ?")
+            params.append(checksum)
+        if enabled is not None:
+            updates.append("enabled = ?")
+            params.append(1 if enabled else 0)
+        if priority is not None:
+            updates.append("priority = ?")
+            params.append(priority)
+
+        if not updates:
+            return False
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(set_id)
+
+        with self._transaction() as (conn, cursor):
+            cursor.execute(f"""
+                UPDATE rule_sets
+                SET {', '.join(updates)}
+                WHERE id = ?
+            """, params)
+            if cursor.rowcount > 0:
+                logger.info(f"更新规则集: {set_id}")
+            return cursor.rowcount > 0
+
+    def update_rule_set_status(
+        self,
+        set_id: str,
+        status: str,
+        error_message: str = None
+    ) -> bool:
+        """更新规则集状态
+
+        Args:
+            set_id: 规则集 ID
+            status: 状态值 ('pending', 'loading', 'loaded', 'error')
+            error_message: 错误状态时的错误信息（可选）
+
+        Returns:
+            是否成功更新
+
+        Raises:
+            ValueError: 如果状态值无效
+        """
+        if status not in self.VALID_RULE_SET_STATUSES:
+            raise ValueError(f"无效的状态值: {status}，有效值为: {', '.join(sorted(self.VALID_RULE_SET_STATUSES))}")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE rule_sets
+                SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (status, error_message, set_id))
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"更新规则集状态: {set_id} -> {status}")
+            return cursor.rowcount > 0
+
+    def delete_rule_set(self, set_id: str) -> bool:
+        """删除规则集
+
+        Args:
+            set_id: 规则集 ID
+
+        Returns:
+            是否成功删除
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM rule_sets WHERE id = ?", (set_id,))
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"删除规则集: {set_id}")
+            return cursor.rowcount > 0
+
+    def get_rule_sets_by_outbound(self, outbound: str) -> List[Dict]:
+        """获取指定出口的所有规则集
+
+        Args:
+            outbound: 出口标签
+
+        Returns:
+            规则集列表
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, name, rule_type, outbound, rule_count, file_path,
+                       checksum, status, error_message, enabled, priority,
+                       created_at, updated_at
+                FROM rule_sets
+                WHERE outbound = ?
+                ORDER BY priority DESC, name ASC
+            """, (outbound,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_rule_sets_by_status(self, status: str) -> List[Dict]:
+        """获取指定状态的规则集
+
+        Args:
+            status: 状态值 ('pending', 'loading', 'loaded', 'error')
+
+        Returns:
+            规则集列表
+
+        Raises:
+            ValueError: 如果状态值无效
+        """
+        if status not in self.VALID_RULE_SET_STATUSES:
+            raise ValueError(f"无效的状态值: {status}，有效值为: {', '.join(sorted(self.VALID_RULE_SET_STATUSES))}")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, name, rule_type, outbound, rule_count, file_path,
+                       checksum, status, error_message, enabled, priority,
+                       created_at, updated_at
+                FROM rule_sets
+                WHERE status = ?
+                ORDER BY priority DESC, name ASC
+            """, (status,)).fetchall()
+            return [dict(row) for row in rows]
 
     # ============ 出口管理 ============
 
@@ -633,23 +959,32 @@ class UserDatabase:
 
     # ============ WireGuard 对等点（客户端）管理 ============
 
-    def get_wireguard_peers(self, enabled_only: bool = True) -> List[Dict]:
-        """获取 WireGuard 对等点列表"""
+    def get_wireguard_peers(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        """获取 WireGuard 对等点列表
+
+        Args:
+            enabled_only: 只返回启用的 peers
+            owner_id: 如果指定，只返回该用户的 peers；如果为 None，返回所有 peers
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            conditions = []
+            params = []
+
             if enabled_only:
-                rows = cursor.execute("""
-                    SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
-                    FROM wireguard_peers
-                    WHERE enabled = 1
-                    ORDER BY name
-                """).fetchall()
-            else:
-                rows = cursor.execute("""
-                    SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
-                    FROM wireguard_peers
-                    ORDER BY name
-                """).fetchall()
+                conditions.append("enabled = 1")
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            rows = cursor.execute(f"""
+                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, owner_id, created_at, updated_at
+                FROM wireguard_peers
+                {where_clause}
+                ORDER BY name
+            """, params).fetchall()
             return [dict(row) for row in rows]
 
     def get_wireguard_peer(self, peer_id: int) -> Optional[Dict]:
@@ -657,7 +992,7 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute("""
-                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
+                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, owner_id, created_at, updated_at
                 FROM wireguard_peers
                 WHERE id = ?
             """, (peer_id,)).fetchone()
@@ -668,7 +1003,7 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute("""
-                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
+                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, owner_id, created_at, updated_at
                 FROM wireguard_peers
                 WHERE name = ?
             """, (name,)).fetchone()
@@ -678,18 +1013,20 @@ class UserDatabase:
                           preshared_key: Optional[str] = None,
                           allow_lan: bool = False,
                           lan_subnet: Optional[str] = None,
-                          default_outbound: Optional[str] = None) -> int:
+                          default_outbound: Optional[str] = None,
+                          owner_id: Optional[int] = None) -> int:
         """添加 WireGuard 对等点
 
         Args:
             default_outbound: 此客户端的默认出口（None=使用入口默认或全局默认）
+            owner_id: 所有者 ID，如果为 None 则插入 NULL（系统级 peer 或旧数据兼容）
         """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO wireguard_peers (name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (name, public_key, allowed_ips, preshared_key, 1 if allow_lan else 0, lan_subnet, default_outbound))
+                INSERT INTO wireguard_peers (name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (name, public_key, allowed_ips, preshared_key, 1 if allow_lan else 0, lan_subnet, default_outbound, owner_id))
             conn.commit()
             return cursor.lastrowid
 
@@ -1123,6 +1460,319 @@ class UserDatabase:
             self.set_setting("jwt_secret_key", secret)
         return secret
 
+    # ============ 用户管理 ============
+
+    def get_users(self) -> List[Dict]:
+        """获取所有用户（不包含密码哈希）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, username, email, role, enabled, token_version,
+                       failed_login_count, locked_until, created_at, updated_at,
+                       last_login_at, created_by, rules_ignored
+                FROM users
+                ORDER BY id
+            """).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """根据 ID 获取用户（包含密码哈希）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT id, username, email, password_hash, role, enabled, token_version,
+                       failed_login_count, locked_until, created_at, updated_at, last_login_at,
+                       rules_ignored
+                FROM users WHERE id = ?
+            """, (user_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_user_by_username(self, username: str) -> Optional[Dict]:
+        """根据用户名获取用户（包含密码哈希）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT id, username, email, password_hash, role, enabled, token_version,
+                       failed_login_count, locked_until, created_at, updated_at, last_login_at,
+                       rules_ignored
+                FROM users WHERE username = ?
+            """, (username,)).fetchone()
+            return dict(row) if row else None
+
+    def get_user_count(self) -> int:
+        """获取用户总数"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("SELECT COUNT(*) FROM users").fetchone()
+            return row[0] if row else 0
+
+    def count_users_by_role(self, role: str) -> int:
+        """统计指定角色的用户数量"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT COUNT(*) FROM users WHERE role = ? AND enabled = 1",
+                (role,)
+            ).fetchone()
+            return row[0] if row else 0
+
+    def get_users_by_role(self, role: str) -> List[Dict]:
+        """获取指定角色的用户列表"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, username, email, role, enabled, created_at, last_login_at
+                FROM users WHERE role = ? ORDER BY created_at DESC
+            """, (role,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def add_user(self, username: str, password_hash: str, email: Optional[str] = None,
+                 role: str = "user", created_by: Optional[int] = None) -> int:
+        """添加新用户"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO users (username, email, password_hash, role, created_by)
+                VALUES (?, ?, ?, ?, ?)
+            """, (username, email, password_hash, role, created_by))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_user(self, user_id: int, **kwargs) -> bool:
+        """更新用户字段"""
+        allowed = {"password_hash", "email", "role", "enabled", "token_version",
+                   "failed_login_count", "locked_until", "last_login_at", "rules_ignored"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return False
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        values = list(updates.values()) + [user_id]
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE users SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                values
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def increment_token_version(self, user_id: int) -> bool:
+        """递增用户的 token_version（用于密码更改后使旧 token 失效）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (user_id,)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_user(self, user_id: int) -> bool:
+        """删除用户（级联删除其资源）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # ============ Token 黑名单 ============
+
+    def add_revoked_token(self, jti: str, user_id: int, expires_at: str, reason: str = None) -> bool:
+        """添加已撤销的 token"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    INSERT INTO token_blacklist (jti, user_id, expires_at, reason)
+                    VALUES (?, ?, ?, ?)
+                """, (jti, user_id, expires_at, reason))
+                conn.commit()
+                return True
+            except Exception:
+                return False
+
+    def is_token_revoked(self, jti: str) -> bool:
+        """检查 token 是否已被撤销"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT 1 FROM token_blacklist WHERE jti = ?",
+                (jti,)
+            ).fetchone()
+            return row is not None
+
+    def cleanup_expired_tokens(self) -> int:
+        """清理过期的 token 黑名单记录"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM token_blacklist WHERE expires_at < datetime('now')"
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    # ============ 审计日志 ============
+
+    def add_audit_log(self, action: str, user_id: Optional[int] = None,
+                      resource_type: Optional[str] = None, resource_id: Optional[str] = None,
+                      details: Optional[str] = None, ip_address: Optional[str] = None) -> int:
+        """添加审计日志"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO audit_log (user_id, action, resource_type, resource_id, details, ip_address)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_id, action, resource_type, resource_id, details, ip_address))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_audit_logs(self, user_id: Optional[int] = None, action: Optional[str] = None,
+                       limit: int = 100, offset: int = 0) -> List[Dict]:
+        """获取审计日志"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            conditions = []
+            params = []
+
+            if user_id is not None:
+                conditions.append("user_id = ?")
+                params.append(user_id)
+            if action:
+                conditions.append("action = ?")
+                params.append(action)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            params.extend([limit, offset])
+
+            rows = cursor.execute(f"""
+                SELECT * FROM audit_log
+                {where_clause}
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+            """, params).fetchall()
+
+            return [dict(row) for row in rows]
+
+    # ============ 用户配额 ============
+
+    def get_user_quota(self, user_id: int) -> Optional[Dict]:
+        """获取用户配额"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM user_quotas WHERE user_id = ?",
+                (user_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def set_user_quota(self, user_id: int, max_peers: int = 10,
+                       max_rules: int = 100, max_rule_sets: int = 10) -> bool:
+        """设置用户配额"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO user_quotas (user_id, max_peers, max_rules, max_rule_sets)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, max_peers, max_rules, max_rule_sets))
+            conn.commit()
+            return True
+
+    # ============ 账户锁定 ============
+
+    def record_failed_login(self, user_id: int) -> int:
+        """记录登录失败并返回失败次数"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE users
+                SET failed_login_count = failed_login_count + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (user_id,))
+            conn.commit()
+
+            row = cursor.execute(
+                "SELECT failed_login_count FROM users WHERE id = ?",
+                (user_id,)
+            ).fetchone()
+            return row[0] if row else 0
+
+    def lock_account(self, user_id: int, lock_minutes: int = 30) -> bool:
+        """锁定账户指定分钟数"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE users
+                SET locked_until = datetime('now', '+' || ? || ' minutes'),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (lock_minutes, user_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def reset_failed_login(self, user_id: int) -> bool:
+        """重置登录失败计数（登录成功后调用）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE users
+                SET failed_login_count = 0, locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (user_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def is_account_locked(self, user_id: int) -> bool:
+        """检查账户是否被锁定"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT locked_until FROM users
+                WHERE id = ? AND locked_until > datetime('now')
+            """, (user_id,)).fetchone()
+            return row is not None
+
+    # ============ 规则忽略设置 ============
+
+    def get_ignore_all_user_rules(self) -> bool:
+        """获取全局用户规则忽略开关状态"""
+        value = self.get_setting("ignore_all_user_rules", "false")
+        return value.lower() == "true"
+
+    def set_ignore_all_user_rules(self, enabled: bool) -> bool:
+        """设置全局用户规则忽略开关"""
+        return self.set_setting("ignore_all_user_rules", "true" if enabled else "false")
+
+    def get_allowed_rule_owner_ids(self) -> set:
+        """获取允许规则同步的用户 ID 集合
+
+        根据全局开关和每用户开关决定哪些用户的规则应被同步到 rust-router。
+        返回一个集合，包含:
+        - 所有管理员用户的 ID（管理员规则永远不会被忽略）
+        - 如果全局开关关闭：rules_ignored = 0 的普通用户 ID
+        - 如果全局开关开启：只包含管理员 ID
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+
+            # 全局开关开启时，只返回管理员 ID
+            if self.get_ignore_all_user_rules():
+                rows = cursor.execute(
+                    "SELECT id FROM users WHERE role = 'admin' AND enabled = 1"
+                ).fetchall()
+                return {row[0] for row in rows}
+
+            # 全局开关关闭时，返回管理员 + 未被忽略的普通用户
+            rows = cursor.execute("""
+                SELECT id FROM users
+                WHERE enabled = 1
+                  AND (role = 'admin' OR (role != 'pending' AND COALESCE(rules_ignored, 0) = 0))
+            """).fetchall()
+            return {row[0] for row in rows}
+
     # ============ Custom Egress 方法 ============
 
     def get_custom_egress_list(self, enabled_only: bool = False) -> List[Dict]:
@@ -1226,8 +1876,15 @@ class UserDatabase:
 
     # ============ Remote Rule Sets 管理 ============
 
-    def get_remote_rule_sets(self, enabled_only: bool = False, category: Optional[str] = None) -> List[Dict]:
-        """获取远程规则集列表"""
+    def get_remote_rule_sets(self, enabled_only: bool = False, category: Optional[str] = None,
+                               owner_id: Optional[int] = None) -> List[Dict]:
+        """获取远程规则集列表
+
+        Args:
+            enabled_only: 仅返回启用的规则集
+            category: 按分类过滤
+            owner_id: 按所有者过滤（用于多用户资源隔离）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             query = "SELECT * FROM remote_rule_sets"
@@ -1239,6 +1896,9 @@ class UserDatabase:
             if category:
                 conditions.append("category = ?")
                 params.append(category)
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
 
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
@@ -1260,15 +1920,27 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return dict(zip(columns, row))
 
-    def toggle_remote_rule_set(self, tag: str) -> bool:
-        """切换远程规则集启用状态"""
+    def toggle_remote_rule_set(self, tag: str, owner_id: Optional[int] = None) -> bool:
+        """切换远程规则集启用状态
+
+        Args:
+            tag: 规则集标签
+            owner_id: 所有者ID（用于权限检查，None表示不检查）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE remote_rule_sets
-                SET enabled = 1 - enabled, updated_at = CURRENT_TIMESTAMP
-                WHERE tag = ?
-            """, (tag,))
+            if owner_id is not None:
+                cursor.execute("""
+                    UPDATE remote_rule_sets
+                    SET enabled = 1 - enabled, updated_at = CURRENT_TIMESTAMP
+                    WHERE tag = ? AND owner_id = ?
+                """, (tag, owner_id))
+            else:
+                cursor.execute("""
+                    UPDATE remote_rule_sets
+                    SET enabled = 1 - enabled, updated_at = CURRENT_TIMESTAMP
+                    WHERE tag = ?
+                """, (tag,))
             conn.commit()
             return cursor.rowcount > 0
 
@@ -1276,7 +1948,8 @@ class UserDatabase:
         """更新远程规则集"""
         allowed_fields = {"name", "description", "url", "format", "outbound",
                           "enabled", "priority", "category", "region",
-                          "last_updated", "domain_count"}
+                          "last_updated", "domain_count",
+                          "file_path", "checksum", "status", "error_message"}
         updates = []
         values = []
         for key, value in kwargs.items():
@@ -1295,26 +1968,76 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    def update_remote_rule_set_status(self, tag: str, status: str, error_message: Optional[str] = None) -> bool:
+        """更新远程规则集状态（用于异步加载）"""
+        valid_statuses = {'pending', 'downloading', 'loaded', 'error'}
+        if status not in valid_statuses:
+            raise ValueError(f"Invalid status: {status}, must be one of {valid_statuses}")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE remote_rule_sets
+                SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE tag = ?
+            """, (status, error_message, tag))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_remote_rule_sets_by_status(self, status: str) -> List[Dict]:
+        """获取指定状态的远程规则集"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, tag, name, description, url, format, outbound, enabled,
+                       priority, category, region, last_updated, domain_count,
+                       file_path, checksum, status, error_message
+                FROM remote_rule_sets WHERE status = ?
+            """, (status,)).fetchall()
+            return [dict(row) for row in rows]
+
     def add_remote_rule_set(self, tag: str, name: str, url: str,
                             description: str = "", format: str = "adblock",
                             outbound: str = "block", category: str = "general",
-                            region: Optional[str] = None, priority: int = 0) -> int:
-        """添加远程规则集"""
+                            region: Optional[str] = None, priority: int = 0,
+                            owner_id: Optional[int] = None) -> int:
+        """添加远程规则集
+
+        Args:
+            tag: 规则集标签（唯一）
+            name: 规则集名称
+            url: 规则文件URL
+            description: 描述
+            format: 格式（adblock/hosts/domains）
+            outbound: 出口（默认block）
+            category: 分类
+            region: 地区代码
+            priority: 优先级
+            owner_id: 所有者用户ID（多用户模式）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO remote_rule_sets
-                (tag, name, description, url, format, outbound, category, region, priority)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (tag, name, description, url, format, outbound, category, region, priority))
+                (tag, name, description, url, format, outbound, category, region, priority, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (tag, name, description, url, format, outbound, category, region, priority, owner_id))
             conn.commit()
             return cursor.lastrowid
 
-    def delete_remote_rule_set(self, tag: str) -> bool:
-        """删除远程规则集"""
+    def delete_remote_rule_set(self, tag: str, owner_id: Optional[int] = None) -> bool:
+        """删除远程规则集
+
+        Args:
+            tag: 规则集标签
+            owner_id: 所有者ID（用于权限检查，None表示不检查）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM remote_rule_sets WHERE tag = ?", (tag,))
+            if owner_id is not None:
+                cursor.execute("DELETE FROM remote_rule_sets WHERE tag = ? AND owner_id = ?", (tag, owner_id))
+            else:
+                cursor.execute("DELETE FROM remote_rule_sets WHERE tag = ?", (tag,))
             conn.commit()
             return cursor.rowcount > 0
 
@@ -1561,7 +2284,7 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
-    # ============ V2Ray Egress 管理（支持 VMess, VLESS, Trojan）============
+    # ============ V2Ray Egress 管理 (VLESS only - Xray-lite) ============
 
     # SOCKS 端口起始值（可通过环境变量配置，与 OpenVPN 37001 错开）
     V2RAY_EGRESS_SOCKS_PORT_START = int(os.environ.get("V2RAY_SOCKS_PORT_BASE", "37101"))
@@ -1692,6 +2415,13 @@ class UserDatabase:
         Returns:
             新创建记录的 ID
         """
+        # [Xray-lite] 仅支持 VLESS 协议
+        if protocol != "vless":
+            raise ValueError(
+                f"Only 'vless' protocol is supported in Xray-lite. Got: '{protocol}'. "
+                "VMess and Trojan have been removed. See docs/VMESS_TROJAN_MIGRATION.md"
+            )
+
         # 自动分配 SOCKS 端口
         socks_port = self.get_next_v2ray_egress_socks_port()
         tls_alpn_json = json.dumps(tls_alpn) if tls_alpn else None
@@ -1759,6 +2489,211 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ============ Shadowsocks 出口 ============
+
+    def get_shadowsocks_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有 Shadowsocks 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM shadowsocks_egress WHERE enabled = 1 ORDER BY tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM shadowsocks_egress ORDER BY tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_shadowsocks_egress(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取 Shadowsocks 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM shadowsocks_egress WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def add_shadowsocks_egress(
+        self,
+        tag: str,
+        server: str,
+        server_port: int,
+        method: str,
+        password: str,
+        description: str = "",
+        udp_enabled: bool = True,
+        enabled: bool = True
+    ) -> int:
+        """添加 Shadowsocks 出口
+
+        Args:
+            tag: 出口标识符
+            server: 服务器地址
+            server_port: 服务器端口
+            method: 加密方法 (aes-256-gcm, 2022-blake3-aes-256-gcm, etc.)
+            password: 密码 (AEAD 2022 需要 Base64 格式)
+            description: 描述
+            udp_enabled: 是否启用 UDP
+            enabled: 是否启用
+
+        Returns:
+            新创建记录的 ID
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO shadowsocks_egress
+                (tag, description, server, server_port, method, password, udp_enabled, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (tag, description, server, server_port, method, password,
+                  1 if udp_enabled else 0, 1 if enabled else 0))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_shadowsocks_egress(self, tag: str, **kwargs) -> bool:
+        """更新 Shadowsocks 出口"""
+        allowed_fields = {
+            "description", "server", "server_port", "method", "password",
+            "udp_enabled", "enabled"
+        }
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(tag)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE shadowsocks_egress SET {', '.join(updates)} WHERE tag = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_shadowsocks_egress(self, tag: str) -> bool:
+        """删除 Shadowsocks 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM shadowsocks_egress WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # ============ VLESS 出口 ============
+
+    def get_vless_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有 VLESS 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM vless_egress WHERE enabled = 1 ORDER BY tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM vless_egress ORDER BY tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_vless_egress(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取 VLESS 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM vless_egress WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def add_vless_egress(
+        self,
+        tag: str,
+        server: str,
+        server_port: int,
+        uuid: str,
+        description: str = "",
+        flow: Optional[str] = None,
+        transport: str = "tcp",
+        ws_path: Optional[str] = None,
+        ws_host: Optional[str] = None,
+        tls_enabled: bool = True,
+        tls_server_name: Optional[str] = None,
+        tls_skip_verify: bool = False,
+        reality_enabled: bool = False,
+        reality_public_key: Optional[str] = None,
+        reality_short_id: Optional[str] = None,
+        enabled: bool = True
+    ) -> int:
+        """添加 VLESS 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO vless_egress (
+                    tag, description, server, server_port, uuid, flow,
+                    transport, ws_path, ws_host,
+                    tls_enabled, tls_server_name, tls_skip_verify,
+                    reality_enabled, reality_public_key, reality_short_id,
+                    enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                tag, description, server, server_port, uuid, flow,
+                transport, ws_path, ws_host,
+                1 if tls_enabled else 0, tls_server_name, 1 if tls_skip_verify else 0,
+                1 if reality_enabled else 0, reality_public_key, reality_short_id,
+                1 if enabled else 0
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_vless_egress(self, tag: str, **kwargs) -> bool:
+        """更新 VLESS 出口"""
+        allowed_fields = {
+            'description', 'server', 'server_port', 'uuid', 'flow',
+            'transport', 'ws_path', 'ws_host',
+            'tls_enabled', 'tls_server_name', 'tls_skip_verify',
+            'reality_enabled', 'reality_public_key', 'reality_short_id',
+            'enabled'
+        }
+        updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+        if not updates:
+            return False
+
+        # Convert booleans to integers
+        for key in ['tls_enabled', 'tls_skip_verify', 'reality_enabled', 'enabled']:
+            if key in updates and isinstance(updates[key], bool):
+                updates[key] = 1 if updates[key] else 0
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        values = list(updates.values()) + [tag]
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE vless_egress SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE tag = ?",
+                values
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_vless_egress(self, tag: str) -> bool:
+        """删除 VLESS 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM vless_egress WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
     # ============ WARP 出口 ============
 
     def get_warp_egress_list(self, enabled_only: bool = False) -> List[Dict]:
@@ -1810,40 +2745,46 @@ class UserDatabase:
         self,
         tag: str,
         description: str = "",
-        protocol: str = "masque",
         config_path: Optional[str] = None,
         license_key: Optional[str] = None,
         account_type: str = "free",
-        mode: str = "socks",
-        socks_port: Optional[int] = None,
         endpoint_v4: Optional[str] = None,
         endpoint_v6: Optional[str] = None,
-        enabled: bool = True
+        enabled: bool = True,
+        account_id: Optional[str] = None,
+        # WireGuard config fields for persistence
+        private_key: Optional[str] = None,
+        peer_public_key: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        local_ip: Optional[str] = None,
+        local_ipv6: Optional[str] = None
     ) -> int:
-        """添加 WARP 出口"""
-        if socks_port is None:
-            socks_port = self.get_next_warp_socks_port()
-
+        """添加 WARP 出口 (WireGuard only with config)"""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO warp_egress
-                (tag, description, protocol, config_path, license_key, account_type,
-                 mode, socks_port, endpoint_v4, endpoint_v6, enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (tag, description, config_path, license_key, account_type,
+                 endpoint_v4, endpoint_v6, enabled, account_id,
+                 private_key, peer_public_key, endpoint, local_ip, local_ipv6)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                tag, description, protocol, config_path, license_key, account_type,
-                mode, socks_port, endpoint_v4, endpoint_v6,
-                1 if enabled else 0
+                tag, description, config_path, license_key, account_type,
+                endpoint_v4, endpoint_v6,
+                1 if enabled else 0,
+                account_id,
+                private_key, peer_public_key, endpoint, local_ip, local_ipv6
             ))
             conn.commit()
             return cursor.lastrowid
 
     def update_warp_egress(self, tag: str, **kwargs) -> bool:
-        """更新 WARP 出口"""
+        """更新 WARP 出口 (WireGuard only with config)"""
         allowed_fields = {
-            "description", "protocol", "config_path", "license_key", "account_type",
-            "mode", "socks_port", "endpoint_v4", "endpoint_v6", "enabled"
+            "description", "config_path", "license_key", "account_type",
+            "endpoint_v4", "endpoint_v6", "enabled", "account_id",
+            # WireGuard config fields
+            "private_key", "peer_public_key", "endpoint", "local_ip", "local_ipv6"
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
         if not updates:
@@ -1932,7 +2873,7 @@ class UserDatabase:
     def get_next_routing_table(self) -> Optional[int]:
         """获取下一个可用的 ECMP 路由表号（200-299 范围）
 
-        Phase 8 Fix: 添加上限验证，防止表号超出 ECMP 范围并与 DSCP/Relay/Peer 表冲突。
+         添加上限验证，防止表号超出 ECMP 范围并与 DSCP/Relay/Peer 表冲突。
 
         Returns:
             可用的表号 (200-299)，如果范围已耗尽则返回 None
@@ -1959,7 +2900,7 @@ class UserDatabase:
                 if table not in used_tables:
                     return table
 
-            # Phase 8: 范围耗尽，返回 None
+            # 范围耗尽，返回 None
             return None
 
     def get_all_egress_tags(self) -> set:
@@ -2089,6 +3030,7 @@ class UserDatabase:
         members: List[str],
         description: str = "",
         weights: Optional[Dict[str, int]] = None,
+        algorithm: str = "five_tuple_hash",
         health_check_url: str = "http://www.gstatic.com/generate_204",
         health_check_interval: int = 60,
         health_check_timeout: int = 5,
@@ -2102,6 +3044,7 @@ class UserDatabase:
             members: 成员出口 tag 列表
             description: 描述
             weights: 权重配置（仅 loadbalance 使用）
+            algorithm: ECMP 算法 (five_tuple_hash, dest_hash, round_robin, etc.)
             health_check_url: 健康检查 URL
             health_check_interval: 健康检查间隔（秒）
             health_check_timeout: 健康检查超时（秒）
@@ -2113,7 +3056,7 @@ class UserDatabase:
         # 自动分配路由表号
         routing_table = self.get_next_routing_table()
 
-        # Phase 8 Fix: 检查表号分配是否成功
+        #  检查表号分配是否成功
         if routing_table is None:
             raise ValueError(
                 "无法分配路由表号：ECMP 表范围 (200-299) 已耗尽。"
@@ -2127,12 +3070,12 @@ class UserDatabase:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO outbound_groups
-                (tag, description, type, members, weights,
+                (tag, description, type, members, weights, algorithm,
                  health_check_url, health_check_interval, health_check_timeout,
                  routing_table, enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                tag, description, group_type, members_json, weights_json,
+                tag, description, group_type, members_json, weights_json, algorithm,
                 health_check_url, health_check_interval, health_check_timeout,
                 routing_table, 1 if enabled else 0
             ))
@@ -2142,11 +3085,11 @@ class UserDatabase:
     def update_outbound_group(self, tag: str, **kwargs) -> bool:
         """更新出口组
 
-        支持的字段：description, members, weights,
+        支持的字段：description, members, weights, algorithm,
         health_check_url, health_check_interval, health_check_timeout, enabled
         """
         allowed_fields = {
-            "description", "members", "weights",
+            "description", "members", "weights", "algorithm",
             "health_check_url", "health_check_interval", "health_check_timeout",
             "enabled"
         }
@@ -2294,18 +3237,31 @@ class UserDatabase:
 
     # ============ V2Ray 用户管理 ============
 
-    def get_v2ray_users(self, enabled_only: bool = True) -> List[Dict]:
-        """获取所有 V2Ray 用户"""
+    def get_v2ray_users(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        """获取所有 V2Ray 用户
+
+        Args:
+            enabled_only: 只返回启用的用户
+            owner_id: 如果指定，只返回该用户的 V2Ray 用户；如果为 None，返回所有
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            conditions = []
+            params = []
+
             if enabled_only:
-                rows = cursor.execute(
-                    "SELECT * FROM v2ray_users WHERE enabled = 1 ORDER BY name"
-                ).fetchall()
-            else:
-                rows = cursor.execute(
-                    "SELECT * FROM v2ray_users ORDER BY name"
-                ).fetchall()
+                conditions.append("enabled = 1")
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            rows = cursor.execute(f"""
+                SELECT * FROM v2ray_users
+                {where_clause}
+                ORDER BY name
+            """, params).fetchall()
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
@@ -2340,9 +3296,13 @@ class UserDatabase:
         password: Optional[str] = None,
         email: Optional[str] = None,
         alter_id: int = 0,
-        flow: Optional[str] = None
+        flow: Optional[str] = None,
+        owner_id: Optional[int] = None
     ) -> int:
         """添加 V2Ray 用户
+
+        Args:
+            owner_id: 所有者 ID，如果为 None 则插入 NULL（系统用户或旧数据兼容）
 
         Returns:
             新创建记录的 ID
@@ -2350,9 +3310,9 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO v2ray_users (name, uuid, password, email, alter_id, flow)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (name, uuid, password, email, alter_id, flow))
+                INSERT INTO v2ray_users (name, uuid, password, email, alter_id, flow, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (name, uuid, password, email, alter_id, flow, owner_id))
             conn.commit()
             return cursor.lastrowid
 
@@ -2382,6 +3342,66 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM v2ray_users WHERE id = ?", (user_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # ============ Shadowsocks Inbound 配置 ============
+
+    def get_shadowsocks_inbound_config(self) -> Optional[Dict]:
+        """获取 Shadowsocks 入口配置"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM shadowsocks_inbound_config WHERE id = 1"
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def set_shadowsocks_inbound_config(
+        self,
+        listen_address: str = "0.0.0.0",
+        listen_port: int = 8388,
+        method: str = "2022-blake3-aes-256-gcm",
+        password: str = "",
+        udp_enabled: bool = True,
+        enabled: bool = False,
+        default_outbound: Optional[str] = None,
+    ) -> bool:
+        """设置 Shadowsocks 入口配置"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO shadowsocks_inbound_config
+                (id, listen_address, listen_port, method, password,
+                 udp_enabled, enabled, default_outbound, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (listen_address, listen_port, method, password,
+                  1 if udp_enabled else 0, 1 if enabled else 0, default_outbound))
+            conn.commit()
+            return True
+
+    def update_shadowsocks_inbound_config(self, **kwargs) -> bool:
+        """更新 Shadowsocks 入口配置的特定字段"""
+        allowed_fields = {
+            "listen_address", "listen_port", "method", "password",
+            "udp_enabled", "enabled", "default_outbound"
+        }
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE shadowsocks_inbound_config SET {", ".join(updates)} WHERE id = 1
+            """, values)
             conn.commit()
             return cursor.rowcount > 0
 
@@ -2436,9 +3456,8 @@ class UserDatabase:
         description: str = "",
         api_port: Optional[int] = None,
         tunnel_type: str = "wireguard",
-        # 隧道状态和 IP 参数（Phase 2 配对系统需要）
-        tunnel_status: str = "disconnected",
-        tunnel_interface: Optional[str] = None,  # Phase 11-Tunnel: WireGuard 接口名
+        # 隧道状态和 IP 参数        tunnel_status: str = "disconnected",
+        tunnel_interface: Optional[str] = None,  # WireGuard 接口名
         tunnel_local_ip: Optional[str] = None,
         tunnel_remote_ip: Optional[str] = None,
         tunnel_port: Optional[int] = None,
@@ -2468,8 +3487,10 @@ class UserDatabase:
         default_outbound: Optional[str] = None,
         auto_reconnect: bool = True,
         enabled: bool = True,
-        # Phase 11: 双向连接状态
+        # 双向连接状态
         bidirectional_status: str = "pending",
+        # SOCKS 端口（用于 Xray 隧道类型）
+        xray_socks_port: Optional[int] = None,
     ) -> int:
         """添加对等节点
 
@@ -2505,12 +3526,13 @@ class UserDatabase:
             default_outbound: 默认出口
             auto_reconnect: 自动重连
             enabled: 是否启用
+            xray_socks_port: Xray SOCKS5 端口（未提供时自动分配）
 
         Raises:
             sqlite3.IntegrityError: 如果 tunnel_local_ip 或 tunnel_port 冲突（竞态条件检测）
             ValueError: 如果 tunnel_port 超出有效范围 (36200-36299)
         """
-        # Phase 6 Fix: 验证 tunnel_port 在有效范围内（支持环境变量配置）
+        # 验证 tunnel_port 在有效范围内（支持环境变量配置）
         TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
         TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
         if tunnel_port is not None:
@@ -2518,6 +3540,10 @@ class UserDatabase:
                 raise ValueError(
                     f"tunnel_port {tunnel_port} 超出有效范围 ({TUNNEL_PORT_MIN}-{TUNNEL_PORT_MAX})"
                 )
+
+        # 自动分配 xray_socks_port（如果未提供且隧道类型为 xray）
+        if xray_socks_port is None and tunnel_type == "xray":
+            xray_socks_port = self.get_next_peer_xray_socks_port()
 
         with self._get_conn() as conn:
             cursor = conn.cursor()
@@ -2527,20 +3553,20 @@ class UserDatabase:
                     tunnel_type, tunnel_status, tunnel_interface,
                     tunnel_local_ip, tunnel_remote_ip, tunnel_port, tunnel_api_endpoint,
                     wg_private_key, wg_public_key, wg_peer_public_key,
-                    xray_protocol, xray_uuid,
+                    xray_protocol, xray_uuid, xray_socks_port,
                     xray_reality_private_key, xray_reality_public_key, xray_reality_short_id,
                     xray_reality_dest, xray_reality_server_names,
                     xray_peer_reality_public_key, xray_peer_reality_short_id,
                     xray_xhttp_path, xray_xhttp_mode, xray_xhttp_host,
                     connection_mode, default_outbound, auto_reconnect, enabled,
                     bidirectional_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tag, name, description, endpoint, api_port, psk_hash, psk_encrypted,
                 tunnel_type, tunnel_status, tunnel_interface,
                 tunnel_local_ip, tunnel_remote_ip, tunnel_port, tunnel_api_endpoint,
                 wg_private_key, wg_public_key, wg_peer_public_key,
-                xray_protocol, xray_uuid,
+                xray_protocol, xray_uuid, xray_socks_port,
                 xray_reality_private_key, xray_reality_public_key, xray_reality_short_id,
                 xray_reality_dest, xray_reality_server_names,
                 xray_peer_reality_public_key, xray_peer_reality_short_id,
@@ -2572,7 +3598,7 @@ class UserDatabase:
             # 对方入站信息（用于连接到对方的入站）
             "peer_inbound_enabled", "peer_inbound_port", "peer_inbound_uuid",
             "peer_inbound_reality_public_key", "peer_inbound_reality_short_id",
-            # Phase 11.1: 双向自动连接参数
+            # 双向自动连接参数
             "bidirectional_status", "remote_wg_private_key", "remote_wg_public_key",
             # 连接模式
             "connection_mode",  # 'outbound' or 'inbound'
@@ -2615,11 +3641,17 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
-    def get_next_peer_tunnel_port(self) -> Optional[int]:
+    def get_next_peer_tunnel_port(self, exclude_ports: set = None) -> Optional[int]:
         """获取下一个可用的对等节点隧道端口
 
         Issue 10/13 Fix: 使用正确的端口范围 (36200-36299) 并正确处理耗尽情况。
         此范围与 CLAUDE.md 和 peer_pairing.py 中的文档保持一致。
+
+         添加 exclude_ports 参数，用于在导入配对时排除对方节点的端口。
+        例如：A 使用 36200，B 导入时应排除 36200，分配 36201。
+
+        Args:
+            exclude_ports: 额外需要排除的端口集合（如对方节点正在使用的端口）
 
         Returns:
             可用的端口号，如果端口范围已耗尽则返回 None
@@ -2631,6 +3663,13 @@ class UserDatabase:
         TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
         TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
 
+        # 获取需要避免的保留端口（防止与入口端口冲突）
+        reserved_ports = self._get_reserved_ports()
+
+        #  合并额外排除的端口
+        if exclude_ports:
+            reserved_ports = reserved_ports | exclude_ports
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
             # 获取所有已使用的端口
@@ -2641,30 +3680,92 @@ class UserDatabase:
 
             # 从最小端口开始查找可用端口（支持端口复用）
             for port in range(TUNNEL_PORT_MIN, TUNNEL_PORT_MAX + 1):
-                if port not in used_ports:
+                if port not in used_ports and port not in reserved_ports:
                     return port
 
             # Issue 10 Fix: 端口范围耗尽，返回 None 而非抛出异常
             # 让调用者可以提供更友好的错误消息
             return None
 
+    def _get_reserved_ports(self) -> set:
+        """获取所有保留端口，避免分配给 peer tunnel
+
+        Returns:
+            保留端口集合，包括 WireGuard 入口端口和其他系统服务端口
+        """
+        reserved = set()
+
+        # WireGuard 入口端口
+        wg_server = self.get_wireguard_server()
+        if wg_server:
+            wg_port = wg_server.get("listen_port")
+            if wg_port:
+                reserved.add(int(wg_port))
+
+        # 从环境变量获取可能的保留端口
+        env_ports = [
+            ("WG_LISTEN_PORT", 36100),
+            ("WEB_PORT", 36000),
+            ("API_BACKEND_PORT", 8000),
+        ]
+        for env_var, default in env_ports:
+            port = int(os.environ.get(env_var, str(default)))
+            reserved.add(port)
+
+        return reserved
+
     def get_next_peer_xray_socks_port(self) -> int:
         """获取下一个可用的 Xray SOCKS 端口（可通过环境变量配置起始端口）
 
+        端口范围说明:
+        - V2Ray egress SOCKS: 37101-37200 (100 个端口)
+        - Peer node SOCKS: 37201-37299 (99 个端口)
+
         Raises:
-            ValueError: 端口超出 65535 限制
+            ValueError: 端口超出限制或与 V2Ray egress 端口冲突
         """
         # Peer Xray SOCKS port start (configurable via environment)
         PEER_XRAY_SOCKS_PORT_START = int(os.environ.get("PEER_XRAY_SOCKS_PORT_START", "37201"))
+        V2RAY_EGRESS_SOCKS_PORT_START = int(os.environ.get("V2RAY_EGRESS_SOCKS_PORT_START", "37101"))
+        V2RAY_EGRESS_SOCKS_PORT_END = PEER_XRAY_SOCKS_PORT_START - 1  # 37200
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
+
+            # 获取当前最大 peer SOCKS 端口
             row = cursor.execute(
                 "SELECT MAX(xray_socks_port) FROM peer_nodes WHERE xray_socks_port IS NOT NULL"
             ).fetchone()
             max_port = row[0] if row and row[0] else (PEER_XRAY_SOCKS_PORT_START - 1)
             next_port = max(max_port + 1, PEER_XRAY_SOCKS_PORT_START)
+
+            # 获取 V2Ray egress 使用的端口（避免冲突）
+            egress_ports = set()
+            try:
+                rows = cursor.execute(
+                    "SELECT socks_port FROM v2ray_egress WHERE socks_port IS NOT NULL"
+                ).fetchall()
+                egress_ports = {row[0] for row in rows}
+            except Exception:
+                pass  # 表可能不存在
+
+            # 跳过与 V2Ray egress 冲突的端口
+            while next_port in egress_ports:
+                next_port += 1
+
+            # 验证端口范围
             if next_port > 65535:
                 raise ValueError(f"Peer Xray SOCKS port overflow: {next_port} > 65535")
+
+            # 警告如果端口接近 V2Ray egress 范围
+            if V2RAY_EGRESS_SOCKS_PORT_START <= next_port <= V2RAY_EGRESS_SOCKS_PORT_END:
+                import logging
+                logging.warning(
+                    f"Peer SOCKS 端口 {next_port} 与 V2Ray egress 端口范围 "
+                    f"({V2RAY_EGRESS_SOCKS_PORT_START}-{V2RAY_EGRESS_SOCKS_PORT_END}) 重叠。"
+                    "建议调整 PEER_XRAY_SOCKS_PORT_START 环境变量。"
+                )
+
             return next_port
 
     def get_next_peer_inbound_port(self) -> int:
@@ -2696,7 +3797,7 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
-    # ============ 双向连接管理 (Phase 11.1) ============
+    # ============ 双向连接管理 ============
 
     def update_peer_bidirectional_status(self, tag: str, status: str) -> bool:
         """更新对等节点的双向连接状态
@@ -2749,8 +3850,7 @@ class UserDatabase:
         Returns:
             符合条件的节点列表
         """
-        # 输入验证 (Phase 11.1)
-        valid_statuses = {'pending', 'outbound_only', 'bidirectional'}
+        # 输入验证         valid_statuses = {'pending', 'outbound_only', 'bidirectional'}
         if status not in valid_statuses:
             logger.warning(f"Invalid bidirectional_status query: {status}")
             return []
@@ -2766,7 +3866,7 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
-    # ============ Pending Pairings 管理 (Phase 11-Tunnel) ============
+    # ============ Pending Pairings 管理 ============
 
     def add_pending_pairing(
         self,
@@ -2918,7 +4018,7 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
-    # ============ Phase 11-Cascade: 级联删除通知支持 ============
+    # ============ 级联删除通知支持 ============
 
     # 有效的事件类型 (必须与数据库 CHECK 约束保持一致)
     # Phase B: 添加 port_change 事件类型支持端口变更通知
@@ -3445,7 +4545,8 @@ class UserDatabase:
         exit_egress: Optional[str] = None,
         dscp_value: Optional[int] = None,
         chain_mark_type: str = "dscp",
-        chain_state: str = "inactive"
+        chain_state: str = "inactive",
+        allow_transitive: bool = False  # 传递模式验证
     ) -> int:
         """添加多跳链路
 
@@ -3463,6 +4564,7 @@ class UserDatabase:
             dscp_value: DSCP 标记值 1-63（多跳链路架构 v2）
             chain_mark_type: 标记类型 'dscp' 或 'xray_email'
             chain_state: 链路状态 'inactive'/'activating'/'active'/'error'
+            allow_transitive: 是否允许传递验证（只验证第一跳）
         """
         with self._get_conn() as conn:
             cursor = conn.cursor()
@@ -3470,8 +4572,9 @@ class UserDatabase:
                 INSERT INTO node_chains (
                     tag, name, description, hops, hop_protocols,
                     entry_rules, relay_rules, priority, enabled,
-                    exit_egress, dscp_value, chain_mark_type, chain_state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_egress, dscp_value, chain_mark_type, chain_state,
+                    allow_transitive
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tag, name, description,
                 json.dumps(hops),
@@ -3479,7 +4582,8 @@ class UserDatabase:
                 json.dumps(entry_rules) if entry_rules else None,
                 json.dumps(relay_rules) if relay_rules else None,
                 priority, 1 if enabled else 0,
-                exit_egress, dscp_value, chain_mark_type, chain_state
+                exit_egress, dscp_value, chain_mark_type, chain_state,
+                1 if allow_transitive else 0
             ))
             conn.commit()
             return cursor.lastrowid
@@ -3492,7 +4596,9 @@ class UserDatabase:
             "last_health_check", "priority", "enabled",
             "downstream_status", "disconnected_node",  # 级联通知字段
             # 多跳链路架构 v2 字段
-            "exit_egress", "dscp_value", "chain_mark_type", "chain_state"
+            "exit_egress", "dscp_value", "chain_mark_type", "chain_state",
+            "allow_transitive",  # 传递模式验证
+            "last_error"  # 错误原因记录
         }
         updates = []
         values = []
@@ -3516,6 +4622,116 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    def atomic_chain_state_transition(
+        self,
+        tag: str,
+        expected_state: str,
+        new_state: str,
+        timeout_ms: int = 30000,
+        last_error: Optional[str] = None
+    ) -> tuple:
+        """ 原子性链路状态转换
+
+        使用 BEGIN EXCLUSIVE 事务确保并发安全。解决两个并发请求同时
+        读取 'inactive' 状态然后都尝试写入 'activating' 的竞态条件。
+
+                - 使用专用连接避免 TLS 连接池隐式事务状态冲突
+        - 添加 last_error 参数支持在同一事务中设置错误消息
+
+        Args:
+            tag: 链路标签
+            expected_state: 期望的当前状态
+            new_state: 要转换到的新状态
+            timeout_ms: 获取锁的超时时间（毫秒）
+            last_error: 可选的错误消息，将在同一事务中原子设置
+
+        Returns:
+            (success: bool, error_message: Optional[str])
+            - (True, None): 转换成功
+            - (False, "Chain not found"): 链路不存在
+            - (False, "Expected state 'X', found 'Y'"): 状态不匹配
+            - (False, "Database error: ..."): 数据库错误
+        """
+        # 使用专用连接避免 TLS 连接池冲突
+        # TLS 缓存连接可能有待处理的隐式事务，导致 BEGIN EXCLUSIVE 或 COMMIT 失败
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=timeout_ms / 1000.0,  # SQLite timeout 是秒
+            check_same_thread=False
+        )
+        try:
+            # 应用 SQLCipher 加密和性能 PRAGMA
+            self._apply_encryption(conn)
+            # [MU-001] 启用外键约束
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # 设置锁等待超时
+            cursor.execute(f"PRAGMA busy_timeout = {timeout_ms}")
+
+            # 开始排他事务 - 阻止其他写操作
+            cursor.execute("BEGIN EXCLUSIVE")
+
+            # 检查当前状态
+            cursor.execute(
+                "SELECT chain_state FROM node_chains WHERE tag = ?",
+                (tag,)
+            )
+            row = cursor.fetchone()
+
+            if not row:
+                # 使用 conn.rollback() 统一事务管理
+                conn.rollback()
+                return False, f"Chain '{tag}' not found"
+
+            current_state = row[0] or "inactive"
+
+            if current_state != expected_state:
+                # 使用 conn.rollback() 统一事务管理
+                conn.rollback()
+                return False, f"Expected state '{expected_state}', found '{current_state}'"
+
+            # 原子更新状态和 last_error（如果提供）
+            if last_error is not None:
+                cursor.execute(
+                    """UPDATE node_chains
+                       SET chain_state = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE tag = ?""",
+                    (new_state, last_error, tag)
+                )
+            else:
+                cursor.execute(
+                    """UPDATE node_chains
+                       SET chain_state = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE tag = ?""",
+                    (new_state, tag)
+                )
+            # 使用 conn.commit() 统一事务管理
+            conn.commit()
+
+            logger.info(
+                f"[db] Chain '{tag}' state transition: {expected_state} -> {new_state}"
+                + (f" (last_error: {last_error[:50]}...)" if last_error and len(last_error) > 50
+                   else (f" (last_error: {last_error})" if last_error else ""))
+            )
+            return True, None
+
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception as rollback_err:
+                # 记录 rollback 失败（连接将在 finally 中关闭）
+                logger.warning(f"[db] Rollback failed during error recovery: {rollback_err}")
+            logger.error(f"[db] atomic_chain_state_transition failed: {e}")
+            return False, f"Database error: {str(e)}"
+        finally:
+            # 专用连接在使用后关闭，不污染 TLS 连接池
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def delete_node_chain(self, tag: str) -> bool:
         """删除多跳链路
 
@@ -3538,7 +4754,7 @@ class UserDatabase:
             return cursor.rowcount > 0
 
     def validate_chain_hops(self, hops: List[str], allow_transitive: bool = False) -> tuple:
-        """Phase 11-Fix.C: 验证链路的跳点节点，支持传递模式
+        """ 验证链路的跳点节点，支持传递模式
 
         验证内容：
         1. hops 不能为空
@@ -3889,8 +5105,25 @@ class UserDatabase:
             if mark_value in self.RESERVED_DSCP_VALUES:
                 raise ValueError(f"DSCP value {mark_value} is reserved for QoS")
 
+        # xray_email 类型必须有 source_node（Xray 路由规则需要精确匹配 email）
+        # 参考: https://github.com/XTLS/Xray-core/discussions/4668
+        if mark_type == "xray_email" and not source_node:
+            raise ValueError(
+                "source_node is required for xray_email mark_type "
+                "(Xray routing does not support wildcard matching in user field)"
+            )
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            existing = cursor.execute(
+                "SELECT chain_tag FROM chain_routing WHERE mark_value = ? AND mark_type = ?",
+                (mark_value, mark_type),
+            ).fetchone()
+            if existing and existing[0] != chain_tag:
+                raise ValueError(
+                    f"Mark value {mark_value} ({mark_type}) already registered to chain '{existing[0]}'"
+                )
+
             cursor.execute("""
                 INSERT INTO chain_routing (chain_tag, mark_value, mark_type, egress_tag, source_node)
                 VALUES (?, ?, ?, ?, ?)
@@ -3908,7 +5141,7 @@ class UserDatabase:
     ) -> int:
         """添加或更新链路路由 (原子操作)
 
-        使用 INSERT OR REPLACE 确保原子性，避免竞态条件。
+        使用显式 UPDATE/INSERT 更新同一链路记录，避免覆盖其他链路。
         如果路由已存在（相同 chain_tag + mark_value + mark_type），则更新。
 
         Args:
@@ -3935,15 +5168,50 @@ class UserDatabase:
             if mark_value in self.RESERVED_DSCP_VALUES:
                 raise ValueError(f"DSCP value {mark_value} is reserved for QoS")
 
+        # xray_email 类型必须有 source_node（Xray 路由规则需要精确匹配 email）
+        # 参考: https://github.com/XTLS/Xray-core/discussions/4668
+        if mark_type == "xray_email" and not source_node:
+            raise ValueError(
+                "source_node is required for xray_email mark_type "
+                "(Xray routing does not support wildcard matching in user field)"
+            )
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            # 使用 INSERT OR REPLACE 实现原子 upsert
-            # chain_routing 表的 UNIQUE 约束在 (chain_tag, mark_value, mark_type) 上
-            cursor.execute("""
-                INSERT OR REPLACE INTO chain_routing
+            existing = cursor.execute(
+                "SELECT chain_tag FROM chain_routing WHERE mark_value = ? AND mark_type = ?",
+                (mark_value, mark_type),
+            ).fetchone()
+            if existing and existing[0] != chain_tag:
+                raise ValueError(
+                    f"Mark value {mark_value} ({mark_type}) already registered to chain '{existing[0]}'"
+                )
+
+            existing_row = cursor.execute(
+                "SELECT id FROM chain_routing WHERE chain_tag = ? AND mark_value = ? AND mark_type = ?",
+                (chain_tag, mark_value, mark_type),
+            ).fetchone()
+
+            if existing_row:
+                cursor.execute(
+                    """
+                    UPDATE chain_routing
+                    SET egress_tag = ?, source_node = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (egress_tag, source_node, existing_row[0]),
+                )
+                conn.commit()
+                return existing_row[0]
+
+            cursor.execute(
+                """
+                INSERT INTO chain_routing
                     (chain_tag, mark_value, mark_type, egress_tag, source_node, updated_at)
                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (chain_tag, mark_value, mark_type, egress_tag, source_node))
+                """,
+                (chain_tag, mark_value, mark_type, egress_tag, source_node),
+            )
             conn.commit()
             return cursor.lastrowid
 
@@ -4038,7 +5306,7 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount
 
-    # ============ 终端出口缓存 (Phase 11.1) ============
+    # ============ 终端出口缓存 ============
 
     def get_terminal_egress_cache(self, chain_tag: str) -> Optional[Dict]:
         """获取终端出口缓存
@@ -4081,7 +5349,7 @@ class UserDatabase:
         Returns:
             是否成功
         """
-        # TTL 边界验证 (Phase 11.1)
+        # TTL 边界验证
         if not isinstance(ttl_seconds, int) or ttl_seconds < 0 or ttl_seconds > 86400:
             logger.warning(f"Invalid ttl_seconds: {ttl_seconds}, using default 300")
             ttl_seconds = 300
@@ -4251,14 +5519,16 @@ class DatabaseManager:
         return self.geodata.search_domain_lists(query, limit)
 
     # 用户数据（读写）
-    def get_routing_rules(self, enabled_only: bool = True) -> List[Dict]:
-        return self.user.get_routing_rules(enabled_only)
+    def get_routing_rules(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        return self.user.get_routing_rules(enabled_only, owner_id)
 
-    def add_routing_rule(self, rule_type: str, target: str, outbound: str, priority: int = 0, tag: Optional[str] = None) -> int:
-        return self.user.add_routing_rule(rule_type, target, outbound, priority, tag)
+    def add_routing_rule(self, rule_type: str, target: str, outbound: str,
+                        priority: int = 0, tag: Optional[str] = None,
+                        owner_id: Optional[int] = None) -> int:
+        return self.user.add_routing_rule(rule_type, target, outbound, priority, tag, owner_id)
 
-    def add_routing_rules_batch(self, rules: List[tuple]) -> int:
-        return self.user.add_routing_rules_batch(rules)
+    def add_routing_rules_batch(self, rules: List[tuple], owner_id: Optional[int] = None) -> int:
+        return self.user.add_routing_rules_batch(rules, owner_id)
 
     def update_routing_rule(self, rule_id: int, outbound: Optional[str] = None,
                           priority: Optional[int] = None, enabled: Optional[bool] = None) -> bool:
@@ -4267,8 +5537,64 @@ class DatabaseManager:
     def delete_routing_rule(self, rule_id: int) -> bool:
         return self.user.delete_routing_rule(rule_id)
 
-    def delete_all_routing_rules(self, preserve_adblock: bool = False) -> int:
-        return self.user.delete_all_routing_rules(preserve_adblock)
+    def delete_routing_rules_by_tag(self, tag: str, owner_id: Optional[int] = None) -> int:
+        return self.user.delete_routing_rules_by_tag(tag, owner_id)
+
+    def delete_all_routing_rules(self, preserve_adblock: bool = False, owner_id: Optional[int] = None) -> int:
+        return self.user.delete_all_routing_rules(preserve_adblock, owner_id)
+
+    # Rule Sets (规则集)
+    def get_rule_sets(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        return self.user.get_rule_sets(enabled_only, owner_id)
+
+    def get_rule_set(self, set_id: str) -> Optional[Dict]:
+        return self.user.get_rule_set(set_id)
+
+    def add_rule_set(
+        self,
+        set_id: str,
+        name: str,
+        rule_type: str,
+        outbound: str,
+        rule_count: int,
+        file_path: str,
+        checksum: str,
+        priority: int = 0,
+        owner_id: Optional[int] = None
+    ) -> bool:
+        return self.user.add_rule_set(set_id, name, rule_type, outbound, rule_count,
+                                      file_path, checksum, priority, owner_id)
+
+    def update_rule_set(
+        self,
+        set_id: str,
+        name: str = None,
+        outbound: str = None,
+        rule_count: int = None,
+        file_path: str = None,
+        checksum: str = None,
+        enabled: bool = None,
+        priority: int = None
+    ) -> bool:
+        return self.user.update_rule_set(set_id, name, outbound, rule_count,
+                                         file_path, checksum, enabled, priority)
+
+    def update_rule_set_status(
+        self,
+        set_id: str,
+        status: str,
+        error_message: str = None
+    ) -> bool:
+        return self.user.update_rule_set_status(set_id, status, error_message)
+
+    def delete_rule_set(self, set_id: str) -> bool:
+        return self.user.delete_rule_set(set_id)
+
+    def get_rule_sets_by_outbound(self, outbound: str) -> List[Dict]:
+        return self.user.get_rule_sets_by_outbound(outbound)
+
+    def get_rule_sets_by_status(self, status: str) -> List[Dict]:
+        return self.user.get_rule_sets_by_status(status)
 
     def get_outbounds(self, enabled_only: bool = True) -> List[Dict]:
         return self.user.get_outbounds(enabled_only)
@@ -4289,8 +5615,8 @@ class DatabaseManager:
         return self.user.set_wireguard_server(interface_name, address, listen_port, mtu, private_key, default_outbound)
 
     # WireGuard 对等点
-    def get_wireguard_peers(self, enabled_only: bool = True) -> List[Dict]:
-        return self.user.get_wireguard_peers(enabled_only)
+    def get_wireguard_peers(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        return self.user.get_wireguard_peers(enabled_only, owner_id)
 
     def get_wireguard_peer(self, peer_id: int) -> Optional[Dict]:
         return self.user.get_wireguard_peer(peer_id)
@@ -4302,8 +5628,9 @@ class DatabaseManager:
                           preshared_key: Optional[str] = None,
                           allow_lan: bool = False,
                           lan_subnet: Optional[str] = None,
-                          default_outbound: Optional[str] = None) -> int:
-        return self.user.add_wireguard_peer(name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound)
+                          default_outbound: Optional[str] = None,
+                          owner_id: Optional[int] = None) -> int:
+        return self.user.add_wireguard_peer(name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, owner_id)
 
     def update_wireguard_peer(self, peer_id: int, name: Optional[str] = None,
                              allowed_ips: Optional[str] = None, enabled: Optional[bool] = None,
@@ -4377,6 +5704,117 @@ class DatabaseManager:
     def get_all_settings(self) -> Dict[str, str]:
         return self.user.get_all_settings()
 
+    # Admin Authentication
+    def is_admin_setup(self) -> bool:
+        """检查管理员密码是否已设置"""
+        return self.user.is_admin_setup()
+
+    def set_admin_password(self, password_hash: str) -> bool:
+        """设置或更新管理员密码哈希"""
+        return self.user.set_admin_password(password_hash)
+
+    def get_admin_password_hash(self) -> Optional[str]:
+        """获取管理员密码哈希"""
+        return self.user.get_admin_password_hash()
+
+    def get_or_create_jwt_secret(self) -> str:
+        """获取 JWT 密钥，不存在则创建"""
+        return self.user.get_or_create_jwt_secret()
+
+    # User Management (用户管理)
+    def get_users(self) -> List[Dict]:
+        """获取所有用户（不包含密码哈希）"""
+        return self.user.get_users()
+
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """根据 ID 获取用户（包含密码哈希）"""
+        return self.user.get_user(user_id)
+
+    def get_user_by_username(self, username: str) -> Optional[Dict]:
+        """根据用户名获取用户（包含密码哈希）"""
+        return self.user.get_user_by_username(username)
+
+    def get_user_count(self) -> int:
+        """获取用户总数"""
+        return self.user.get_user_count()
+
+    def count_users_by_role(self, role: str) -> int:
+        """统计指定角色的用户数量"""
+        return self.user.count_users_by_role(role)
+
+    def get_users_by_role(self, role: str) -> List[Dict]:
+        """获取指定角色的用户列表"""
+        return self.user.get_users_by_role(role)
+
+    def add_user(self, username: str, password_hash: str, email: Optional[str] = None,
+                 role: str = "user", created_by: Optional[int] = None) -> int:
+        """添加新用户"""
+        return self.user.add_user(username, password_hash, email, role, created_by)
+
+    def update_user(self, user_id: int, **kwargs) -> bool:
+        """更新用户字段"""
+        return self.user.update_user(user_id, **kwargs)
+
+    def increment_token_version(self, user_id: int) -> bool:
+        """递增用户的 token_version（用于密码更改后使旧 token 失效）"""
+        return self.user.increment_token_version(user_id)
+
+    def delete_user(self, user_id: int) -> bool:
+        """删除用户（级联删除其资源）"""
+        return self.user.delete_user(user_id)
+
+    # Token Blacklist (Token 黑名单)
+    def add_revoked_token(self, jti: str, user_id: int, expires_at: str, reason: str = None) -> bool:
+        """添加已撤销的 token"""
+        return self.user.add_revoked_token(jti, user_id, expires_at, reason)
+
+    def is_token_revoked(self, jti: str) -> bool:
+        """检查 token 是否已被撤销"""
+        return self.user.is_token_revoked(jti)
+
+    def cleanup_expired_tokens(self) -> int:
+        """清理过期的 token 黑名单记录"""
+        return self.user.cleanup_expired_tokens()
+
+    # Audit Log (审计日志)
+    def add_audit_log(self, action: str, user_id: Optional[int] = None,
+                      resource_type: Optional[str] = None, resource_id: Optional[str] = None,
+                      details: Optional[str] = None, ip_address: Optional[str] = None) -> int:
+        """添加审计日志"""
+        return self.user.add_audit_log(action, user_id, resource_type, resource_id, details, ip_address)
+
+    def get_audit_logs(self, user_id: Optional[int] = None, action: Optional[str] = None,
+                       limit: int = 100, offset: int = 0) -> List[Dict]:
+        """获取审计日志"""
+        return self.user.get_audit_logs(user_id, action, limit, offset)
+
+    # User Quotas (用户配额)
+    def get_user_quota(self, user_id: int) -> Optional[Dict]:
+        """获取用户配额"""
+        return self.user.get_user_quota(user_id)
+
+    def set_user_quota(self, user_id: int, max_peers: int = 10,
+                       max_rules: int = 100, max_rule_sets: int = 10) -> bool:
+        """设置用户配额"""
+        return self.user.set_user_quota(user_id, max_peers, max_rules, max_rule_sets)
+
+    # Account Lockout (账户锁定)
+    def record_failed_login(self, user_id: int) -> int:
+        """记录登录失败并返回失败次数"""
+        return self.user.record_failed_login(user_id)
+
+    def lock_account(self, user_id: int, lock_minutes: int = 30) -> bool:
+        """锁定账户指定分钟数"""
+        return self.user.lock_account(user_id, lock_minutes)
+
+    def reset_failed_login(self, user_id: int) -> bool:
+        """重置登录失败计数（登录成功后调用）"""
+        return self.user.reset_failed_login(user_id)
+
+    def is_account_locked(self, user_id: int) -> bool:
+        """检查账户是否被锁定"""
+        return self.user.is_account_locked(user_id)
+
     # Custom Egress
     def get_custom_egress_list(self, enabled_only: bool = False) -> List[Dict]:
         return self.user.get_custom_egress_list(enabled_only)
@@ -4400,14 +5838,15 @@ class DatabaseManager:
         return self.user.delete_custom_egress(tag)
 
     # Remote Rule Sets
-    def get_remote_rule_sets(self, enabled_only: bool = False, category: Optional[str] = None) -> List[Dict]:
-        return self.user.get_remote_rule_sets(enabled_only, category)
+    def get_remote_rule_sets(self, enabled_only: bool = False, category: Optional[str] = None,
+                               owner_id: Optional[int] = None) -> List[Dict]:
+        return self.user.get_remote_rule_sets(enabled_only, category, owner_id)
 
     def get_remote_rule_set(self, tag: str) -> Optional[Dict]:
         return self.user.get_remote_rule_set(tag)
 
-    def toggle_remote_rule_set(self, tag: str) -> bool:
-        return self.user.toggle_remote_rule_set(tag)
+    def toggle_remote_rule_set(self, tag: str, owner_id: Optional[int] = None) -> bool:
+        return self.user.toggle_remote_rule_set(tag, owner_id)
 
     def update_remote_rule_set(self, tag: str, **kwargs) -> bool:
         return self.user.update_remote_rule_set(tag, **kwargs)
@@ -4415,12 +5854,19 @@ class DatabaseManager:
     def add_remote_rule_set(self, tag: str, name: str, url: str,
                             description: str = "", format: str = "adblock",
                             outbound: str = "block", category: str = "general",
-                            region: Optional[str] = None, priority: int = 0) -> int:
+                            region: Optional[str] = None, priority: int = 0,
+                            owner_id: Optional[int] = None) -> int:
         return self.user.add_remote_rule_set(tag, name, url, description, format,
-                                             outbound, category, region, priority)
+                                             outbound, category, region, priority, owner_id)
 
-    def delete_remote_rule_set(self, tag: str) -> bool:
-        return self.user.delete_remote_rule_set(tag)
+    def delete_remote_rule_set(self, tag: str, owner_id: Optional[int] = None) -> bool:
+        return self.user.delete_remote_rule_set(tag, owner_id)
+
+    def update_remote_rule_set_status(self, tag: str, status: str, error_message: Optional[str] = None) -> bool:
+        return self.user.update_remote_rule_set_status(tag, status, error_message)
+
+    def get_remote_rule_sets_by_status(self, status: str) -> List[Dict]:
+        return self.user.get_remote_rule_sets_by_status(status)
 
     # Direct Egress
     def get_direct_egress_list(self, enabled_only: bool = False) -> List[Dict]:
@@ -4538,6 +5984,75 @@ class DatabaseManager:
     def delete_v2ray_egress(self, tag: str) -> bool:
         return self.user.delete_v2ray_egress(tag)
 
+    # Shadowsocks Egress
+    def get_shadowsocks_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_shadowsocks_egress_list(enabled_only)
+
+    def get_shadowsocks_egress(self, tag: str) -> Optional[Dict]:
+        return self.user.get_shadowsocks_egress(tag)
+
+    def add_shadowsocks_egress(
+        self,
+        tag: str,
+        server: str,
+        server_port: int,
+        method: str,
+        password: str,
+        description: str = "",
+        udp_enabled: bool = True,
+        enabled: bool = True
+    ) -> int:
+        return self.user.add_shadowsocks_egress(
+            tag, server, server_port, method, password,
+            description, udp_enabled, enabled
+        )
+
+    def update_shadowsocks_egress(self, tag: str, **kwargs) -> bool:
+        return self.user.update_shadowsocks_egress(tag, **kwargs)
+
+    def delete_shadowsocks_egress(self, tag: str) -> bool:
+        return self.user.delete_shadowsocks_egress(tag)
+
+    # VLESS Egress
+    def get_vless_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_vless_egress_list(enabled_only)
+
+    def get_vless_egress(self, tag: str) -> Optional[Dict]:
+        return self.user.get_vless_egress(tag)
+
+    def add_vless_egress(
+        self,
+        tag: str,
+        server: str,
+        server_port: int,
+        uuid: str,
+        description: str = "",
+        flow: Optional[str] = None,
+        transport: str = "tcp",
+        ws_path: Optional[str] = None,
+        ws_host: Optional[str] = None,
+        tls_enabled: bool = True,
+        tls_server_name: Optional[str] = None,
+        tls_skip_verify: bool = False,
+        reality_enabled: bool = False,
+        reality_public_key: Optional[str] = None,
+        reality_short_id: Optional[str] = None,
+        enabled: bool = True
+    ) -> int:
+        return self.user.add_vless_egress(
+            tag, server, server_port, uuid, description, flow,
+            transport, ws_path, ws_host,
+            tls_enabled, tls_server_name, tls_skip_verify,
+            reality_enabled, reality_public_key, reality_short_id,
+            enabled
+        )
+
+    def update_vless_egress(self, tag: str, **kwargs) -> bool:
+        return self.user.update_vless_egress(tag, **kwargs)
+
+    def delete_vless_egress(self, tag: str) -> bool:
+        return self.user.delete_vless_egress(tag)
+
     # WARP Egress
     def get_warp_egress_list(self, enabled_only: bool = False) -> List[Dict]:
         return self.user.get_warp_egress_list(enabled_only)
@@ -4552,19 +6067,25 @@ class DatabaseManager:
         self,
         tag: str,
         description: str = "",
-        protocol: str = "masque",
         config_path: Optional[str] = None,
         license_key: Optional[str] = None,
         account_type: str = "free",
-        mode: str = "socks",
-        socks_port: Optional[int] = None,
         endpoint_v4: Optional[str] = None,
         endpoint_v6: Optional[str] = None,
-        enabled: bool = True
+        enabled: bool = True,
+        account_id: Optional[str] = None,
+        # WireGuard config fields
+        private_key: Optional[str] = None,
+        peer_public_key: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        local_ip: Optional[str] = None,
+        local_ipv6: Optional[str] = None
     ) -> int:
+        """WireGuard only with WG config"""
         return self.user.add_warp_egress(
-            tag, description, protocol, config_path, license_key, account_type,
-            mode, socks_port, endpoint_v4, endpoint_v6, enabled
+            tag, description, config_path, license_key, account_type,
+            endpoint_v4, endpoint_v6, enabled, account_id,
+            private_key, peer_public_key, endpoint, local_ip, local_ipv6
         )
 
     def update_warp_egress(self, tag: str, **kwargs) -> bool:
@@ -4611,13 +6132,14 @@ class DatabaseManager:
         members: List[str],
         description: str = "",
         weights: Optional[Dict[str, int]] = None,
+        algorithm: str = "five_tuple_hash",
         health_check_url: str = "http://www.gstatic.com/generate_204",
         health_check_interval: int = 60,
         health_check_timeout: int = 5,
         enabled: bool = True
     ) -> int:
         return self.user.add_outbound_group(
-            tag, group_type, members, description, weights,
+            tag, group_type, members, description, weights, algorithm,
             health_check_url, health_check_interval, health_check_timeout, enabled
         )
 
@@ -4673,8 +6195,8 @@ class DatabaseManager:
         return self.user.update_v2ray_inbound_config(**kwargs)
 
     # V2Ray Users
-    def get_v2ray_users(self, enabled_only: bool = True) -> List[Dict]:
-        return self.user.get_v2ray_users(enabled_only)
+    def get_v2ray_users(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        return self.user.get_v2ray_users(enabled_only, owner_id)
 
     def get_v2ray_user(self, user_id: int) -> Optional[Dict]:
         return self.user.get_v2ray_user(user_id)
@@ -4689,15 +6211,38 @@ class DatabaseManager:
         password: Optional[str] = None,
         email: Optional[str] = None,
         alter_id: int = 0,
-        flow: Optional[str] = None
+        flow: Optional[str] = None,
+        owner_id: Optional[int] = None
     ) -> int:
-        return self.user.add_v2ray_user(name, uuid, password, email, alter_id, flow)
+        return self.user.add_v2ray_user(name, uuid, password, email, alter_id, flow, owner_id)
 
     def update_v2ray_user(self, user_id: int, **kwargs) -> bool:
         return self.user.update_v2ray_user(user_id, **kwargs)
 
     def delete_v2ray_user(self, user_id: int) -> bool:
         return self.user.delete_v2ray_user(user_id)
+
+    # Shadowsocks Inbound 配置
+    def get_shadowsocks_inbound_config(self) -> Optional[Dict]:
+        return self.user.get_shadowsocks_inbound_config()
+
+    def set_shadowsocks_inbound_config(
+        self,
+        listen_address: str = "0.0.0.0",
+        listen_port: int = 8388,
+        method: str = "2022-blake3-aes-256-gcm",
+        password: str = "",
+        udp_enabled: bool = True,
+        enabled: bool = False,
+        default_outbound: Optional[str] = None,
+    ) -> bool:
+        return self.user.set_shadowsocks_inbound_config(
+            listen_address, listen_port, method, password,
+            udp_enabled, enabled, default_outbound
+        )
+
+    def update_shadowsocks_inbound_config(self, **kwargs) -> bool:
+        return self.user.update_shadowsocks_inbound_config(**kwargs)
 
     # Peer Nodes (对等节点管理)
     def get_peer_nodes(self, enabled_only: bool = False) -> List[Dict]:
@@ -4719,9 +6264,8 @@ class DatabaseManager:
         description: str = "",
         api_port: Optional[int] = None,
         tunnel_type: str = "wireguard",
-        # 隧道状态和 IP 参数（Phase 2 配对系统需要）
-        tunnel_status: str = "disconnected",
-        tunnel_interface: Optional[str] = None,  # Phase 11-Tunnel: WireGuard 接口名
+        # 隧道状态和 IP 参数        tunnel_status: str = "disconnected",
+        tunnel_interface: Optional[str] = None,  # WireGuard 接口名
         tunnel_local_ip: Optional[str] = None,
         tunnel_remote_ip: Optional[str] = None,
         tunnel_port: Optional[int] = None,
@@ -4751,8 +6295,10 @@ class DatabaseManager:
         default_outbound: Optional[str] = None,
         auto_reconnect: bool = True,
         enabled: bool = True,
-        # Phase 11: 双向连接状态
+        # 双向连接状态
         bidirectional_status: str = "pending",
+        # SOCKS 端口（用于 Xray 隧道类型）
+        xray_socks_port: Optional[int] = None,
     ) -> int:
         return self.user.add_peer_node(
             tag, name, endpoint, psk_hash, psk_encrypted, description, api_port,
@@ -4765,7 +6311,7 @@ class DatabaseManager:
             xray_peer_reality_public_key, xray_peer_reality_short_id,
             xray_xhttp_path, xray_xhttp_mode, xray_xhttp_host,
             connection_mode, default_outbound, auto_reconnect, enabled,
-            bidirectional_status
+            bidirectional_status, xray_socks_port
         )
 
     def update_peer_node(self, tag: str, **kwargs) -> bool:
@@ -4777,8 +6323,8 @@ class DatabaseManager:
     def get_connected_peer_nodes(self) -> List[Dict]:
         return self.user.get_connected_peer_nodes()
 
-    def get_next_peer_tunnel_port(self) -> Optional[int]:
-        return self.user.get_next_peer_tunnel_port()
+    def get_next_peer_tunnel_port(self, exclude_ports: set = None) -> Optional[int]:
+        return self.user.get_next_peer_tunnel_port(exclude_ports=exclude_ports)
 
     def get_next_peer_xray_socks_port(self) -> int:
         return self.user.get_next_peer_xray_socks_port()
@@ -4789,8 +6335,7 @@ class DatabaseManager:
     def get_peer_nodes_with_inbound(self) -> List[Dict]:
         return self.user.get_peer_nodes_with_inbound()
 
-    # 双向连接管理 (Phase 11.1)
-    def update_peer_bidirectional_status(self, tag: str, status: str) -> bool:
+    # 双向连接管理     def update_peer_bidirectional_status(self, tag: str, status: str) -> bool:
         return self.user.update_peer_bidirectional_status(tag, status)
 
     def get_peers_pending_bidirectional(self) -> List[Dict]:
@@ -4799,7 +6344,7 @@ class DatabaseManager:
     def get_peers_by_bidirectional_status(self, status: str) -> List[Dict]:
         return self.user.get_peers_by_bidirectional_status(status)
 
-    # Pending Pairings (待处理配对管理, Phase 11-Tunnel)
+    # Pending Pairings (待处理配对管理)
     def add_pending_pairing(
         self,
         pairing_id: str,
@@ -4839,7 +6384,7 @@ class DatabaseManager:
     def get_all_pending_pairings(self) -> List[Dict]:
         return self.user.get_all_pending_pairings()
 
-    # Phase 11-Cascade: 级联删除通知支持
+    # 级联删除通知支持
     def log_peer_event(
         self,
         event_type: str,
@@ -4952,7 +6497,8 @@ class DatabaseManager:
         exit_egress: Optional[str] = None,
         dscp_value: Optional[int] = None,
         chain_mark_type: str = "dscp",
-        chain_state: str = "inactive"
+        chain_state: str = "inactive",
+        allow_transitive: bool = False  # 传递模式验证
     ) -> int:
         return self.user.add_node_chain(
             tag, name, hops, description, hop_protocols,
@@ -4960,11 +6506,25 @@ class DatabaseManager:
             exit_egress=exit_egress,
             dscp_value=dscp_value,
             chain_mark_type=chain_mark_type,
-            chain_state=chain_state
+            chain_state=chain_state,
+            allow_transitive=allow_transitive
         )
 
     def update_node_chain(self, tag: str, **kwargs) -> bool:
         return self.user.update_node_chain(tag, **kwargs)
+
+    def atomic_chain_state_transition(
+        self,
+        tag: str,
+        expected_state: str,
+        new_state: str,
+        timeout_ms: int = 30000,
+        last_error: Optional[str] = None
+    ) -> tuple:
+        """ 原子性链路状态转换（代理方法）"""
+        return self.user.atomic_chain_state_transition(
+            tag, expected_state, new_state, timeout_ms, last_error
+        )
 
     def delete_node_chain(self, tag: str) -> bool:
         return self.user.delete_node_chain(tag)
@@ -5065,8 +6625,7 @@ class DatabaseManager:
     def update_peer_node_tunnel_api_endpoint(self, tag: str, tunnel_api_endpoint: Optional[str]) -> bool:
         return self.user.update_peer_node_tunnel_api_endpoint(tag, tunnel_api_endpoint)
 
-    # 终端出口缓存 (Phase 11.1)
-    def get_terminal_egress_cache(self, chain_tag: str) -> Optional[Dict]:
+    # 终端出口缓存     def get_terminal_egress_cache(self, chain_tag: str) -> Optional[Dict]:
         return self.user.get_terminal_egress_cache(chain_tag)
 
     def update_terminal_egress_cache(

@@ -1,0 +1,591 @@
+{
+  "version": "1.0",
+  "description": "DSCP chain routing test vectors for Rust/Python parity testing",
+  "generated_at": "2026-01-06T00:00:00Z",
+  "total_cases": 45,
+  "categories": {
+    "dscp_value_validation": 10,
+    "routing_mark_calculation": 10,
+    "routing_table_mapping": 10,
+    "chain_activation": 8,
+    "terminal_egress_validation": 7
+  },
+  "test_cases": [
+    {
+      "id": "dscp_valid_001",
+      "category": "dscp_value_validation",
+      "description": "DSCP value 1 is valid (minimum)",
+      "input": {
+        "dscp_value": 1
+      },
+      "expected": {
+        "is_valid": true,
+        "routing_table": 301,
+        "routing_mark": "0x301"
+      }
+    },
+    {
+      "id": "dscp_valid_002",
+      "category": "dscp_value_validation",
+      "description": "DSCP value 63 is valid (maximum)",
+      "input": {
+        "dscp_value": 63
+      },
+      "expected": {
+        "is_valid": true,
+        "routing_table": 363,
+        "routing_mark": "0x33F"
+      }
+    },
+    {
+      "id": "dscp_valid_003",
+      "category": "dscp_value_validation",
+      "description": "DSCP value 32 is valid (middle)",
+      "input": {
+        "dscp_value": 32
+      },
+      "expected": {
+        "is_valid": true,
+        "routing_table": 332,
+        "routing_mark": "0x320"
+      }
+    },
+    {
+      "id": "dscp_invalid_001",
+      "category": "dscp_value_validation",
+      "description": "DSCP value 0 is invalid (reserved)",
+      "input": {
+        "dscp_value": 0
+      },
+      "expected": {
+        "is_valid": false,
+        "error": "DSCP value 0 is reserved"
+      }
+    },
+    {
+      "id": "dscp_invalid_002",
+      "category": "dscp_value_validation",
+      "description": "DSCP value 64 is invalid (exceeds 6-bit max)",
+      "input": {
+        "dscp_value": 64
+      },
+      "expected": {
+        "is_valid": false,
+        "error": "DSCP value exceeds maximum (63)"
+      }
+    },
+    {
+      "id": "dscp_invalid_003",
+      "category": "dscp_value_validation",
+      "description": "DSCP value 255 is invalid",
+      "input": {
+        "dscp_value": 255
+      },
+      "expected": {
+        "is_valid": false,
+        "error": "DSCP value exceeds maximum (63)"
+      }
+    },
+    {
+      "id": "dscp_valid_004",
+      "category": "dscp_value_validation",
+      "description": "DSCP value 10 is valid",
+      "input": {
+        "dscp_value": 10
+      },
+      "expected": {
+        "is_valid": true,
+        "routing_table": 310,
+        "routing_mark": "0x30A"
+      }
+    },
+    {
+      "id": "dscp_valid_005",
+      "category": "dscp_value_validation",
+      "description": "DSCP value 16 is valid",
+      "input": {
+        "dscp_value": 16
+      },
+      "expected": {
+        "is_valid": true,
+        "routing_table": 316,
+        "routing_mark": "0x310"
+      }
+    },
+    {
+      "id": "dscp_valid_006",
+      "category": "dscp_value_validation",
+      "description": "DSCP value 48 is valid",
+      "input": {
+        "dscp_value": 48
+      },
+      "expected": {
+        "is_valid": true,
+        "routing_table": 348,
+        "routing_mark": "0x330"
+      }
+    },
+    {
+      "id": "dscp_valid_007",
+      "category": "dscp_value_validation",
+      "description": "DSCP value 5 is valid (common)",
+      "input": {
+        "dscp_value": 5
+      },
+      "expected": {
+        "is_valid": true,
+        "routing_table": 305,
+        "routing_mark": "0x305"
+      }
+    },
+    {
+      "id": "mark_calc_001",
+      "category": "routing_mark_calculation",
+      "description": "Entry mark for DSCP 1",
+      "input": {
+        "dscp_value": 1,
+        "mark_type": "entry"
+      },
+      "expected": {
+        "routing_mark": "0x301",
+        "routing_mark_decimal": 769
+      }
+    },
+    {
+      "id": "mark_calc_002",
+      "category": "routing_mark_calculation",
+      "description": "Entry mark for DSCP 10",
+      "input": {
+        "dscp_value": 10,
+        "mark_type": "entry"
+      },
+      "expected": {
+        "routing_mark": "0x30A",
+        "routing_mark_decimal": 778
+      }
+    },
+    {
+      "id": "mark_calc_003",
+      "category": "routing_mark_calculation",
+      "description": "Entry mark for DSCP 63",
+      "input": {
+        "dscp_value": 63,
+        "mark_type": "entry"
+      },
+      "expected": {
+        "routing_mark": "0x33F",
+        "routing_mark_decimal": 831
+      }
+    },
+    {
+      "id": "mark_calc_004",
+      "category": "routing_mark_calculation",
+      "description": "Extract DSCP from mark 0x301",
+      "input": {
+        "routing_mark": "0x301",
+        "operation": "extract_dscp"
+      },
+      "expected": {
+        "dscp_value": 1
+      }
+    },
+    {
+      "id": "mark_calc_005",
+      "category": "routing_mark_calculation",
+      "description": "Extract DSCP from mark 0x33F",
+      "input": {
+        "routing_mark": "0x33F",
+        "operation": "extract_dscp"
+      },
+      "expected": {
+        "dscp_value": 63
+      }
+    },
+    {
+      "id": "mark_calc_006",
+      "category": "routing_mark_calculation",
+      "description": "Invalid mark 0x300 (DSCP 0)",
+      "input": {
+        "routing_mark": "0x300",
+        "operation": "validate"
+      },
+      "expected": {
+        "is_valid": false,
+        "error": "DSCP value 0 is reserved"
+      }
+    },
+    {
+      "id": "mark_calc_007",
+      "category": "routing_mark_calculation",
+      "description": "Invalid mark 0x340 (DSCP 64)",
+      "input": {
+        "routing_mark": "0x340",
+        "operation": "validate"
+      },
+      "expected": {
+        "is_valid": false,
+        "error": "Mark exceeds valid DSCP range"
+      }
+    },
+    {
+      "id": "mark_calc_008",
+      "category": "routing_mark_calculation",
+      "description": "Invalid mark 0x200 (wrong base)",
+      "input": {
+        "routing_mark": "0x200",
+        "operation": "validate"
+      },
+      "expected": {
+        "is_valid": false,
+        "error": "Mark base is not 0x300"
+      }
+    },
+    {
+      "id": "mark_calc_009",
+      "category": "routing_mark_calculation",
+      "description": "Entry mark for DSCP 20",
+      "input": {
+        "dscp_value": 20,
+        "mark_type": "entry"
+      },
+      "expected": {
+        "routing_mark": "0x314",
+        "routing_mark_decimal": 788
+      }
+    },
+    {
+      "id": "mark_calc_010",
+      "category": "routing_mark_calculation",
+      "description": "Entry mark for DSCP 45",
+      "input": {
+        "dscp_value": 45,
+        "mark_type": "entry"
+      },
+      "expected": {
+        "routing_mark": "0x32D",
+        "routing_mark_decimal": 813
+      }
+    },
+    {
+      "id": "table_map_001",
+      "category": "routing_table_mapping",
+      "description": "DSCP 1 maps to table 301",
+      "input": {
+        "dscp_value": 1
+      },
+      "expected": {
+        "routing_table": 301
+      }
+    },
+    {
+      "id": "table_map_002",
+      "category": "routing_table_mapping",
+      "description": "DSCP 63 maps to table 363",
+      "input": {
+        "dscp_value": 63
+      },
+      "expected": {
+        "routing_table": 363
+      }
+    },
+    {
+      "id": "table_map_003",
+      "category": "routing_table_mapping",
+      "description": "Table 301 maps back to DSCP 1",
+      "input": {
+        "routing_table": 301,
+        "operation": "reverse_lookup"
+      },
+      "expected": {
+        "dscp_value": 1
+      }
+    },
+    {
+      "id": "table_map_004",
+      "category": "routing_table_mapping",
+      "description": "Table 300 maps to DSCP 0 (invalid)",
+      "input": {
+        "routing_table": 300,
+        "operation": "reverse_lookup"
+      },
+      "expected": {
+        "dscp_value": 0,
+        "is_valid_dscp": false
+      }
+    },
+    {
+      "id": "table_map_005",
+      "category": "routing_table_mapping",
+      "description": "Table 299 is outside DSCP range",
+      "input": {
+        "routing_table": 299,
+        "operation": "reverse_lookup"
+      },
+      "expected": {
+        "dscp_value": null,
+        "error": "Table not in DSCP range"
+      }
+    },
+    {
+      "id": "table_map_006",
+      "category": "routing_table_mapping",
+      "description": "Table 364 is outside DSCP range",
+      "input": {
+        "routing_table": 364,
+        "operation": "reverse_lookup"
+      },
+      "expected": {
+        "dscp_value": null,
+        "error": "Table not in DSCP range"
+      }
+    },
+    {
+      "id": "table_map_007",
+      "category": "routing_table_mapping",
+      "description": "DSCP range does not overlap with ECMP (200-299)",
+      "input": {
+        "check_overlap": true,
+        "range_a": [300, 363],
+        "range_b": [200, 299]
+      },
+      "expected": {
+        "overlaps": false
+      }
+    },
+    {
+      "id": "table_map_008",
+      "category": "routing_table_mapping",
+      "description": "DSCP range does not overlap with Relay (400-463)",
+      "input": {
+        "check_overlap": true,
+        "range_a": [300, 363],
+        "range_b": [400, 463]
+      },
+      "expected": {
+        "overlaps": false
+      }
+    },
+    {
+      "id": "table_map_009",
+      "category": "routing_table_mapping",
+      "description": "DSCP range does not overlap with Peer (500-599)",
+      "input": {
+        "check_overlap": true,
+        "range_a": [300, 363],
+        "range_b": [500, 599]
+      },
+      "expected": {
+        "overlaps": false
+      }
+    },
+    {
+      "id": "table_map_010",
+      "category": "routing_table_mapping",
+      "description": "DSCP 32 maps to table 332",
+      "input": {
+        "dscp_value": 32
+      },
+      "expected": {
+        "routing_table": 332
+      }
+    },
+    {
+      "id": "chain_001",
+      "category": "chain_activation",
+      "description": "Create chain with DSCP 5",
+      "input": {
+        "chain_tag": "us-chain",
+        "dscp_value": 5
+      },
+      "expected": {
+        "success": true,
+        "routing_table": 305,
+        "routing_mark": "0x305"
+      }
+    },
+    {
+      "id": "chain_002",
+      "category": "chain_activation",
+      "description": "Create multiple chains",
+      "input": {
+        "chains": [
+          {"tag": "us-west", "dscp": 1},
+          {"tag": "us-east", "dscp": 2},
+          {"tag": "eu-london", "dscp": 10}
+        ]
+      },
+      "expected": {
+        "success": true,
+        "chain_count": 3
+      }
+    },
+    {
+      "id": "chain_003",
+      "category": "chain_activation",
+      "description": "Reject duplicate DSCP",
+      "input": {
+        "chains": [
+          {"tag": "chain-a", "dscp": 1},
+          {"tag": "chain-b", "dscp": 1}
+        ]
+      },
+      "expected": {
+        "success": false,
+        "error": "DSCP value already in use"
+      }
+    },
+    {
+      "id": "chain_004",
+      "category": "chain_activation",
+      "description": "Maximum 63 chains",
+      "input": {
+        "operation": "fill_all_slots"
+      },
+      "expected": {
+        "max_chains": 63,
+        "dscp_range": [1, 63]
+      }
+    },
+    {
+      "id": "chain_005",
+      "category": "chain_activation",
+      "description": "Lookup chain by routing mark",
+      "input": {
+        "chain_tag": "test-chain",
+        "dscp_value": 20,
+        "operation": "lookup_by_mark"
+      },
+      "expected": {
+        "routing_mark": "0x314",
+        "found_tag": "test-chain"
+      }
+    },
+    {
+      "id": "chain_006",
+      "category": "chain_activation",
+      "description": "Get chain info by tag",
+      "input": {
+        "chain_tag": "my-chain",
+        "dscp_value": 15,
+        "operation": "get_info"
+      },
+      "expected": {
+        "dscp_value": 15,
+        "routing_table": 315,
+        "routing_mark": "0x30F"
+      }
+    },
+    {
+      "id": "chain_007",
+      "category": "chain_activation",
+      "description": "Chain with minimum DSCP",
+      "input": {
+        "chain_tag": "min-chain",
+        "dscp_value": 1
+      },
+      "expected": {
+        "success": true,
+        "routing_table": 301
+      }
+    },
+    {
+      "id": "chain_008",
+      "category": "chain_activation",
+      "description": "Chain with maximum DSCP",
+      "input": {
+        "chain_tag": "max-chain",
+        "dscp_value": 63
+      },
+      "expected": {
+        "success": true,
+        "routing_table": 363
+      }
+    },
+    {
+      "id": "terminal_001",
+      "category": "terminal_egress_validation",
+      "description": "V2Ray egress is SOCKS-based (rejected)",
+      "input": {
+        "egress_type": "v2ray",
+        "egress_tag": "v2ray-us"
+      },
+      "expected": {
+        "can_be_terminal": false,
+        "reason": "SOCKS-based egress strips DSCP headers"
+      }
+    },
+    {
+      "id": "terminal_002",
+      "category": "terminal_egress_validation",
+      "description": "WARP MASQUE is SOCKS-based (rejected)",
+      "input": {
+        "egress_type": "warp-masque",
+        "egress_tag": "warp-1"
+      },
+      "expected": {
+        "can_be_terminal": false,
+        "reason": "SOCKS-based egress strips DSCP headers"
+      }
+    },
+    {
+      "id": "terminal_003",
+      "category": "terminal_egress_validation",
+      "description": "Direct egress is allowed",
+      "input": {
+        "egress_type": "direct",
+        "egress_tag": "direct-out"
+      },
+      "expected": {
+        "can_be_terminal": true
+      }
+    },
+    {
+      "id": "terminal_004",
+      "category": "terminal_egress_validation",
+      "description": "PIA egress is allowed",
+      "input": {
+        "egress_type": "pia",
+        "egress_tag": "pia-us-east"
+      },
+      "expected": {
+        "can_be_terminal": true
+      }
+    },
+    {
+      "id": "terminal_005",
+      "category": "terminal_egress_validation",
+      "description": "Custom WireGuard egress is allowed",
+      "input": {
+        "egress_type": "custom",
+        "egress_tag": "custom-wg-1"
+      },
+      "expected": {
+        "can_be_terminal": true
+      }
+    },
+    {
+      "id": "terminal_006",
+      "category": "terminal_egress_validation",
+      "description": "WARP WireGuard egress is allowed",
+      "input": {
+        "egress_type": "warp-wireguard",
+        "egress_tag": "warp-wg-1"
+      },
+      "expected": {
+        "can_be_terminal": true
+      }
+    },
+    {
+      "id": "terminal_007",
+      "category": "terminal_egress_validation",
+      "description": "Peer tunnel egress is allowed",
+      "input": {
+        "egress_type": "peer",
+        "egress_tag": "peer-node-1"
+      },
+      "expected": {
+        "can_be_terminal": true
+      }
+    }
+  ]
+}

@@ -196,18 +196,26 @@ def parse_trojan_uri(uri: str) -> Dict[str, Any]:
 def parse_v2ray_uri(uri: str) -> Dict[str, Any]:
     """Auto-detect and parse V2Ray URI
 
-    Supports: vmess://, vless://, trojan://
+    Supports: vless:// only (VMess and Trojan removed in Xray-lite)
     """
     uri = uri.strip()
 
     if uri.startswith("vmess://"):
-        return parse_vmess_uri(uri)
+        # [REMOVED in Xray-lite] VMess 协议已从 Xray-lite 中移除
+        raise ValueError(
+            "VMess protocol is no longer supported in Xray-lite. "
+            "Please use VLESS protocol instead. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
     elif uri.startswith("vless://"):
         return parse_vless_uri(uri)
     elif uri.startswith("trojan://"):
-        return parse_trojan_uri(uri)
+        # [REMOVED in Xray-lite] Trojan 协议已从 Xray-lite 中移除
+        raise ValueError(
+            "Trojan protocol is no longer supported in Xray-lite. "
+            "Please use VLESS protocol instead. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
     else:
-        raise ValueError(f"Unsupported URI scheme. Expected vmess://, vless://, or trojan://")
+        raise ValueError(f"Unsupported URI scheme. Expected vless://")
 
 
 def generate_vmess_uri(config: Dict[str, Any]) -> str:
@@ -405,17 +413,28 @@ def generate_trojan_uri(config: Dict[str, Any]) -> str:
 
 
 def generate_v2ray_uri(config: Dict[str, Any]) -> str:
-    """Generate share URI based on protocol type"""
+    """Generate share URI based on protocol type
+
+    Supports: vless only (VMess and Trojan removed in Xray-lite)
+    """
     protocol = config.get("protocol", "")
 
     if protocol == "vmess":
-        return generate_vmess_uri(config)
+        # [REMOVED in Xray-lite] VMess 协议已从 Xray-lite 中移除
+        raise ValueError(
+            "VMess protocol is no longer supported in Xray-lite. "
+            "Please use VLESS protocol instead. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
     elif protocol == "vless":
         return generate_vless_uri(config)
     elif protocol == "trojan":
-        return generate_trojan_uri(config)
+        # [REMOVED in Xray-lite] Trojan 协议已从 Xray-lite 中移除
+        raise ValueError(
+            "Trojan protocol is no longer supported in Xray-lite. "
+            "Please use VLESS protocol instead. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
     else:
-        raise ValueError(f"Unsupported protocol: {protocol}")
+        raise ValueError(f"Unsupported protocol: {protocol}. Only 'vless' is supported.")
 
 
 # ============ Helper Functions ============

@@ -3,9 +3,11 @@
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 import sys
+from typing import Optional
 import yaml
 
 # SQLCipher 加密数据库支持
@@ -19,6 +21,69 @@ except ImportError:
 
 # 用户数据库结构
 USER_DB_SCHEMA = """
+-- ============ 多用户支持（必须最先创建，其他表引用 users.id） ============
+
+-- 用户表（多用户认证）
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,               -- 用户名
+    email TEXT,                                  -- 邮箱（可选）
+    password_hash TEXT NOT NULL,                 -- bcrypt 密码哈希
+    role TEXT NOT NULL CHECK(role IN ('admin', 'user', 'pending')) DEFAULT 'user',  -- 角色
+    enabled INTEGER DEFAULT 1,                   -- 是否启用
+    token_version INTEGER DEFAULT 1,             -- Token 版本（用于失效所有 Token）
+    failed_login_count INTEGER DEFAULT 0,        -- 连续登录失败次数
+    locked_until TIMESTAMP,                      -- 锁定截止时间
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TIMESTAMP,                     -- 最后登录时间
+    created_by INTEGER REFERENCES users(id)      -- 创建者 ID
+);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+CREATE INDEX IF NOT EXISTS idx_users_enabled ON users(enabled);
+
+-- Token 黑名单表（用于 Token 失效）
+CREATE TABLE IF NOT EXISTS token_blacklist (
+    jti TEXT PRIMARY KEY,                        -- JWT ID (唯一标识)
+    user_id INTEGER NOT NULL,                    -- 用户 ID
+    expires_at TIMESTAMP NOT NULL,               -- Token 过期时间
+    reason TEXT,                                 -- 失效原因
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_token_blacklist_expires ON token_blacklist(expires_at);
+
+-- 审计日志表（用户操作记录）
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,                             -- 操作用户 ID（可为空表示系统操作）
+    action TEXT NOT NULL,                        -- 操作类型（login, logout, create, update, delete 等）
+    resource_type TEXT,                          -- 资源类型（user, rule, egress 等）
+    resource_id TEXT,                            -- 资源 ID
+    details TEXT,                                -- JSON 格式详情
+    ip_address TEXT,                             -- 客户端 IP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action, created_at);
+
+-- 用户配额表（资源限制）
+CREATE TABLE IF NOT EXISTS user_quotas (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    max_peers INTEGER DEFAULT 10,                -- 最大 WireGuard 客户端数
+    max_rules INTEGER DEFAULT 100,               -- 最大路由规则数
+    max_rule_sets INTEGER DEFAULT 10             -- 最大规则集数
+);
+
+-- 数据库迁移记录表
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,                 -- 迁移版本号
+    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    description TEXT                             -- 迁移描述
+);
+
+-- ============ 路由规则 ============
+
 -- 路由规则表（用户自定义）
 CREATE TABLE IF NOT EXISTS routing_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,12 +93,37 @@ CREATE TABLE IF NOT EXISTS routing_rules (
     tag TEXT,                  -- 规则组标签/名称
     priority INTEGER DEFAULT 0,
     enabled INTEGER DEFAULT 1,
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,  -- [MU] 所有者用户ID
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_rule_enabled ON routing_rules(enabled, priority);
 CREATE INDEX IF NOT EXISTS idx_rule_outbound ON routing_rules(outbound);
 CREATE INDEX IF NOT EXISTS idx_rule_tag ON routing_rules(tag);
+-- Note: owner_id indexes are created by migrate_owner_id_columns() for existing DBs
+
+-- 规则集表（二进制规则文件元数据）
+-- 存储 IP/域名规则集的元数据，实际规则存储在 msgpack 文件中
+CREATE TABLE IF NOT EXISTS rule_sets (
+    id TEXT PRIMARY KEY,              -- 规则集 ID，如 'geoip-cn', 'custom-streaming'
+    name TEXT NOT NULL,               -- 人类可读名称
+    rule_type TEXT NOT NULL,          -- 'ip', 'domain', 'domain_suffix', 'domain_keyword'
+    outbound TEXT NOT NULL,           -- 出口标签
+    rule_count INTEGER DEFAULT 0,     -- 规则集中的规则数量
+    file_path TEXT,                   -- 二进制文件的相对路径
+    checksum TEXT,                    -- SHA256 校验和
+    status TEXT DEFAULT 'pending',    -- pending/loading/loaded/error
+    error_message TEXT,               -- 错误状态时的错误信息
+    enabled INTEGER DEFAULT 1,
+    priority INTEGER DEFAULT 0,
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,  -- [MU] 所有者用户ID
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_rule_sets_enabled ON rule_sets(enabled);
+CREATE INDEX IF NOT EXISTS idx_rule_sets_status ON rule_sets(status);
+CREATE INDEX IF NOT EXISTS idx_rule_sets_outbound ON rule_sets(outbound);
+-- Note: owner_id indexes are created by migrate_owner_id_columns() for existing DBs
 
 -- 出口配置表
 CREATE TABLE IF NOT EXISTS outbounds (
@@ -71,11 +161,13 @@ CREATE TABLE IF NOT EXISTS wireguard_peers (
     lan_subnet TEXT,                  -- 局域网子网 (如 192.168.1.0/24)
     default_outbound TEXT,            -- 此客户端的默认出口（NULL=使用入口默认或全局默认）
     enabled INTEGER DEFAULT 1,
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,  -- [MU] 所有者用户ID
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 -- [DB-001] 添加 enabled 索引以优化查询性能
 CREATE INDEX IF NOT EXISTS idx_wireguard_peers_enabled ON wireguard_peers(enabled);
+-- Note: owner_id indexes are created by migrate_owner_id_columns() for existing DBs
 
 -- PIA profiles 表
 CREATE TABLE IF NOT EXISTS pia_profiles (
@@ -109,11 +201,13 @@ CREATE TABLE IF NOT EXISTS custom_category_items (
     name TEXT NOT NULL,
     domains TEXT NOT NULL,  -- JSON 数组格式
     domain_count INTEGER DEFAULT 0,
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,  -- [MU] 所有者用户ID
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_category_items_category ON custom_category_items(category_id);
 CREATE INDEX IF NOT EXISTS idx_category_items_item_id ON custom_category_items(item_id);
+-- Note: owner_id indexes are created by migrate_owner_id_columns() for existing DBs
 
 -- 用户设置表
 CREATE TABLE IF NOT EXISTS settings (
@@ -261,23 +355,94 @@ CREATE INDEX IF NOT EXISTS idx_v2ray_egress_tag ON v2ray_egress(tag);
 CREATE INDEX IF NOT EXISTS idx_v2ray_egress_protocol ON v2ray_egress(protocol);
 CREATE INDEX IF NOT EXISTS idx_v2ray_egress_enabled ON v2ray_egress(enabled);
 
--- WARP 出口表（Cloudflare WARP via MASQUE 协议）
+-- Shadowsocks 出口表
+CREATE TABLE IF NOT EXISTS shadowsocks_egress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+
+    -- 服务器配置
+    server TEXT NOT NULL,
+    server_port INTEGER NOT NULL DEFAULT 8388,
+
+    -- 加密方式（支持 AEAD 2022 和传统 AEAD）
+    -- 2022-blake3-aes-256-gcm, 2022-blake3-aes-128-gcm, 2022-blake3-chacha20-poly1305
+    -- aes-256-gcm, aes-128-gcm, chacha20-ietf-poly1305
+    method TEXT NOT NULL DEFAULT 'aes-256-gcm',
+
+    -- 密码（对于 AEAD 2022 需要 Base64 格式的 32 字节密钥）
+    password TEXT NOT NULL,
+
+    -- UDP 支持
+    udp_enabled INTEGER DEFAULT 1,
+
+    -- 状态
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_shadowsocks_egress_tag ON shadowsocks_egress(tag);
+CREATE INDEX IF NOT EXISTS idx_shadowsocks_egress_enabled ON shadowsocks_egress(enabled);
+
+-- VLESS 出口表
+CREATE TABLE IF NOT EXISTS vless_egress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+
+    -- 服务器配置
+    server TEXT NOT NULL,
+    server_port INTEGER NOT NULL DEFAULT 443,
+
+    -- 认证
+    uuid TEXT NOT NULL,
+    flow TEXT,                                  -- xtls-rprx-vision 等
+
+    -- 传输层配置
+    transport TEXT NOT NULL DEFAULT 'tcp',      -- tcp, ws, grpc
+    ws_path TEXT,                               -- WebSocket 路径
+    ws_host TEXT,                               -- WebSocket Host 头
+
+    -- TLS 配置
+    tls_enabled INTEGER DEFAULT 1,
+    tls_server_name TEXT,                       -- SNI
+    tls_skip_verify INTEGER DEFAULT 0,
+
+    -- REALITY 配置（Xray 专有）
+    reality_enabled INTEGER DEFAULT 0,
+    reality_public_key TEXT,                    -- REALITY 服务器公钥
+    reality_short_id TEXT,                      -- REALITY Short ID
+
+    -- 状态
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_vless_egress_tag ON vless_egress(tag);
+CREATE INDEX IF NOT EXISTS idx_vless_egress_enabled ON vless_egress(enabled);
+
+-- WARP 出口表（Cloudflare WARP via WireGuard）
+-- Simplified schema - WireGuard only (MASQUE removed)
+-- Added WireGuard config fields for persistence
 CREATE TABLE IF NOT EXISTS warp_egress (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tag TEXT NOT NULL UNIQUE,                 -- 出口标识，如 "warp-main"
     description TEXT DEFAULT '',               -- 描述
 
-    -- 协议配置
-    protocol TEXT DEFAULT 'masque',            -- masque / wireguard
-    config_path TEXT,                          -- usque/wgcf config 路径
-    license_key TEXT,                          -- WARP+ license key（可选）
-    account_type TEXT DEFAULT 'free',          -- free / warp+ / teams
+    -- WireGuard 配置（必需字段）
+    private_key TEXT,                          -- WireGuard 私钥 (base64)
+    peer_public_key TEXT,                      -- WARP 服务器公钥 (base64)
+    endpoint TEXT,                             -- 默认 endpoint (如 engage.cloudflareclient.com:2408)
+    local_ip TEXT,                             -- 分配的 IPv4 地址 (如 172.16.0.2)
+    local_ipv6 TEXT,                           -- 分配的 IPv6 地址
 
-    -- 运行模式
-    mode TEXT DEFAULT 'socks',                 -- socks / tun
-    socks_port INTEGER UNIQUE,                 -- SOCKS5 端口（38001+）
+    -- 旧字段（保留兼容性）
+    config_path TEXT,                          -- 保留字段（未来可能使用）
+    license_key TEXT,                          -- Cloudflare auth token
+    account_type TEXT DEFAULT 'free',          -- free / unlimited
+    account_id TEXT,                           -- Cloudflare account ID (for management)
 
-    -- 自定义 Endpoint（指定地区）
+    -- 自定义 Endpoint（指定地区，覆盖默认 endpoint）
     endpoint_v4 TEXT,                          -- 自定义 IPv4 endpoint (如 162.159.193.10:2408)
     endpoint_v6 TEXT,                          -- 自定义 IPv6 endpoint
 
@@ -356,11 +521,40 @@ CREATE TABLE IF NOT EXISTS v2ray_users (
     flow TEXT,
 
     enabled INTEGER DEFAULT 1,
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,  -- [MU] 所有者用户ID
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_v2ray_users_uuid ON v2ray_users(uuid);
 CREATE INDEX IF NOT EXISTS idx_v2ray_users_enabled ON v2ray_users(enabled);
+-- Note: owner_id indexes are created by migrate_owner_id_columns() for existing DBs
+
+-- Shadowsocks 入口服务器配置表（单行，类似 v2ray_inbound_config）
+CREATE TABLE IF NOT EXISTS shadowsocks_inbound_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+
+    -- 监听配置
+    listen_address TEXT DEFAULT '0.0.0.0',
+    listen_port INTEGER NOT NULL DEFAULT 8388,
+
+    -- 加密方式（仅支持 AEAD 2022 推荐）
+    -- 2022-blake3-aes-256-gcm, 2022-blake3-aes-128-gcm, 2022-blake3-chacha20-poly1305
+    -- aes-256-gcm, aes-128-gcm, chacha20-ietf-poly1305
+    method TEXT NOT NULL DEFAULT '2022-blake3-aes-256-gcm',
+
+    -- 密码（对于 AEAD 2022 需要 Base64 格式）
+    password TEXT NOT NULL DEFAULT '',
+
+    -- UDP 中继
+    udp_enabled INTEGER DEFAULT 1,
+
+    -- 入口绑定出口
+    default_outbound TEXT,
+
+    enabled INTEGER DEFAULT 0,    -- 默认禁用
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 
 -- 远程规则集表（广告拦截等）
 CREATE TABLE IF NOT EXISTS remote_rule_sets (
@@ -377,11 +571,18 @@ CREATE TABLE IF NOT EXISTS remote_rule_sets (
     region TEXT,  -- cn, de, fr, kr, ru, etc.
     last_updated TIMESTAMP,
     domain_count INTEGER DEFAULT 0,
+    file_path TEXT,                -- 二进制文件相对路径 (msgpack)
+    checksum TEXT,                 -- SHA256 校验和
+    status TEXT DEFAULT 'pending', -- pending/downloading/loaded/error
+    error_message TEXT,            -- 错误信息
+    owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE,  -- [MU] 所有者用户ID
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_enabled ON remote_rule_sets(enabled);
 CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_category ON remote_rule_sets(category);
+-- Note: owner_id indexes are created by migrate_owner_id_columns() for existing DBs
+-- Note: idx_remote_rule_sets_status created by migration function for existing DBs
 
 -- 管理员认证表（单行）
 CREATE TABLE IF NOT EXISTS admin_auth (
@@ -409,6 +610,7 @@ CREATE TABLE IF NOT EXISTS outbound_groups (
     members TEXT NOT NULL,                 -- JSON 数组 ["us-stream", "jp-stream"]
     -- 负载均衡参数
     weights TEXT,                          -- JSON 对象 {"us-stream": 2, "jp-stream": 1}
+    algorithm TEXT DEFAULT 'five_tuple_hash',  -- ECMP 算法 (five_tuple_hash, dest_hash, round_robin, etc.)
     -- 健康检查参数
     health_check_url TEXT DEFAULT 'http://www.gstatic.com/generate_204',
     health_check_interval INTEGER DEFAULT 60,   -- 秒
@@ -493,8 +695,7 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
     -- outbound: 连接到对端的主隧道端点（默认）
     -- inbound: 连接到对端的入站监听器（需要 peer_inbound_enabled=1）
 
-    -- 双向连接状态 (Phase 11.1)
-    bidirectional_status TEXT DEFAULT 'pending' CHECK(bidirectional_status IN ('pending', 'outbound_only', 'bidirectional')),
+    -- 双向连接状态     bidirectional_status TEXT DEFAULT 'pending' CHECK(bidirectional_status IN ('pending', 'outbound_only', 'bidirectional')),
     -- pending: 等待双向连接
     -- outbound_only: 仅出站连接
     -- bidirectional: 双向连接已建立
@@ -517,8 +718,7 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
 CREATE INDEX IF NOT EXISTS idx_peer_nodes_tag ON peer_nodes(tag);
 CREATE INDEX IF NOT EXISTS idx_peer_nodes_enabled ON peer_nodes(enabled);
 CREATE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_status ON peer_nodes(tunnel_status);
--- 注: idx_peer_nodes_enabled_bidirectional 索引在迁移函数中创建（Phase 11.1）
--- 避免现有数据库缺少 bidirectional_status 列时出错
+-- 注: idx_peer_nodes_enabled_bidirectional 索引在迁移函数中创建-- 避免现有数据库缺少 bidirectional_status 列时出错
 -- 唯一索引防止资源分配竞态条件
 CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_local_ip ON peer_nodes(tunnel_local_ip) WHERE tunnel_local_ip IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_port ON peer_nodes(tunnel_port) WHERE tunnel_port IS NOT NULL;
@@ -571,6 +771,8 @@ CREATE TABLE IF NOT EXISTS node_chains (
     dscp_value INTEGER,                    -- DSCP 标记值 (1-63)，用于 WireGuard 链路流量识别
     chain_mark_type TEXT DEFAULT 'dscp' CHECK(chain_mark_type IN ('dscp', 'xray_email')),
     chain_state TEXT DEFAULT 'inactive' CHECK(chain_state IN ('inactive', 'activating', 'active', 'error')),
+    allow_transitive INTEGER DEFAULT 0,    -- 传递模式验证（只验证第一跳）
+    last_error TEXT,                       -- 最后错误信息
 
     -- 健康状态
     health_status TEXT DEFAULT 'unknown' CHECK(health_status IN ('unknown', 'healthy', 'degraded', 'unhealthy')),
@@ -631,13 +833,13 @@ CREATE TABLE IF NOT EXISTS chain_routing (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(chain_tag, mark_value, mark_type)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_routing_unique_mark ON chain_routing(mark_value, mark_type);
 CREATE INDEX IF NOT EXISTS idx_chain_routing_mark ON chain_routing(mark_value, mark_type);
 CREATE INDEX IF NOT EXISTS idx_chain_routing_chain_tag ON chain_routing(chain_tag);
 CREATE INDEX IF NOT EXISTS idx_chain_routing_egress ON chain_routing(egress_tag);
 CREATE INDEX IF NOT EXISTS idx_chain_routing_source_node ON chain_routing(source_node);
 
--- 终端出口缓存表 (Phase 11.1)
--- 入口节点缓存终端节点的出口列表，避免每次都通过隧道查询
+-- 终端出口缓存表 -- 入口节点缓存终端节点的出口列表，避免每次都通过隧道查询
 CREATE TABLE IF NOT EXISTS terminal_egress_cache (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chain_tag TEXT NOT NULL UNIQUE,          -- 链路标识（与 node_chains.tag 对应）
@@ -649,7 +851,7 @@ CREATE TABLE IF NOT EXISTS terminal_egress_cache (
 -- 注: chain_tag 上的 UNIQUE 约束已自动创建隐式索引，无需额外索引
 CREATE INDEX IF NOT EXISTS idx_terminal_egress_cache_expires ON terminal_egress_cache(expires_at);
 
--- ============ Phase 11-Cascade: 级联删除通知支持 ============
+-- ============ 级联删除通知支持 ============
 
 -- 对等节点事件审计日志
 -- 记录所有节点生命周期事件（删除、断开、广播等）
@@ -687,7 +889,7 @@ CREATE TABLE IF NOT EXISTS processed_peer_events (
     from_node TEXT NOT NULL,                     -- 事件来源节点
     action TEXT                                  -- 事件动作类型
 );
-CREATE INDEX IF NOT EXISTS idx_processed_peer_events_time ON processed_peer_events(processed_at)
+CREATE INDEX IF NOT EXISTS idx_processed_peer_events_time ON processed_peer_events(processed_at);
 """
 
 
@@ -712,6 +914,10 @@ def init_user_db(db_path: Path, encryption_key: str = None) -> sqlite3.Connectio
     # 应用 SQLCipher 加密密钥
     if encryption_key and HAS_SQLCIPHER:
         conn.execute(f"PRAGMA key = '{encryption_key}'")
+
+    # [MU-001] 启用外键约束 - SQLite 默认禁用外键，必须显式启用
+    # 这对于 ON DELETE CASCADE（如删除用户时级联删除其资源）至关重要
+    conn.execute("PRAGMA foreign_keys = ON")
 
     conn.executescript(USER_DB_SCHEMA)
     conn.commit()
@@ -874,11 +1080,84 @@ def migrate_warp_egress_protocol(conn: sqlite3.Connection):
     columns = {row[1] for row in cursor.fetchall()}
 
     if "protocol" not in columns:
-        cursor.execute("ALTER TABLE warp_egress ADD COLUMN protocol TEXT DEFAULT 'masque'")
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN protocol TEXT DEFAULT 'wireguard'")
         conn.commit()
         print("✓ 添加 warp_egress.protocol 字段")
     else:
         print("⊘ warp_egress.protocol 字段已存在，跳过迁移")
+
+    # 将所有 masque 协议更新为 wireguard（MASQUE 已弃用）
+    cursor.execute("UPDATE warp_egress SET protocol='wireguard' WHERE protocol='masque'")
+    if cursor.rowcount > 0:
+        conn.commit()
+        print(f"✓ 已将 {cursor.rowcount} 个 WARP 出口从 masque 更新为 wireguard")
+
+    # 添加 account_id 字段（用于 rust-router WARP 注册）
+    if "account_id" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN account_id TEXT")
+        conn.commit()
+        print("✓ 添加 warp_egress.account_id 字段（WARP Integration）")
+    else:
+        print("⊘ warp_egress.account_id 字段已存在，跳过迁移")
+
+    # 移除 MASQUE 专用字段（mode, socks_port）
+    # 这是一个破坏性迁移，需要重建表
+    # 只检查 mode/socks_port，不检查 protocol（避免重复迁移）
+    if "mode" in columns or "socks_port" in columns:
+        print(" 检测到旧表结构（包含 MASQUE 字段），开始迁移...")
+
+        # 禁用所有 MASQUE 条目
+        cursor.execute("SELECT COUNT(*) FROM warp_egress WHERE protocol='masque'")
+        masque_count = cursor.fetchone()[0]
+        if masque_count > 0:
+            print(f"⚠ 发现 {masque_count} 个 MASQUE 条目（已弃用）")
+            print("  这些条目将被禁用。请使用 WireGuard 重新注册。")
+            cursor.execute("UPDATE warp_egress SET enabled=0 WHERE protocol='masque'")
+            conn.commit()
+
+        # 创建新表（WireGuard-only schema）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS warp_egress_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag TEXT NOT NULL UNIQUE,
+                description TEXT DEFAULT '',
+                config_path TEXT,
+                license_key TEXT,
+                account_type TEXT DEFAULT 'free',
+                account_id TEXT,
+                endpoint_v4 TEXT,
+                endpoint_v6 TEXT,
+                enabled INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 复制数据（只复制启用的 WireGuard 条目）
+        cursor.execute("""
+            INSERT INTO warp_egress_new
+            (tag, description, config_path, license_key, account_type, account_id,
+             endpoint_v4, endpoint_v6, enabled, created_at, updated_at)
+            SELECT tag, description, config_path, license_key, account_type, account_id,
+                   endpoint_v4, endpoint_v6, enabled, created_at, updated_at
+            FROM warp_egress
+            WHERE protocol != 'masque' OR protocol IS NULL
+        """)
+
+        # 删除旧表
+        cursor.execute("DROP TABLE warp_egress")
+
+        # 重命名新表
+        cursor.execute("ALTER TABLE warp_egress_new RENAME TO warp_egress")
+
+        # 重建索引
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_warp_egress_tag ON warp_egress(tag)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_warp_egress_enabled ON warp_egress(enabled)")
+
+        conn.commit()
+        print("✓ 迁移完成：移除 MASQUE 字段，表结构已简化")
+    else:
+        print("⊘ warp_egress 表已是简化结构，跳过迁移")
 
 
 def migrate_outbound_groups(conn: sqlite3.Connection):
@@ -888,7 +1167,17 @@ def migrate_outbound_groups(conn: sqlite3.Connection):
     # 检查 outbound_groups 表是否存在
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbound_groups'")
     if cursor.fetchone():
-        print("⊘ outbound_groups 表已存在，跳过迁移")
+        # 表已存在，检查是否需要添加 algorithm 列
+        cursor.execute("PRAGMA table_info(outbound_groups)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "algorithm" not in columns:
+            cursor.execute("""
+                ALTER TABLE outbound_groups ADD COLUMN algorithm TEXT DEFAULT 'five_tuple_hash'
+            """)
+            conn.commit()
+            print("✓ 为 outbound_groups 表添加 algorithm 列")
+        else:
+            print("⊘ outbound_groups 表已存在，跳过迁移")
         return
 
     # 创建表
@@ -900,6 +1189,7 @@ def migrate_outbound_groups(conn: sqlite3.Connection):
             type TEXT NOT NULL CHECK(type IN ('loadbalance', 'failover')),
             members TEXT NOT NULL,
             weights TEXT,
+            algorithm TEXT DEFAULT 'five_tuple_hash',
             health_check_url TEXT DEFAULT 'http://www.gstatic.com/generate_204',
             health_check_interval INTEGER DEFAULT 60,
             health_check_timeout INTEGER DEFAULT 5,
@@ -1108,6 +1398,10 @@ def migrate_peer_nodes_tables(conn: sqlite3.Connection):
         if "disconnected_node" not in columns:
             cursor.execute("ALTER TABLE node_chains ADD COLUMN disconnected_node TEXT")
             print("✓ 添加 node_chains.disconnected_node 列")
+        # last_error 列
+        if "last_error" not in columns:
+            cursor.execute("ALTER TABLE node_chains ADD COLUMN last_error TEXT")
+            print("✓ 添加 node_chains.last_error 列")
         if "downstream_status" in columns and "disconnected_node" in columns:
             print("⊘ node_chains 表已存在，跳过")
 
@@ -1408,6 +1702,8 @@ def migrate_node_chains_chain_fields(conn: sqlite3.Connection):
         ("dscp_value", "INTEGER"),
         ("chain_mark_type", "TEXT DEFAULT 'dscp'"),
         ("chain_state", "TEXT DEFAULT 'inactive'"),
+        ("allow_transitive", "INTEGER DEFAULT 0"),  # 传递模式验证
+        ("last_error", "TEXT"),  # 错误原因记录
     ]
 
     for field_name, field_type in chain_fields:
@@ -1469,35 +1765,49 @@ def migrate_chain_routing_table(conn: sqlite3.Connection):
 
     # 检查 chain_routing 表是否存在
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chain_routing'")
-    if cursor.fetchone():
-        print("⊘ chain_routing 表已存在，跳过迁移")
-        return
+    table_exists = cursor.fetchone() is not None
+    if table_exists:
+        print("⊘ chain_routing 表已存在，跳过创建")
 
     # 创建表
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS chain_routing (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chain_tag TEXT NOT NULL,
-            mark_value INTEGER NOT NULL,
-            mark_type TEXT NOT NULL DEFAULT 'dscp' CHECK(mark_type IN ('dscp', 'xray_email')),
-            egress_tag TEXT NOT NULL,
-            source_node TEXT,
-            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(chain_tag, mark_value, mark_type)
+    if not table_exists:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chain_routing (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chain_tag TEXT NOT NULL,
+                mark_value INTEGER NOT NULL,
+                mark_type TEXT NOT NULL DEFAULT 'dscp' CHECK(mark_type IN ('dscp', 'xray_email')),
+                egress_tag TEXT NOT NULL,
+                source_node TEXT,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chain_tag, mark_value, mark_type)
+            )
+        """)
+
+    try:
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_routing_unique_mark ON chain_routing(mark_value, mark_type)"
         )
-    """)
+        print("✓ 创建 chain_routing 唯一索引 (mark_value, mark_type)")
+    except sqlite3.IntegrityError as e:
+        raise RuntimeError(
+            "Duplicate chain_routing marks detected; clean up duplicates before migration"
+        ) from e
+
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_mark ON chain_routing(mark_value, mark_type)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_chain_tag ON chain_routing(chain_tag)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_egress ON chain_routing(egress_tag)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_source_node ON chain_routing(source_node)")
     conn.commit()
-    print("✓ 创建 chain_routing 表")
+    if table_exists:
+        print("✓ 更新 chain_routing 索引")
+    else:
+        print("✓ 创建 chain_routing 表")
 
 
 def migrate_peer_nodes_bidirectional_fields(conn: sqlite3.Connection):
-    """为 peer_nodes 表添加双向连接字段 (Phase 11.1)
-
+    """为 peer_nodes 表添加双向连接字段 
     支持离线配对后自动双向连接:
     - bidirectional_status: 双向连接状态 (pending/outbound_only/bidirectional)
     - remote_wg_private_key: 为远程节点预生成的 WireGuard 私钥
@@ -1551,8 +1861,7 @@ def migrate_peer_nodes_bidirectional_fields(conn: sqlite3.Connection):
 
 
 def migrate_terminal_egress_cache_table(conn: sqlite3.Connection):
-    """为现有数据库添加 terminal_egress_cache 表 (Phase 11.1)
-
+    """为现有数据库添加 terminal_egress_cache 表 
     用于缓存终端节点的出口列表，避免每次都通过隧道查询远程 API
     - 缓存命中时直接返回本地数据
     - 缓存过期（默认 5 分钟）后重新获取
@@ -1624,7 +1933,7 @@ def migrate_pending_pairings_table(conn: sqlite3.Connection):
 
 
 def migrate_cascade_delete_tables(conn: sqlite3.Connection):
-    """Phase 11-Cascade: 添加级联删除通知支持表
+    """ 添加级联删除通知支持表
 
     添加三个表:
     - peer_event_log: 审计日志，记录节点生命周期事件
@@ -1691,6 +2000,520 @@ def migrate_cascade_delete_tables(conn: sqlite3.Connection):
         conn.commit()
     else:
         print("⊘ 级联删除通知表已存在，跳过迁移")
+
+
+def migrate_warp_egress_wireguard_fields(conn: sqlite3.Connection):
+    """ 添加 WireGuard 配置字段到 warp_egress 表
+
+    修复 WARP 出口在容器重启后消失的问题。
+    之前 WireGuard 配置只传给 rust-router，没有持久化到数据库。
+    """
+    cursor = conn.cursor()
+    fields_added = 0
+
+    # 检查表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='warp_egress'")
+    if not cursor.fetchone():
+        print("⊘ warp_egress 表不存在，跳过迁移")
+        return
+
+    # 检查并添加 private_key 字段
+    cursor.execute("PRAGMA table_info(warp_egress)")
+    columns = {col[1] for col in cursor.fetchall()}
+
+    if "private_key" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN private_key TEXT")
+        fields_added += 1
+        print("✓ 添加 warp_egress.private_key 字段")
+
+    if "peer_public_key" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN peer_public_key TEXT")
+        fields_added += 1
+        print("✓ 添加 warp_egress.peer_public_key 字段")
+
+    if "endpoint" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN endpoint TEXT")
+        fields_added += 1
+        print("✓ 添加 warp_egress.endpoint 字段")
+
+    if "local_ip" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN local_ip TEXT")
+        fields_added += 1
+        print("✓ 添加 warp_egress.local_ip 字段")
+
+    if "local_ipv6" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN local_ipv6 TEXT")
+        fields_added += 1
+        print("✓ 添加 warp_egress.local_ipv6 字段")
+
+    if fields_added > 0:
+        conn.commit()
+        print(f"✓  添加了 {fields_added} 个 WireGuard 配置字段")
+    else:
+        print("⊘ warp_egress WireGuard 字段已存在，跳过迁移")
+
+
+def migrate_remote_rule_sets_binary_fields(conn: sqlite3.Connection):
+    """为 remote_rule_sets 表添加二进制存储字段
+
+    用于将广告拦截规则迁移到 msgpack 二进制格式：
+    - file_path: 二进制文件相对路径
+    - checksum: SHA256 校验和
+    - status: 状态 (pending/downloading/loaded/error)
+    - error_message: 错误信息
+    """
+    cursor = conn.cursor()
+
+    # 检查 remote_rule_sets 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='remote_rule_sets'")
+    if not cursor.fetchone():
+        print("⊘ remote_rule_sets 表不存在，跳过迁移")
+        return
+
+    cursor.execute("PRAGMA table_info(remote_rule_sets)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    fields_added = 0
+
+    if "file_path" not in columns:
+        cursor.execute("ALTER TABLE remote_rule_sets ADD COLUMN file_path TEXT")
+        fields_added += 1
+        print("✓ 添加 remote_rule_sets.file_path 字段")
+
+    if "checksum" not in columns:
+        cursor.execute("ALTER TABLE remote_rule_sets ADD COLUMN checksum TEXT")
+        fields_added += 1
+        print("✓ 添加 remote_rule_sets.checksum 字段")
+
+    if "status" not in columns:
+        cursor.execute("ALTER TABLE remote_rule_sets ADD COLUMN status TEXT DEFAULT 'pending'")
+        fields_added += 1
+        print("✓ 添加 remote_rule_sets.status 字段")
+
+    if "error_message" not in columns:
+        cursor.execute("ALTER TABLE remote_rule_sets ADD COLUMN error_message TEXT")
+        fields_added += 1
+        print("✓ 添加 remote_rule_sets.error_message 字段")
+
+    # 始终尝试创建状态索引（如果 status 列存在）
+    if "status" in columns or fields_added > 0:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_status ON remote_rule_sets(status)")
+
+    if fields_added > 0:
+        conn.commit()
+        print(f"✓ 添加了 {fields_added} 个二进制存储字段")
+    else:
+        print("⊘ remote_rule_sets 二进制字段已存在，跳过迁移")
+
+
+def backup_database_before_migration(db_path: Path, migration_name: str) -> Optional[Path]:
+    """
+    在执行迁移前备份数据库
+
+    Args:
+        db_path: 数据库文件路径
+        migration_name: 迁移名称（用于备份文件名）
+
+    Returns:
+        备份文件路径，如果备份已存在则返回 None
+    """
+    backup_suffix = f".backup-{migration_name}"
+    backup_path = db_path.with_suffix(db_path.suffix + backup_suffix)
+
+    # 如果备份已存在，说明之前已经备份过，跳过
+    if backup_path.exists():
+        print(f"[Migration] 备份已存在: {backup_path}")
+        return None
+
+    # 只在源数据库存在时才备份
+    if not db_path.exists():
+        return None
+
+    try:
+        shutil.copy2(db_path, backup_path)
+        print(f"[Migration] 已创建数据库备份: {backup_path}")
+        return backup_path
+    except Exception as e:
+        print(f"[Migration] 备份失败: {e}")
+        raise
+
+
+def migrate_multiuser_tables(conn: sqlite3.Connection):
+    """迁移到多用户支持（迁移版本 100）
+
+    添加以下表:
+    - users: 用户表（多用户认证）
+    - token_blacklist: Token 黑名单表
+    - audit_log: 审计日志表
+    - user_quotas: 用户配额表
+    - schema_migrations: 迁移记录表
+
+    从 admin_auth 表迁移现有管理员数据到 users 表
+    """
+    cursor = conn.cursor()
+    MIGRATION_VERSION = 100
+
+    # 获取数据库路径用于备份
+    db_info = conn.execute("PRAGMA database_list").fetchone()
+    if db_info and db_info[2]:
+        db_path = Path(db_info[2])
+        # 在执行任何迁移前备份数据库
+        backup_database_before_migration(db_path, "pre-multiuser")
+
+    # 1. 确保 schema_migrations 表存在
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            description TEXT
+        )
+    """)
+
+    # 2. 检查是否已应用此迁移
+    cursor.execute("SELECT version FROM schema_migrations WHERE version = ?", (MIGRATION_VERSION,))
+    if cursor.fetchone():
+        print("⊘ 多用户迁移（版本 100）已应用，跳过")
+        return
+
+    print("开始多用户迁移（版本 100）...")
+    tables_created = 0
+
+    # 开始迁移事务（使用 SAVEPOINT 以便安全回滚）
+    conn.execute("SAVEPOINT multiuser_migration")
+    try:
+        # 3. 创建 users 表
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+        if not cursor.fetchone():
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE,
+                    email TEXT,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('admin', 'user', 'pending')) DEFAULT 'user',
+                    enabled INTEGER DEFAULT 1,
+                    token_version INTEGER DEFAULT 1,
+                    failed_login_count INTEGER DEFAULT 0,
+                    locked_until TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_login_at TIMESTAMP,
+                    created_by INTEGER REFERENCES users(id)
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_enabled ON users(enabled)")
+            tables_created += 1
+            print("✓ 创建 users 表")
+
+        # 4. 创建 token_blacklist 表
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='token_blacklist'")
+        if not cursor.fetchone():
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS token_blacklist (
+                    jti TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    expires_at TIMESTAMP NOT NULL,
+                    reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_token_blacklist_expires ON token_blacklist(expires_at)")
+            tables_created += 1
+            print("✓ 创建 token_blacklist 表")
+
+        # 5. 创建 audit_log 表
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_log'")
+        if not cursor.fetchone():
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    action TEXT NOT NULL,
+                    resource_type TEXT,
+                    resource_id TEXT,
+                    details TEXT,
+                    ip_address TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id, created_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action, created_at)")
+            tables_created += 1
+            print("✓ 创建 audit_log 表")
+
+        # 6. 创建 user_quotas 表
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_quotas'")
+        if not cursor.fetchone():
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_quotas (
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    max_peers INTEGER DEFAULT 10,
+                    max_rules INTEGER DEFAULT 100,
+                    max_rule_sets INTEGER DEFAULT 10
+                )
+            """)
+            tables_created += 1
+            print("✓ 创建 user_quotas 表")
+
+        # 7. 从 admin_auth 表迁移数据到 users 表
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='admin_auth'")
+        if cursor.fetchone():
+            # 检查 admin_auth 是否有数据
+            cursor.execute("SELECT password_hash, created_at, updated_at FROM admin_auth WHERE id = 1")
+            admin_row = cursor.fetchone()
+            if admin_row:
+                # 检查 users 表中是否已有 admin 用户
+                cursor.execute("SELECT id FROM users WHERE username = 'admin'")
+                if not cursor.fetchone():
+                    password_hash, created_at, updated_at = admin_row
+                    cursor.execute("""
+                        INSERT INTO users (username, password_hash, role, enabled, token_version, created_at, updated_at)
+                        VALUES ('admin', ?, 'admin', 1, 1, ?, ?)
+                    """, (password_hash, created_at, updated_at))
+                    print("✓ 从 admin_auth 迁移管理员数据到 users 表")
+                else:
+                    print("⊘ users 表中已存在 admin 用户，跳过数据迁移")
+            else:
+                print("⊘ admin_auth 表中无数据，跳过数据迁移")
+        else:
+            print("⊘ admin_auth 表不存在，跳过数据迁移")
+
+        # 8. 记录迁移版本
+        cursor.execute("""
+            INSERT INTO schema_migrations (version, description)
+            VALUES (?, '多用户支持：添加 users, token_blacklist, audit_log, user_quotas 表')
+        """, (MIGRATION_VERSION,))
+
+        # 释放 SAVEPOINT（提交迁移）
+        conn.execute("RELEASE multiuser_migration")
+        conn.commit()
+        print(f"✓ 多用户迁移完成（创建 {tables_created} 个表）")
+
+    except Exception as e:
+        # 回滚到 SAVEPOINT
+        conn.execute("ROLLBACK TO multiuser_migration")
+        print(f"[Migration] 迁移失败，已回滚: {e}")
+        raise
+
+
+def migrate_owner_id_columns(conn: sqlite3.Connection):
+    """为用户所属资源表添加 owner_id 列（迁移版本 101）
+
+    添加 owner_id 列到以下表:
+    - routing_rules: 路由规则表
+    - rule_sets: 规则集表
+    - wireguard_peers: WireGuard 对等点表
+    - v2ray_users: V2Ray 用户表
+    - custom_category_items: 自定义分类项目表
+    - remote_rule_sets: 远程规则集表
+
+    现有数据默认属于管理员用户（id=1）
+    """
+    cursor = conn.cursor()
+    MIGRATION_VERSION = 101
+
+    # 1. 确保 schema_migrations 表存在
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            description TEXT
+        )
+    """)
+
+    # 2. 检查是否已应用此迁移
+    cursor.execute("SELECT version FROM schema_migrations WHERE version = ?", (MIGRATION_VERSION,))
+    if cursor.fetchone():
+        print("⊘ owner_id 列迁移（版本 101）已应用，跳过")
+        return
+
+    print("开始 owner_id 列迁移（版本 101）...")
+    columns_added = 0
+    indexes_added = 0
+
+    # 需要添加 owner_id 的表列表
+    # 格式: (表名, 是否需要复合索引 owner_id + enabled)
+    tables_to_migrate = [
+        ("routing_rules", True),      # 路由规则需要按 owner + enabled 查询
+        ("rule_sets", True),          # 规则集需要按 owner + enabled 查询
+        ("wireguard_peers", True),    # WireGuard 对等点需要按 owner + enabled 查询
+        ("v2ray_users", True),        # V2Ray 用户需要按 owner + enabled 查询
+        ("custom_category_items", False),  # 自定义分类项目
+        ("remote_rule_sets", False),  # 远程规则集
+    ]
+
+    for table_name, needs_composite_index in tables_to_migrate:
+        # 检查表是否存在
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,)
+        )
+        if not cursor.fetchone():
+            print(f"⊘ {table_name} 表不存在，跳过")
+            continue
+
+        # 检查 owner_id 列是否已存在
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        if "owner_id" not in columns:
+            # 添加 owner_id 列，默认值为 1（管理员用户）
+            # 注意: SQLite ALTER TABLE 不支持 REFERENCES + DEFAULT，且 ALTER TABLE 的 FK 约束被忽略
+            # FK 约束仅在 CREATE TABLE 时生效，现有数据通过 DEFAULT 1 归属管理员
+            cursor.execute(f"""
+                ALTER TABLE {table_name}
+                ADD COLUMN owner_id INTEGER DEFAULT 1
+            """)
+            columns_added += 1
+            print(f"✓ 添加 {table_name}.owner_id 列")
+
+            # 更新现有数据的 owner_id 为 1（管理员）
+            # SQLite 的 ALTER TABLE ADD COLUMN ... DEFAULT 不会更新现有行
+            cursor.execute(f"UPDATE {table_name} SET owner_id = 1 WHERE owner_id IS NULL")
+            if cursor.rowcount > 0:
+                print(f"  → 更新 {cursor.rowcount} 条现有记录的 owner_id 为 1")
+
+            # 添加基础索引
+            cursor.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{table_name}_owner
+                ON {table_name}(owner_id)
+            """)
+            indexes_added += 1
+
+            # 为 routing_rules 和 rule_sets 添加复合索引 (owner_id, enabled)
+            if needs_composite_index:
+                cursor.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{table_name}_owner_enabled
+                    ON {table_name}(owner_id, enabled)
+                """)
+                indexes_added += 1
+                print(f"✓ 添加 {table_name}(owner_id, enabled) 复合索引")
+        else:
+            print(f"⊘ {table_name}.owner_id 列已存在，跳过")
+
+    # 3. 记录迁移版本
+    cursor.execute("""
+        INSERT INTO schema_migrations (version, description)
+        VALUES (?, 'owner_id 列: 为 routing_rules, rule_sets, wireguard_peers, v2ray_users, custom_category_items, remote_rule_sets 表添加用户所有权')
+    """, (MIGRATION_VERSION,))
+
+    conn.commit()
+    print(f"✓ owner_id 列迁移完成（添加 {columns_added} 列，{indexes_added} 个索引）")
+
+
+def migrate_users_rules_ignored(conn: sqlite3.Connection):
+    """为 users 表添加 rules_ignored 列（迁移版本 102）
+
+    添加功能：
+    - users.rules_ignored: 每用户规则忽略开关
+    - settings.ignore_all_user_rules: 全局规则忽略开关
+
+    当开关启用时，用户创建的规则不会同步到 rust-router，
+    只有管理员的规则会生效。
+    """
+    cursor = conn.cursor()
+    MIGRATION_VERSION = 102
+
+    # 1. 确保 schema_migrations 表存在
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            description TEXT
+        )
+    """)
+
+    # 2. 检查是否已应用此迁移
+    cursor.execute("SELECT version FROM schema_migrations WHERE version = ?", (MIGRATION_VERSION,))
+    if cursor.fetchone():
+        print("⊘ rules_ignored 迁移（版本 102）已应用，跳过")
+        return
+
+    print("开始 rules_ignored 迁移（版本 102）...")
+
+    # 3. 检查 users 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+    if not cursor.fetchone():
+        print("⊘ users 表不存在，跳过迁移")
+        return
+
+    # 4. 检查 rules_ignored 列是否已存在
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [row[1] for row in cursor.fetchall()]
+
+    if "rules_ignored" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN rules_ignored INTEGER DEFAULT 0")
+        print("✓ 添加 users.rules_ignored 列")
+    else:
+        print("⊘ users.rules_ignored 列已存在")
+
+    # 5. 添加全局忽略设置（如果不存在）
+    cursor.execute("SELECT value FROM settings WHERE key = 'ignore_all_user_rules'")
+    if not cursor.fetchone():
+        cursor.execute("""
+            INSERT INTO settings (key, value) VALUES ('ignore_all_user_rules', 'false')
+        """)
+        print("✓ 添加 ignore_all_user_rules 设置")
+    else:
+        print("⊘ ignore_all_user_rules 设置已存在")
+
+    # 6. 记录迁移版本
+    cursor.execute("""
+        INSERT INTO schema_migrations (version, description)
+        VALUES (?, '添加 users.rules_ignored 列和 ignore_all_user_rules 设置')
+    """, (MIGRATION_VERSION,))
+
+    conn.commit()
+    print("✓ rules_ignored 迁移完成")
+
+
+def repair_null_owner_ids(conn):
+    """修复 owner_id 为 NULL 的记录
+
+    早期版本的迁移没有更新现有记录的 owner_id，导致 NULL 值。
+    此函数将所有 NULL 的 owner_id 设置为 1（管理员用户）。
+    """
+    cursor = conn.cursor()
+
+    # 需要检查的表列表
+    tables_with_owner_id = [
+        "routing_rules",
+        "rule_sets",
+        "wireguard_peers",
+        "v2ray_users",
+        "custom_category_items",
+        "remote_rule_sets"
+    ]
+
+    total_fixed = 0
+    for table_name in tables_with_owner_id:
+        try:
+            # 检查表是否存在
+            cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+            if not cursor.fetchone():
+                continue
+
+            # 检查是否有 owner_id 列
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "owner_id" not in columns:
+                continue
+
+            # 更新 NULL 值为 1
+            cursor.execute(f"UPDATE {table_name} SET owner_id = 1 WHERE owner_id IS NULL")
+            if cursor.rowcount > 0:
+                print(f"  → 修复 {table_name} 中 {cursor.rowcount} 条记录的 owner_id")
+                total_fixed += cursor.rowcount
+        except Exception as e:
+            print(f"  ⚠ 修复 {table_name} 时出错: {e}")
+
+    if total_fixed > 0:
+        conn.commit()
+        print(f"✓ 共修复 {total_fixed} 条记录的 owner_id")
+    else:
+        print("⊘ 无需修复 owner_id（无 NULL 值）")
 
 
 def generate_wireguard_private_key() -> str:
@@ -1925,15 +2748,33 @@ def main():
     migrate_node_chains_chain_fields(conn)
     migrate_chain_routing_table(conn)
 
-    # Phase 11.1: 双向连接和终端出口缓存
+    # 双向连接和终端出口缓存
     migrate_peer_nodes_bidirectional_fields(conn)
     migrate_terminal_egress_cache_table(conn)
 
-    # Phase 11-Tunnel: 待处理配对表（用于隧道优先的配对流程）
+    # 待处理配对表（用于隧道优先的配对流程）
     migrate_pending_pairings_table(conn)
 
-    # Phase 11-Cascade: 级联删除通知支持表
+    # 级联删除通知支持表
     migrate_cascade_delete_tables(conn)
+
+    # WARP WireGuard 配置持久化
+    migrate_warp_egress_wireguard_fields(conn)
+
+    # 广告拦截规则二进制存储
+    migrate_remote_rule_sets_binary_fields(conn)
+
+    # 多用户支持迁移
+    migrate_multiuser_tables(conn)
+
+    # 用户所属资源 owner_id 列迁移
+    migrate_owner_id_columns(conn)
+
+    # 用户规则忽略开关迁移
+    migrate_users_rules_ignored(conn)
+
+    # 修复 owner_id 为 NULL 的记录（迁移可能在 UPDATE 语句添加前运行过）
+    repair_null_owner_ids(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)
