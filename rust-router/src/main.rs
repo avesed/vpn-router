@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use tokio::signal;
-use tracing::{debug, error, info, warn, Level};
+use tracing::{debug, error, info, trace, warn, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
@@ -541,13 +541,13 @@ async fn main() -> Result<()> {
     debug!("Created VlessReplyRegistry for VLESS-WG bridge reply routing");
 
     // Create sharded bridge reply registry for routing WG replies to ShardedVlessWgBridge instances
-    #[cfg(feature = "sharded-vless-wg-bridge")]
+    #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
     let sharded_bridge_reply_registry =
         Arc::new(rust_router::vless_wg_bridge::ShardedBridgeReplyRegistry::new());
-    #[cfg(feature = "sharded-vless-wg-bridge")]
+    #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
     debug!("Created ShardedBridgeReplyRegistry for sharded bridge reply routing");
 
-    #[cfg(feature = "sharded-vless-wg-bridge")]
+    #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
     let ingress_subnet: ipnet::Ipv4Net = userspace_wg_config
         .wg_subnet
         .parse()
@@ -556,7 +556,7 @@ async fn main() -> Result<()> {
                   userspace_wg_config.wg_subnet, e);
             "10.25.0.0/24".parse().unwrap()
         });
-    #[cfg(feature = "sharded-vless-wg-bridge")]
+    #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
     info!(ingress_subnet = %ingress_subnet, "Reply routing: using ingress subnet filter");
 
     let wg_reply_handler = Arc::new(WgReplyHandler::new({
@@ -565,13 +565,13 @@ async fn main() -> Result<()> {
         let reply_stats = Arc::clone(&reply_stats);
         let peer_tunnel_stats = Arc::clone(&peer_tunnel_stats);
         let vless_registry = Arc::clone(&vless_reply_registry);
-        #[cfg(feature = "sharded-vless-wg-bridge")]
+        #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
         let sharded_registry = Arc::clone(&sharded_bridge_reply_registry);
         move |packet, tunnel_tag: String| {
             // First, try to route to sharded bridges (feature-gated)
             // Skip for packets destined to WG ingress subnet — these are direct
             // forwarding replies (post-DNAT) that must reach reply_router.
-            #[cfg(feature = "sharded-vless-wg-bridge")]
+            #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
             {
                 let is_wg_client_reply = if packet.len() >= 20 && (packet[0] >> 4) == 4 {
                     let dst = std::net::Ipv4Addr::new(
@@ -857,7 +857,7 @@ async fn main() -> Result<()> {
 
     // Set sharded bridge reply registry (feature-gated)
     // Must be done after Arc wrapping since set_sharded_bridge_reply_registry takes &self
-    #[cfg(feature = "sharded-vless-wg-bridge")]
+    #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
     {
         ipc_handler.set_sharded_bridge_reply_registry(Arc::clone(&sharded_bridge_reply_registry));
         debug!("Set ShardedBridgeReplyRegistry on IpcHandler");

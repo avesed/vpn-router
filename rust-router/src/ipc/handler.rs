@@ -253,8 +253,10 @@ pub struct IpcHandler {
     sharded_bridge_reply_txs: RwLock<std::collections::HashMap<String, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
 
     /// Shared registry for WgReplyHandler to route packets to sharded bridges
-    /// This is set after handler creation via set_sharded_bridge_reply_registry()
-    #[cfg(feature = "sharded-vless-wg-bridge")]
+    /// This is set after handler creation via set_sharded_bridge_reply_registry().
+    /// Also used by the netbridge egress path (use-netbridge-egress) to route WG
+    /// tunnel replies back into per-tunnel smoltcp egress adapters.
+    #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
     sharded_bridge_reply_registry: RwLock<Option<Arc<crate::vless_wg_bridge::ShardedBridgeReplyRegistry>>>,
 
     /// Legacy single sharded bridge (for backward compatibility)
@@ -267,7 +269,7 @@ pub struct IpcHandler {
     /// Netbridge adapters per WG tunnel (tag -> adapter)
     /// Each WG tunnel gets its own NetbridgeVlessAdapter for the new unified bridge
     #[cfg(feature = "use-netbridge-egress")]
-    netbridge_adapters: RwLock<std::collections::HashMap<String, Arc<crate::netbridge::NetbridgeVlessAdapter>>>,
+    netbridge_adapters: Arc<RwLock<std::collections::HashMap<String, Arc<crate::netbridge::NetbridgeVlessAdapter>>>>,
 
     /// Netbridge egress handles per tunnel (for joining tasks on shutdown)
     #[cfg(feature = "use-netbridge-egress")]
@@ -341,13 +343,13 @@ impl IpcHandler {
             sharded_bridges: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             sharded_bridge_reply_txs: RwLock::new(std::collections::HashMap::new()),
-            #[cfg(feature = "sharded-vless-wg-bridge")]
+            #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
             sharded_bridge_reply_registry: RwLock::new(None),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             sharded_bridge: RwLock::new(None),
 
             #[cfg(feature = "use-netbridge-egress")]
-            netbridge_adapters: RwLock::new(std::collections::HashMap::new()),
+            netbridge_adapters: Arc::new(RwLock::new(std::collections::HashMap::new())),
             #[cfg(feature = "use-netbridge-egress")]
             netbridge_handles: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "shadowsocks")]
@@ -410,13 +412,13 @@ impl IpcHandler {
             sharded_bridges: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             sharded_bridge_reply_txs: RwLock::new(std::collections::HashMap::new()),
-            #[cfg(feature = "sharded-vless-wg-bridge")]
+            #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
             sharded_bridge_reply_registry: RwLock::new(None),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             sharded_bridge: RwLock::new(None),
 
             #[cfg(feature = "use-netbridge-egress")]
-            netbridge_adapters: RwLock::new(std::collections::HashMap::new()),
+            netbridge_adapters: Arc::new(RwLock::new(std::collections::HashMap::new())),
             #[cfg(feature = "use-netbridge-egress")]
             netbridge_handles: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "shadowsocks")]
@@ -478,13 +480,13 @@ impl IpcHandler {
             sharded_bridges: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             sharded_bridge_reply_txs: RwLock::new(std::collections::HashMap::new()),
-            #[cfg(feature = "sharded-vless-wg-bridge")]
+            #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
             sharded_bridge_reply_registry: RwLock::new(None),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             sharded_bridge: RwLock::new(None),
 
             #[cfg(feature = "use-netbridge-egress")]
-            netbridge_adapters: RwLock::new(std::collections::HashMap::new()),
+            netbridge_adapters: Arc::new(RwLock::new(std::collections::HashMap::new())),
             #[cfg(feature = "use-netbridge-egress")]
             netbridge_handles: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "shadowsocks")]
@@ -549,13 +551,13 @@ impl IpcHandler {
             sharded_bridges: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             sharded_bridge_reply_txs: RwLock::new(std::collections::HashMap::new()),
-            #[cfg(feature = "sharded-vless-wg-bridge")]
+            #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
             sharded_bridge_reply_registry: RwLock::new(None),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             sharded_bridge: RwLock::new(None),
 
             #[cfg(feature = "use-netbridge-egress")]
-            netbridge_adapters: RwLock::new(std::collections::HashMap::new()),
+            netbridge_adapters: Arc::new(RwLock::new(std::collections::HashMap::new())),
             #[cfg(feature = "use-netbridge-egress")]
             netbridge_handles: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "shadowsocks")]
@@ -838,7 +840,7 @@ impl IpcHandler {
     ///
     /// This registry is used by the WgReplyHandler to route packets to the
     /// correct sharded bridge based on tunnel tag.
-    #[cfg(feature = "sharded-vless-wg-bridge")]
+    #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
     pub fn set_sharded_bridge_reply_registry(
         &self,
         registry: Arc<crate::vless_wg_bridge::ShardedBridgeReplyRegistry>,
@@ -3756,11 +3758,13 @@ impl IpcHandler {
                         warn!("Failed to take TX receiver for tunnel '{}' - TX forwarding disabled", tag);
                     }
 
-                    // Register the shard's WG reply channel DIRECTLY with the registry.
-                    // This eliminates the intermediate feeder task and extra copy:
-                    //   Before: Registry → channel → feeder task → feed_reply() → copy → shard
-                    //   After:  Registry → shard (direct)
-                    #[cfg(feature = "sharded-vless-wg-bridge")]
+                    // Register the adapter's WG reply channel so decrypted reply packets
+                    // from this tunnel are routed back into its smoltcp egress. REQUIRED
+                    // for SS/VLESS inbound -> WG egress (e.g. WARP): without it the reply
+                    // (SYN-ACK etc.) hits the ingress reply router, which has no session
+                    // for the egress adapter and drops it ("No session mapping for reply").
+                    // The registry + its routing in main.rs are gated on the same features.
+                    #[cfg(any(feature = "sharded-vless-wg-bridge", feature = "use-netbridge-egress"))]
                     {
                         if let Some(registry) = self.sharded_bridge_reply_registry.read().as_ref() {
                             let reply_tx = adapter.wg_reply_sender();
@@ -3771,20 +3775,10 @@ impl IpcHandler {
                             );
                         } else {
                             warn!(
-                                "Sharded bridge reply registry not available - netbridge adapter for '{}' will not receive WG replies",
+                                "Netbridge reply registry not available - adapter for '{}' will not receive WG replies",
                                 tag
                             );
                         }
-                    }
-                    #[cfg(not(feature = "sharded-vless-wg-bridge"))]
-                    {
-                        // Without sharded-vless-wg-bridge, the netbridge adapter WG replies
-                        // are handled through the main ingress reply router
-                        debug!(
-                            "NetbridgeVlessAdapter for tunnel '{}' will receive WG replies via ingress reply router",
-                            tag
-                        );
-                        let _ = adapter; // silence unused warning
                     }
 
                     info!(
@@ -6777,13 +6771,13 @@ impl IpcHandler {
                 alpn: vec!["h2".to_string(), "http/1.1".to_string()],
                 skip_verify: tls_skip_verify,
             },
-            "websocket" => VlessTransportConfig::WebSocket {
+            "websocket" | "ws" => VlessTransportConfig::WebSocket {
                 path: ws_path.clone().unwrap_or_else(|| "/".to_string()),
                 host: ws_host.clone(),
                 headers: vec![],
                 tls: None,
             },
-            "websocket_tls" => VlessTransportConfig::WebSocket {
+            "websocket_tls" | "wss" => VlessTransportConfig::WebSocket {
                 path: ws_path.clone().unwrap_or_else(|| "/".to_string()),
                 host: ws_host.clone(),
                 headers: vec![],
@@ -6798,7 +6792,7 @@ impl IpcHandler {
             _ => {
                 return IpcResponse::error(
                     ErrorCode::InvalidParameters,
-                    format!("Invalid transport type: '{}'. Valid options: tcp, tls, websocket, websocket_tls", transport),
+                    format!("Invalid transport type: '{}'. Valid options: tcp, tls, websocket (ws), websocket_tls (wss)", transport),
                 );
             }
         };
@@ -7155,11 +7149,10 @@ impl IpcHandler {
             self.sharded_bridges.read().clone(),
         ));
 
-        // Clone netbridge adapters map for per-tunnel adapter lookup (feature-gated)
+        // Share the LIVE netbridge adapters map (not a snapshot) so a WG tunnel's
+        // adapter created after this inbound is configured is still found at lookup time.
         #[cfg(feature = "use-netbridge-egress")]
-        let netbridge_adapters_map = Arc::new(parking_lot::RwLock::new(
-            self.netbridge_adapters.read().clone(),
-        ));
+        let netbridge_adapters_map = Arc::clone(&self.netbridge_adapters);
 
         // Store references for statistics updates
         let total_conn_stat = Arc::clone(&total_connections);
@@ -8166,11 +8159,10 @@ impl IpcHandler {
             self.sharded_bridges.read().clone(),
         ));
 
-        // Clone netbridge adapters map for per-tunnel adapter lookup (feature-gated)
+        // Share the LIVE netbridge adapters map (not a snapshot) so a WG tunnel's
+        // adapter created after this inbound is configured is still found at lookup time.
         #[cfg(feature = "use-netbridge-egress")]
-        let netbridge_adapters_map = Arc::new(parking_lot::RwLock::new(
-            self.netbridge_adapters.read().clone(),
-        ));
+        let netbridge_adapters_map = Arc::clone(&self.netbridge_adapters);
 
         // Start the accept loop in a background task with full routing support
         let accept_task = tokio::spawn(async move {
@@ -8583,9 +8575,7 @@ impl IpcHandler {
                         self.sharded_bridges.read().clone(),
                     ));
                     #[cfg(feature = "use-netbridge-egress")]
-                    let udp_netbridge_adapters = Arc::new(parking_lot::RwLock::new(
-                        self.netbridge_adapters.read().clone(),
-                    ));
+                    let udp_netbridge_adapters = Arc::clone(&self.netbridge_adapters);
 
                     // Map of WG tunnel tag -> VlessWgBridge for UDP (legacy fallback)
                     // Only compiled when neither sharded-vless-wg-bridge nor use-netbridge-egress features are enabled
