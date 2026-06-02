@@ -595,11 +595,15 @@ async fn main() -> Result<()> {
                 };
 
                 if !is_wg_client_reply {
+                    // Offer the reply to the per-tunnel netbridge/sharded egress adapter, but
+                    // do NOT return: the same WG tunnel can carry BOTH netbridge-egress sessions
+                    // (SS/VLESS -> WG) AND WG-ingress direct forwarding (WG client -> WG egress).
+                    // The registry is fire-and-forget, so we also fall through to the ingress
+                    // reply router; whichever consumer owns the session handles it, the other
+                    // drops it. (Without the fall-through, single-node WG-ingress -> WARP breaks.)
                     if sharded_registry.try_route(&tunnel_tag, &packet) {
-                        trace!(tunnel = %tunnel_tag, "Reply routed to sharded bridge");
-                        return;
+                        trace!(tunnel = %tunnel_tag, "Reply offered to netbridge/sharded adapter");
                     }
-                    trace!(tunnel = %tunnel_tag, "Sharded bridge did not claim reply, falling through");
                 }
             }
 
