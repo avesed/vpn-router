@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_login_at TIMESTAMP,                     -- 最后登录时间
-    created_by INTEGER REFERENCES users(id)      -- 创建者 ID
+    created_by INTEGER REFERENCES users(id),     -- 创建者 ID
+    rules_ignored INTEGER DEFAULT 0              -- 每用户规则忽略开关（迁移版本 102，纳入基础 schema）
 );
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
@@ -435,6 +436,7 @@ CREATE TABLE IF NOT EXISTS warp_egress (
     endpoint TEXT,                             -- 默认 endpoint (如 engage.cloudflareclient.com:2408)
     local_ip TEXT,                             -- 分配的 IPv4 地址 (如 172.16.0.2)
     local_ipv6 TEXT,                           -- 分配的 IPv6 地址
+    reserved TEXT,                             -- WARP 3字节 client-id (JSON, 如 "[226,4,0]")，数据转发必需
 
     -- 旧字段（保留兼容性）
     config_path TEXT,                          -- 保留字段（未来可能使用）
@@ -695,7 +697,8 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
     -- outbound: 连接到对端的主隧道端点（默认）
     -- inbound: 连接到对端的入站监听器（需要 peer_inbound_enabled=1）
 
-    -- 双向连接状态     bidirectional_status TEXT DEFAULT 'pending' CHECK(bidirectional_status IN ('pending', 'outbound_only', 'bidirectional')),
+    -- 双向连接状态
+    bidirectional_status TEXT DEFAULT 'pending' CHECK(bidirectional_status IN ('pending', 'outbound_only', 'bidirectional')),
     -- pending: 等待双向连接
     -- outbound_only: 仅出站连接
     -- bidirectional: 双向连接已建立
@@ -1099,6 +1102,14 @@ def migrate_warp_egress_protocol(conn: sqlite3.Connection):
         print("✓ 添加 warp_egress.account_id 字段（WARP Integration）")
     else:
         print("⊘ warp_egress.account_id 字段已存在，跳过迁移")
+
+    # 添加 reserved 字段（WARP 3 字节 client-id，Cloudflare 数据转发必需）
+    if "reserved" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN reserved TEXT")
+        conn.commit()
+        print("✓ 添加 warp_egress.reserved 字段（WARP client-id）")
+    else:
+        print("⊘ warp_egress.reserved 字段已存在，跳过迁移")
 
     # 移除 MASQUE 专用字段（mode, socks_port）
     # 这是一个破坏性迁移，需要重建表
@@ -2198,7 +2209,8 @@ def migrate_multiuser_tables(conn: sqlite3.Connection):
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_login_at TIMESTAMP,
-                    created_by INTEGER REFERENCES users(id)
+                    created_by INTEGER REFERENCES users(id),
+                    rules_ignored INTEGER DEFAULT 0
                 )
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")

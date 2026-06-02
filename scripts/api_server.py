@@ -9650,6 +9650,8 @@ async def _register_warp_via_rust_router(db, data: WarpEgressCreate):
             endpoint=warp_config.endpoint,
             local_ip=warp_config.ipv4_address,
             local_ipv6=warp_config.ipv6_address,
+            # WARP 3-byte client identifier; required to route data (not just handshake)
+            reserved=json.dumps(list(warp_config.reserved)) if getattr(warp_config, "reserved", None) else None,
         )
 
         # Create WireGuard tunnel via IPC
@@ -19211,6 +19213,11 @@ def _validate_endpoint(endpoint: str) -> tuple:
     """
     if not endpoint:
         return False, "endpoint 不能为空", None, None
+
+    # [安全] 拒绝包含控制字符的输入（防止 CRLF / header 注入）
+    # 注意: int("8080\n") 会被静默接受，故必须在解析前显式拒绝控制字符
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in endpoint):
+        return False, "endpoint 包含非法控制字符", None, None
 
     if ":" not in endpoint:
         return False, "endpoint 格式应为 host:port", None, None

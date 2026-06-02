@@ -1076,6 +1076,7 @@ class RustRouterClient:
         listen_port: Optional[int] = None,
         mtu: int = 1420,
         persistent_keepalive: int = 25,
+        reserved: Optional[list] = None,
     ) -> IpcResponse:
         """Create a userspace WireGuard tunnel.
 
@@ -1106,6 +1107,10 @@ class RustRouterClient:
             config["peer_ip"] = peer_ip
         if listen_port is not None:
             config["listen_port"] = listen_port
+        if reserved is not None:
+            # WARP 3-byte client identifier (e.g. [226, 4, 0]); injected into
+            # every outgoing WireGuard packet header by the tunnel.
+            config["reserved"] = reserved
 
         return await self._send_command({
             "type": "create_wg_tunnel",

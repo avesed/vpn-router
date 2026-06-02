@@ -1033,6 +1033,17 @@ class RustRouterManager:
                     peer_public_key = egress.get("peer_public_key")
                     endpoint = egress.get("endpoint")
                     local_ip = egress.get("local_ip")
+                    # WARP reserved client-id bytes (JSON list, e.g. "[226,4,0]"),
+                    # required by Cloudflare to route data through the tunnel.
+                    reserved = None
+                    _reserved_raw = egress.get("reserved")
+                    if _reserved_raw:
+                        try:
+                            _r = json.loads(_reserved_raw) if isinstance(_reserved_raw, str) else _reserved_raw
+                            if isinstance(_r, (list, tuple)) and len(_r) == 3:
+                                reserved = [int(x) & 0xFF for x in _r]
+                        except (ValueError, TypeError):
+                            logger.warning(f"WARP egress {tag}: invalid reserved bytes {_reserved_raw!r}")
 
                     # Check if database has all required fields
                     if not all([private_key, peer_public_key, endpoint, local_ip]):
@@ -1085,6 +1096,7 @@ class RustRouterManager:
                         "peer_public_key": peer_public_key,
                         "endpoint": resolved_endpoint,
                         "local_ip": local_ip,
+                        "reserved": reserved,
                         "type": "warp",
                     }
                     logger.info(f"Found WARP WG egress {tag}: endpoint={resolved_endpoint}, local_ip={local_ip}")
@@ -1108,6 +1120,7 @@ class RustRouterManager:
                             peer_public_key=config["peer_public_key"],
                             endpoint=config["endpoint"],
                             local_ip=config["local_ip"],
+                            reserved=config.get("reserved"),
                         )
 
                         if resp.success:

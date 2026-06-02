@@ -2757,23 +2757,28 @@ class UserDatabase:
         peer_public_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         local_ip: Optional[str] = None,
-        local_ipv6: Optional[str] = None
+        local_ipv6: Optional[str] = None,
+        reserved: Optional[str] = None
     ) -> int:
-        """添加 WARP 出口 (WireGuard only with config)"""
+        """添加 WARP 出口 (WireGuard only with config)
+
+        reserved: JSON-encoded 3-byte client identifier (e.g. "[226,4,0]"),
+        required by Cloudflare WARP to route data through the tunnel.
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO warp_egress
                 (tag, description, config_path, license_key, account_type,
                  endpoint_v4, endpoint_v6, enabled, account_id,
-                 private_key, peer_public_key, endpoint, local_ip, local_ipv6)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 private_key, peer_public_key, endpoint, local_ip, local_ipv6, reserved)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tag, description, config_path, license_key, account_type,
                 endpoint_v4, endpoint_v6,
                 1 if enabled else 0,
                 account_id,
-                private_key, peer_public_key, endpoint, local_ip, local_ipv6
+                private_key, peer_public_key, endpoint, local_ip, local_ipv6, reserved
             ))
             conn.commit()
             return cursor.lastrowid
@@ -2784,7 +2789,8 @@ class UserDatabase:
             "description", "config_path", "license_key", "account_type",
             "endpoint_v4", "endpoint_v6", "enabled", "account_id",
             # WireGuard config fields
-            "private_key", "peer_public_key", "endpoint", "local_ip", "local_ipv6"
+            "private_key", "peer_public_key", "endpoint", "local_ip", "local_ipv6",
+            "reserved"
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
         if not updates:
@@ -3456,7 +3462,8 @@ class UserDatabase:
         description: str = "",
         api_port: Optional[int] = None,
         tunnel_type: str = "wireguard",
-        # 隧道状态和 IP 参数        tunnel_status: str = "disconnected",
+        # 隧道状态和 IP 参数
+        tunnel_status: str = "disconnected",
         tunnel_interface: Optional[str] = None,  # WireGuard 接口名
         tunnel_local_ip: Optional[str] = None,
         tunnel_remote_ip: Optional[str] = None,
@@ -3850,7 +3857,8 @@ class UserDatabase:
         Returns:
             符合条件的节点列表
         """
-        # 输入验证         valid_statuses = {'pending', 'outbound_only', 'bidirectional'}
+        # 输入验证
+        valid_statuses = {'pending', 'outbound_only', 'bidirectional'}
         if status not in valid_statuses:
             logger.warning(f"Invalid bidirectional_status query: {status}")
             return []
@@ -5522,6 +5530,9 @@ class DatabaseManager:
     def get_routing_rules(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
         return self.user.get_routing_rules(enabled_only, owner_id)
 
+    def get_allowed_rule_owner_ids(self) -> set:
+        return self.user.get_allowed_rule_owner_ids()
+
     def add_routing_rule(self, rule_type: str, target: str, outbound: str,
                         priority: int = 0, tag: Optional[str] = None,
                         owner_id: Optional[int] = None) -> int:
@@ -6079,13 +6090,14 @@ class DatabaseManager:
         peer_public_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         local_ip: Optional[str] = None,
-        local_ipv6: Optional[str] = None
+        local_ipv6: Optional[str] = None,
+        reserved: Optional[str] = None
     ) -> int:
         """WireGuard only with WG config"""
         return self.user.add_warp_egress(
             tag, description, config_path, license_key, account_type,
             endpoint_v4, endpoint_v6, enabled, account_id,
-            private_key, peer_public_key, endpoint, local_ip, local_ipv6
+            private_key, peer_public_key, endpoint, local_ip, local_ipv6, reserved
         )
 
     def update_warp_egress(self, tag: str, **kwargs) -> bool:
@@ -6264,7 +6276,8 @@ class DatabaseManager:
         description: str = "",
         api_port: Optional[int] = None,
         tunnel_type: str = "wireguard",
-        # 隧道状态和 IP 参数        tunnel_status: str = "disconnected",
+        # 隧道状态和 IP 参数
+        tunnel_status: str = "disconnected",
         tunnel_interface: Optional[str] = None,  # WireGuard 接口名
         tunnel_local_ip: Optional[str] = None,
         tunnel_remote_ip: Optional[str] = None,

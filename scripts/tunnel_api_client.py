@@ -494,7 +494,7 @@ class TunnelAPIClient:
         egress_tag: str,
         mark_type: str = "dscp",
         source_node: Optional[str] = None,
-        target_node: Optional[str] = None, 支持转发注册
+        target_node: Optional[str] = None,  # 支持转发注册
     ) -> bool:
         """在终端节点注册链路路由
 
@@ -521,7 +521,7 @@ class TunnelAPIClient:
             }
             if source_node:
                 data["source_node"] = source_node
-           如果指定了 target_node，接收节点将转发注册
+            # 如果指定了 target_node，接收节点将转发注册
             if target_node:
                 data["target_node"] = target_node
 
@@ -549,8 +549,8 @@ class TunnelAPIClient:
         chain_tag: str,
         mark_value: int,
         mark_type: str = "dscp",
-        target_node: Optional[str] = None, 支持转发注销
-        source_node: Optional[str] = None, 入口节点标识
+        target_node: Optional[str] = None,  # 支持转发注销
+        source_node: Optional[str] = None,  # 入口节点标识
     ) -> bool:
         """在终端节点注销链路路由
 
@@ -572,10 +572,10 @@ class TunnelAPIClient:
                 "mark_value": mark_value,
                 "mark_type": mark_type,
             }
-           传递模式下，通过中继转发注销请求
+            # 传递模式下，通过中继转发注销请求
             if target_node:
                 params["target_node"] = target_node
-           传递入口节点标识
+            # 传递入口节点标识
             if source_node:
                 params["source_node"] = source_node
 
@@ -852,7 +852,7 @@ class TunnelAPIClient:
     def unregister_relay_route(
         self,
         chain_tag: str,
-        source_node: Optional[str] = None, 入口节点标识
+        source_node: Optional[str] = None,  # 入口节点标识
     ) -> bool:
         """ 在远程节点注销中继转发规则
 
@@ -871,7 +871,7 @@ class TunnelAPIClient:
             data = {
                 "chain_tag": chain_tag,
             }
-           传递入口节点标识
+            # 传递入口节点标识
             if source_node:
                 data["source_node"] = source_node
             result = self._make_request("POST", "/api/relay-routing/unregister", data=data)
