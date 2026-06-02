@@ -769,8 +769,8 @@ mod tests {
     fn test_max_ttl() {
         let entry = CacheEntry::new_with_ttl(vec![], u32::MAX, "test", false);
         assert_eq!(entry.original_ttl(), u32::MAX);
-        // remaining_ttl should still work
-        assert!(entry.remaining_ttl() <= u32::MAX);
+        // remaining_ttl should still work (positive immediately after creation)
+        assert!(entry.remaining_ttl() > 0);
     }
 
     #[test]

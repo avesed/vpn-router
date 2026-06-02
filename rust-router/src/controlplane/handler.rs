@@ -1379,7 +1379,8 @@ mod tests {
             "direct".to_string(),
         );
 
-        assert!(handler.rule_engine().version() >= 0);
+        // version() returns an unsigned counter; just confirm it is accessible
+        let _ = handler.rule_engine().version();
         assert!(!handler.outbound_manager().is_empty());
         assert!(!handler.chain_handler().has_chain_manager());
     }

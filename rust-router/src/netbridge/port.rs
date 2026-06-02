@@ -207,7 +207,7 @@ impl PortAllocator {
     /// The shard index (0-based), or `None` if outside the ephemeral range.
     #[must_use]
     pub fn shard_for_port(port: u16, total_shards: u16) -> Option<usize> {
-        if port < PORT_RANGE_START || port > PORT_RANGE_END {
+        if !(PORT_RANGE_START..=PORT_RANGE_END).contains(&port) {
             return None;
         }
 
@@ -532,8 +532,7 @@ mod tests {
         let guard = allocator.allocate().expect("should allocate");
         let port = guard.port();
 
-        assert!(port >= PORT_RANGE_START);
-        assert!(port <= PORT_RANGE_END);
+        assert!((PORT_RANGE_START..=PORT_RANGE_END).contains(&port));
         assert!(allocator.is_allocated(port));
         assert_eq!(allocator.allocated_count(), 1);
     }

@@ -192,14 +192,6 @@ pub struct VlessDestination {
     pub addons: VlessAddons,
 }
 
-impl VlessDestination {
-    /// Get the destination as a string (address:port)
-    #[must_use]
-    pub fn to_string(&self) -> String {
-        format!("{}:{}", self.address, self.port)
-    }
-}
-
 impl std::fmt::Display for VlessDestination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.address, self.port)

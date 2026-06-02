@@ -284,8 +284,7 @@ mod tests {
         let guard = allocator.allocate().expect("should allocate");
         let port = guard.port();
 
-        assert!(port >= PORT_RANGE_START);
-        assert!(port <= PORT_RANGE_END);
+        assert!((PORT_RANGE_START..=PORT_RANGE_END).contains(&port));
         assert!(allocator.is_allocated(port));
 
         drop(guard);

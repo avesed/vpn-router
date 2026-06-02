@@ -693,7 +693,7 @@ impl SmoltcpHttpClient {
         static PORT_COUNTER: AtomicU16 = AtomicU16::new(49152);
 
         let port = PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        if port >= 65535 {
+        if port == 65535 {
             PORT_COUNTER.store(49152, Ordering::Relaxed);
         }
         port
