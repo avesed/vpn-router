@@ -6986,15 +6986,23 @@ impl IpcHandler {
         use crate::vless_inbound::InboundRealityConfig;
         use std::net::SocketAddr;
 
-        // Check if already running
-        {
-            let inbound_guard = self.vless_inbound.read();
-            if inbound_guard.is_some() {
-                return IpcResponse::error(
-                    ErrorCode::AlreadyExists,
-                    "VLESS inbound is already running. Stop it first with StopVlessInbound.",
-                );
+        // If a listener is already running, tear it down first so this call
+        // acts as a reconfigure. Otherwise the old accept loop keeps serving
+        // the stale config (e.g. switching REALITY -> plain would leave the
+        // old REALITY server running and plain clients would hang).
+        let was_running = {
+            let mut task_guard = self.vless_inbound_task.write();
+            if let Some(task) = task_guard.take() {
+                task.abort();
+                info!("Stopping existing VLESS inbound accept task for reconfigure");
             }
+            let mut inbound_guard = self.vless_inbound.write();
+            inbound_guard.take().is_some()
+        };
+        if was_running {
+            // Give the aborted task a moment to release the listening socket
+            // before the new listener binds the same port.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
 
         // Parse listen address
