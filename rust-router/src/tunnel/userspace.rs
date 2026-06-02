@@ -996,6 +996,16 @@ impl UserspaceWgTunnel {
         // Process result
         match result {
             TunnResult::WriteToNetwork(encrypted) => {
+                // WARP: Cloudflare requires the 3-byte client-id in the reserved
+                // header field of every transport packet; without it the handshake
+                // still succeeds but all data packets are silently dropped.
+                if let Some(reserved) = self.config.reserved {
+                    if encrypted.len() >= 4 {
+                        encrypted[1] = reserved[0];
+                        encrypted[2] = reserved[1];
+                        encrypted[3] = reserved[2];
+                    }
+                }
                 // Use send_to() instead of send() for unconnected socket
                 socket
                     .send_to(encrypted, self.peer_addr_parsed)
@@ -1107,6 +1117,14 @@ impl UserspaceWgTunnel {
         // Process result
         match result {
             TunnResult::WriteToNetwork(encrypted) => {
+                // WARP: inject the reserved client-id bytes (see send() above)
+                if let Some(reserved) = self.config.reserved {
+                    if encrypted.len() >= 4 {
+                        encrypted[1] = reserved[0];
+                        encrypted[2] = reserved[1];
+                        encrypted[3] = reserved[2];
+                    }
+                }
                 socket
                     .send_to(encrypted, self.peer_addr_parsed)
                     .await

@@ -313,6 +313,7 @@ impl WgEgressManager {
             listen_port: config.listen_port, // Use specified port or let the system choose
             persistent_keepalive: config.persistent_keepalive,
             mtu: config.mtu,
+            reserved: config.reserved,
         };
 
         // Create the tunnel

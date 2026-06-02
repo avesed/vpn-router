@@ -391,6 +391,11 @@ pub struct WgEgressConfig {
     /// Only used when `use_batch_io` is true. Maximum value is 256.
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+
+    /// WARP reserved bytes (3-byte client identifier), forwarded to the tunnel
+    /// and injected into every outgoing WireGuard packet header (Cloudflare WARP).
+    #[serde(default)]
+    pub reserved: Option<[u8; 3]>,
 }
 
 fn default_allowed_ips() -> Vec<String> {
@@ -461,6 +466,7 @@ impl WgEgressConfig {
             preshared_key: None,
             use_batch_io: default_use_batch_io(),
             batch_size: default_batch_size(),
+            reserved: None,
         }
     }
 
@@ -513,6 +519,7 @@ impl WgEgressConfig {
             preshared_key: None,
             use_batch_io: default_use_batch_io(),
             batch_size: default_batch_size(),
+            reserved: None,
         }
     }
 
@@ -541,6 +548,13 @@ impl WgEgressConfig {
     #[must_use]
     pub fn with_mtu(mut self, mtu: u16) -> Self {
         self.mtu = Some(mtu);
+        self
+    }
+
+    /// Set the WARP reserved bytes (3-byte client identifier)
+    #[must_use]
+    pub fn with_reserved(mut self, reserved: [u8; 3]) -> Self {
+        self.reserved = Some(reserved);
         self
     }
 
@@ -728,6 +742,7 @@ impl Default for WgEgressConfig {
             preshared_key: None,
             use_batch_io: default_use_batch_io(),
             batch_size: default_batch_size(),
+            reserved: None,
         }
     }
 }

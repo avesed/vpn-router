@@ -1933,6 +1933,10 @@ pub struct WgTunnelConfig {
     /// MTU for the tunnel
     #[serde(default)]
     pub mtu: Option<u16>,
+    /// WARP reserved bytes (3-byte client identifier), injected into every
+    /// outgoing WireGuard packet header for Cloudflare WARP egress.
+    #[serde(default)]
+    pub reserved: Option<[u8; 3]>,
 }
 
 /// `WireGuard` tunnel status
@@ -4127,6 +4131,7 @@ rust_router_connections_total 12345
             listen_port: Some(36200),
             persistent_keepalive: Some(25),
             mtu: Some(1420),
+            reserved: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"private_key\":\"cGFzc3dvcmQ=\""));
@@ -4427,6 +4432,7 @@ rust_router_connections_total 12345
                 listen_port: None,
                 persistent_keepalive: None,
                 mtu: None,
+                reserved: None,
             },
         };
         let json = serde_json::to_string(&cmd).unwrap();

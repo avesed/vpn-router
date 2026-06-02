@@ -3636,6 +3636,9 @@ impl IpcHandler {
         if let Some(port) = config.listen_port {
             egress_config = egress_config.with_listen_port(port);
         }
+        if let Some(reserved) = config.reserved {
+            egress_config = egress_config.with_reserved(reserved);
+        }
 
         match egress_manager.create_tunnel(egress_config).await {
             Ok(()) => {

@@ -46,6 +46,12 @@ pub struct WgTunnelConfig {
     /// MTU for the tunnel
     #[serde(default)]
     pub mtu: Option<u16>,
+    /// WARP reserved bytes (3-byte client identifier). When set, these
+    /// overwrite bytes [1..4] of every outgoing WireGuard packet, which
+    /// Cloudflare WARP requires to route data (the handshake succeeds without
+    /// them, but all data packets are silently dropped).
+    #[serde(default)]
+    pub reserved: Option<[u8; 3]>,
 }
 
 impl Default for WgTunnelConfig {
@@ -59,6 +65,7 @@ impl Default for WgTunnelConfig {
             listen_port: None,
             persistent_keepalive: Some(25),
             mtu: Some(1420),
+            reserved: None,
         }
     }
 }
