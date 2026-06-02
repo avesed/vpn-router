@@ -363,84 +363,84 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        // Read from underlying transport into input_buffer
-        let mut read_buf = vec![0u8; 16384];
-        let mut tmp_buf = ReadBuf::new(&mut read_buf);
-
-        match Pin::new(&mut self.inner).poll_read(cx, &mut tmp_buf) {
-            Poll::Ready(Ok(())) => {
-                let n = tmp_buf.filled().len();
-                if n == 0 {
-                    return Poll::Ready(Ok(())); // EOF
-                }
-
-                self.input_buffer.extend_from_slice(&read_buf[..n]);
-
-                // Try to decrypt a complete record
-                if self.input_buffer.len() < TLS_RECORD_HEADER_SIZE {
-                    // Need more data - wake up again
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-
+        loop {
+            // Decrypt and return any complete TLS record already buffered BEFORE
+            // awaiting the transport. TCP requests often arrive as several records
+            // batched into one read; processing only one per wakeup (and reading
+            // the socket first) deadlocks request/response traffic. Small single
+            // -record DNS happened to work, which is why UDP passed but TCP hung.
+            if self.input_buffer.len() >= TLS_RECORD_HEADER_SIZE {
                 let record_len =
                     u16::from_be_bytes([self.input_buffer[3], self.input_buffer[4]]) as usize;
                 let total_len = TLS_RECORD_HEADER_SIZE + record_len;
 
-                if self.input_buffer.len() < total_len {
-                    // Need more data
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
+                if self.input_buffer.len() >= total_len {
+                    let mut ciphertext: Vec<u8> = self
+                        .input_buffer
+                        .drain(..total_len)
+                        .skip(TLS_RECORD_HEADER_SIZE)
+                        .collect();
 
-                // Extract and decrypt record
-                let mut ciphertext: Vec<u8> = self
-                    .input_buffer
-                    .drain(..total_len)
-                    .skip(TLS_RECORD_HEADER_SIZE)
-                    .collect();
+                    let cipher_suite = self.cipher_suite;
+                    let client_key_bytes = self.client_app_key_bytes.clone();
+                    let client_iv = self.client_app_iv.clone();
 
-                // Extract values to avoid borrow conflicts
-                let cipher_suite = self.cipher_suite;
-                let client_key_bytes = self.client_app_key_bytes.clone();
-                let client_iv = self.client_app_iv.clone();
-
-                let client_key = match AeadKey::new(cipher_suite, &client_key_bytes) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("Failed to create decryption key: {}", e),
-                        )));
-                    }
-                };
-
-                let mut decryptor =
-                    RecordDecryptor::new(&client_key, &client_iv, &mut self.read_seq);
-
-                match decryptor.decrypt_record_in_place(&mut ciphertext, record_len as u16) {
-                    Ok((content_type, plaintext)) => {
-                        if content_type == CONTENT_TYPE_APPLICATION_DATA {
-                            let to_copy = plaintext.len().min(buf.remaining());
-                            buf.put_slice(&plaintext[..to_copy]);
-
-                            if to_copy < plaintext.len() {
-                                self.read_buffer.extend_from_slice(&plaintext[to_copy..]);
-                                self.read_offset = 0;
-                            }
+                    let client_key = match AeadKey::new(cipher_suite, &client_key_bytes) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Failed to create decryption key: {}", e),
+                            )));
                         }
-                        // Ignore alerts and other content types for now
+                    };
 
-                        Poll::Ready(Ok(()))
+                    let mut decryptor =
+                        RecordDecryptor::new(&client_key, &client_iv, &mut self.read_seq);
+
+                    match decryptor.decrypt_record_in_place(&mut ciphertext, record_len as u16) {
+                        Ok((content_type, plaintext)) => {
+                            if content_type == CONTENT_TYPE_APPLICATION_DATA
+                                && !plaintext.is_empty()
+                            {
+                                let to_copy = plaintext.len().min(buf.remaining());
+                                buf.put_slice(&plaintext[..to_copy]);
+                                if to_copy < plaintext.len() {
+                                    self.read_buffer.extend_from_slice(&plaintext[to_copy..]);
+                                    self.read_offset = 0;
+                                }
+                                return Poll::Ready(Ok(()));
+                            }
+                            // Non-application-data (alerts/handshake) or empty payload:
+                            // never return an empty read here, as copy_bidirectional
+                            // treats a 0-byte read as EOF. Loop to the next record.
+                            continue;
+                        }
+                        Err(e) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Decryption failed: {}", e),
+                            )));
+                        }
                     }
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Decryption failed: {}", e),
-                    ))),
                 }
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+
+            // No complete record buffered - read more from the transport.
+            let mut read_buf = vec![0u8; 16384];
+            let mut tmp_buf = ReadBuf::new(&mut read_buf);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut tmp_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = tmp_buf.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(Ok(())); // EOF
+                    }
+                    self.input_buffer.extend_from_slice(&read_buf[..n]);
+                    // loop to attempt decryption of the (possibly now complete) record
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
