@@ -8,6 +8,12 @@ __pycache__/
 *.pyd
 
 # ==========================================
+# E2E test runtime state (configs/keys, logs, built binary) — keep out of git
+# ==========================================
+/test-e2e/
+/.playwright-mcp/
+
+# ==========================================
 # Build outputs
 # ==========================================
 /frontend/dist/

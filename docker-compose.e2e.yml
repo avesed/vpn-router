@@ -1,0 +1,94 @@
+# E2E test topology (isolated from the host-net dev instance on :36000)
+#   node A (entry):  WG ingress + SS/VLESS egress -> B          UI http://localhost:36011
+#   node B (exit) :  SS/VLESS ingress + WARP egress -> internet UI http://localhost:36010
+# Bridge network vpntest (172.31.0.0/24); fixed host scripts mounted over the stale image.
+networks:
+  vpntest:
+    external: true
+
+x-env: &env
+  TZ: America/New_York
+  DISABLE_IPV6: "1"
+  USE_RUST_ROUTER: "true"
+  USERSPACE_WG: "true"
+  RUST_ROUTER_SOCKS5_INBOUND: "true"
+  WEB_PORT: "36000"
+  WG_LISTEN_PORT: "36100"
+  LOG_LEVEL: DEBUG
+  RUST_LOG: "rust_router=debug,info"
+
+services:
+  vpn-e2e-b:
+    image: vpn-router-vpn-gateway:latest
+    container_name: vpn-e2e-b
+    hostname: vpn-e2e-b
+    privileged: true
+    networks: [vpntest]
+    ports:
+      - "36010:36000"
+    environment: *env
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./test-e2e/b/config:/etc/sing-box
+      - ./test-e2e/b/logs:/var/log
+      - ./scripts/api_server.py:/usr/local/bin/api_server.py:ro
+      - ./scripts/db_helper.py:/usr/local/bin/db_helper.py:ro
+      - ./scripts/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
+      - ./scripts/init_user_db.py:/usr/local/bin/init_user_db.py:ro
+      - ./scripts/tunnel_api_client.py:/usr/local/bin/tunnel_api_client.py:ro
+      - ./scripts/convert_adblock.py:/usr/local/bin/convert_adblock.py:ro
+      - ./scripts/v2ray_uri_parser.py:/usr/local/bin/v2ray_uri_parser.py:ro
+      - ./scripts/v2ray_stats_client.py:/usr/local/bin/v2ray_stats_client.py:ro
+      - ./scripts/warp_endpoint_optimizer.py:/usr/local/bin/warp_endpoint_optimizer.py:ro
+      - ./scripts/openvpn_manager.py:/usr/local/bin/openvpn_manager.py:ro
+      - ./scripts/socks5_proxy.py:/usr/local/bin/socks5_proxy.py:ro
+      - ./scripts/health_checker.py:/usr/local/bin/health_checker.py:ro
+      - ./scripts/peer_tunnel_manager.py:/usr/local/bin/peer_tunnel_manager.py:ro
+      - ./scripts/peer_pairing.py:/usr/local/bin/peer_pairing.py:ro
+      - ./scripts/key_manager.py:/usr/local/bin/key_manager.py:ro
+      - ./scripts/rust_router_manager.py:/usr/local/bin/rust_router_manager.py:ro
+      - ./scripts/rust_router_client.py:/usr/local/bin/rust_router_client.py:ro
+      - ./scripts/render_routing_config.py:/usr/local/bin/render_routing_config.py:ro
+      - ./scripts/log_config.py:/usr/local/bin/log_config.py:ro
+      - ./test-e2e/cargo-target/debug/rust-router:/usr/local/bin/rust-router:ro
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+  vpn-e2e-a:
+    image: vpn-router-vpn-gateway:latest
+    container_name: vpn-e2e-a
+    hostname: vpn-e2e-a
+    privileged: true
+    networks: [vpntest]
+    ports:
+      - "36011:36000"
+      - "36110:36100/udp"
+    environment: *env
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./test-e2e/a/config:/etc/sing-box
+      - ./test-e2e/a/logs:/var/log
+      - ./scripts/api_server.py:/usr/local/bin/api_server.py:ro
+      - ./scripts/db_helper.py:/usr/local/bin/db_helper.py:ro
+      - ./scripts/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
+      - ./scripts/init_user_db.py:/usr/local/bin/init_user_db.py:ro
+      - ./scripts/tunnel_api_client.py:/usr/local/bin/tunnel_api_client.py:ro
+      - ./scripts/convert_adblock.py:/usr/local/bin/convert_adblock.py:ro
+      - ./scripts/v2ray_uri_parser.py:/usr/local/bin/v2ray_uri_parser.py:ro
+      - ./scripts/v2ray_stats_client.py:/usr/local/bin/v2ray_stats_client.py:ro
+      - ./scripts/warp_endpoint_optimizer.py:/usr/local/bin/warp_endpoint_optimizer.py:ro
+      - ./scripts/openvpn_manager.py:/usr/local/bin/openvpn_manager.py:ro
+      - ./scripts/socks5_proxy.py:/usr/local/bin/socks5_proxy.py:ro
+      - ./scripts/health_checker.py:/usr/local/bin/health_checker.py:ro
+      - ./scripts/peer_tunnel_manager.py:/usr/local/bin/peer_tunnel_manager.py:ro
+      - ./scripts/peer_pairing.py:/usr/local/bin/peer_pairing.py:ro
+      - ./scripts/key_manager.py:/usr/local/bin/key_manager.py:ro
+      - ./scripts/rust_router_manager.py:/usr/local/bin/rust_router_manager.py:ro
+      - ./scripts/rust_router_client.py:/usr/local/bin/rust_router_client.py:ro
+      - ./scripts/render_routing_config.py:/usr/local/bin/render_routing_config.py:ro
+      - ./scripts/log_config.py:/usr/local/bin/log_config.py:ro
+      - ./test-e2e/cargo-target/debug/rust-router:/usr/local/bin/rust-router:ro
+    stop_grace_period: 15s
+    restart: unless-stopped
