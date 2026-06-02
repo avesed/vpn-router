@@ -846,6 +846,15 @@ pub enum IpcCommand {
         /// Skip TLS certificate verification (for testing)
         #[serde(default)]
         tls_skip_verify: bool,
+        /// Enable REALITY transport (TLS 1.3 camouflage). Takes precedence over `transport`.
+        #[serde(default)]
+        reality_enabled: bool,
+        /// REALITY server public key (Base64-encoded X25519, 32 bytes)
+        #[serde(default)]
+        reality_public_key: Option<String>,
+        /// REALITY short ID (hex string, up to 16 chars / 8 bytes; empty = all-zero)
+        #[serde(default)]
+        reality_short_id: Option<String>,
         /// WebSocket path (for WebSocket transport)
         #[serde(default)]
         ws_path: Option<String>,
@@ -5251,6 +5260,9 @@ rust_router_connections_total 12345
             transport: "websocket_tls".into(),
             tls_server_name: Some("jp.example.com".into()),
             tls_skip_verify: false,
+            reality_enabled: false,
+            reality_public_key: None,
+            reality_short_id: None,
             ws_path: Some("/ws".into()),
             ws_host: Some("jp.example.com".into()),
         };

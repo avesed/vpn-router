@@ -2,6 +2,7 @@
 //!
 //! This module processes IPC commands and generates responses.
 
+use base64::Engine as _;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1395,6 +1396,9 @@ impl IpcHandler {
                 transport,
                 tls_server_name,
                 tls_skip_verify,
+                reality_enabled,
+                reality_public_key,
+                reality_short_id,
                 ws_path,
                 ws_host,
             } => {
@@ -1407,6 +1411,9 @@ impl IpcHandler {
                     transport,
                     tls_server_name,
                     tls_skip_verify,
+                    reality_enabled,
+                    reality_public_key,
+                    reality_short_id,
                     ws_path,
                     ws_host,
                 )
@@ -6732,6 +6739,7 @@ impl IpcHandler {
     ///
     /// Creates a new VLESS outbound and adds it to the outbound manager.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_add_vless_outbound(
         &self,
         tag: String,
@@ -6742,6 +6750,9 @@ impl IpcHandler {
         transport: String,
         tls_server_name: Option<String>,
         tls_skip_verify: bool,
+        reality_enabled: bool,
+        reality_public_key: Option<String>,
+        reality_short_id: Option<String>,
         ws_path: Option<String>,
         ws_host: Option<String>,
     ) -> IpcResponse {
@@ -6761,8 +6772,85 @@ impl IpcHandler {
             );
         }
 
-        // Build transport configuration based on transport type
-        let transport_config = match transport.as_str() {
+        // Build transport configuration.
+        //
+        // REALITY takes precedence over the transport string: the Python control
+        // plane sends transport="tcp" together with reality_enabled=true.
+        let transport_config = if reality_enabled {
+            // Decode the REALITY server public key (Base64 X25519, 32 bytes).
+            let pubkey_b64 = match reality_public_key {
+                Some(k) if !k.is_empty() => k,
+                _ => {
+                    return IpcResponse::error(
+                        ErrorCode::InvalidParameters,
+                        "REALITY requires reality_public_key",
+                    );
+                }
+            };
+            let pubkey_bytes = match base64::engine::general_purpose::STANDARD
+                .decode(pubkey_b64.as_bytes())
+                .or_else(|_| {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(pubkey_b64.as_bytes())
+                }) {
+                Ok(b) => b,
+                Err(e) => {
+                    return IpcResponse::error(
+                        ErrorCode::InvalidParameters,
+                        format!("Invalid REALITY public key Base64: {e}"),
+                    );
+                }
+            };
+            if pubkey_bytes.len() != 32 {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!(
+                        "REALITY public key must be 32 bytes, got {}",
+                        pubkey_bytes.len()
+                    ),
+                );
+            }
+            let mut server_public_key = [0u8; 32];
+            server_public_key.copy_from_slice(&pubkey_bytes);
+
+            // Decode the short ID (hex). Empty / absent => all-zero short ID.
+            let short_id = match reality_short_id.as_deref() {
+                None | Some("") => [0u8; 8],
+                Some(hex_str) => {
+                    let bytes = match hex::decode(hex_str) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return IpcResponse::error(
+                                ErrorCode::InvalidParameters,
+                                format!("Invalid REALITY short_id hex '{hex_str}': {e}"),
+                            );
+                        }
+                    };
+                    if bytes.len() > 8 {
+                        return IpcResponse::error(
+                            ErrorCode::InvalidParameters,
+                            format!("REALITY short_id too long: {} bytes (max 8)", bytes.len()),
+                        );
+                    }
+                    // Right-pad with zeros to 8 bytes (matches server normalization).
+                    let mut sid = [0u8; 8];
+                    sid[..bytes.len()].copy_from_slice(&bytes);
+                    sid
+                }
+            };
+
+            // SNI: prefer tls_server_name, fall back to the server address.
+            let server_name = tls_server_name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| server_address.clone());
+
+            VlessTransportConfig::Reality {
+                server_public_key,
+                short_id,
+                server_name,
+            }
+        } else {
+            match transport.as_str() {
             "tcp" => VlessTransportConfig::Tcp,
             "tls" => VlessTransportConfig::Tls {
                 server_name: tls_server_name
@@ -6789,11 +6877,12 @@ impl IpcHandler {
                     skip_verify: tls_skip_verify,
                 }),
             },
-            _ => {
-                return IpcResponse::error(
-                    ErrorCode::InvalidParameters,
-                    format!("Invalid transport type: '{}'. Valid options: tcp, tls, websocket (ws), websocket_tls (wss)", transport),
-                );
+                _ => {
+                    return IpcResponse::error(
+                        ErrorCode::InvalidParameters,
+                        format!("Invalid transport type: '{}'. Valid options: tcp, tls, websocket (ws), websocket_tls (wss)", transport),
+                    );
+                }
             }
         };
 

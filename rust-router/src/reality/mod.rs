@@ -141,7 +141,7 @@ pub use auth::{
 };
 
 // Client connection
-pub use client::{FeedResult, RealityClientConfig, RealityClientConnection};
+pub use client::{FeedResult, RealityClientConfig, RealityClientConnection, RealityClientStream};
 
 // Server connection
 pub use server::{

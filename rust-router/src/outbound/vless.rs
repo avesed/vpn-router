@@ -53,9 +53,12 @@ use tokio::time::timeout;
 use tracing::{debug, trace};
 use uuid::Uuid;
 
-use super::traits::{HealthStatus, Outbound, OutboundConnection, ProxyServerInfo};
+use super::traits::{
+    BoxedAsyncStream, HealthStatus, Outbound, OutboundConnection, ProxyServerInfo,
+};
 use crate::connection::OutboundStats;
 use crate::error::{OutboundError, UdpError};
+use crate::reality::{RealityClientConfig, RealityClientStream};
 use crate::transport::{connect as transport_connect, TlsConfig, TransportConfig, WebSocketConfig};
 use crate::vless::{VlessAddons, VlessAddress, VlessCommand, VlessRequestHeader, VlessStream};
 
@@ -244,6 +247,21 @@ pub enum VlessTransportConfig {
         /// TLS settings (None for plain WebSocket)
         #[serde(default)]
         tls: Option<TlsSettings>,
+    },
+
+    /// REALITY transport (TLS 1.3 camouflage over TCP)
+    ///
+    /// The VLESS protocol is tunneled inside a REALITY-encrypted TLS 1.3 channel.
+    /// Unlike `Tls`, this is NOT handled by the generic transport layer: the
+    /// VLESS outbound performs the TCP connect and REALITY handshake directly
+    /// (see `VlessOutbound::connect`).
+    Reality {
+        /// Server's X25519 public key (32 bytes)
+        server_public_key: [u8; 32],
+        /// REALITY short ID (8 bytes; all-zero means "no short ID")
+        short_id: [u8; 8],
+        /// Server name used for SNI in the camouflaged ClientHello
+        server_name: String,
     },
 }
 
@@ -475,6 +493,12 @@ impl VlessOutbound {
                     transport = transport.with_tls(tls_config);
                 }
             }
+            VlessTransportConfig::Reality { .. } => {
+                // REALITY is handled directly in `connect` (raw TCP connect +
+                // RealityClientStream handshake), not via the generic transport
+                // layer, so we leave this as plain TCP. `connect` never calls
+                // `transport_connect` for the Reality variant.
+            }
         }
 
         transport
@@ -550,6 +574,49 @@ impl VlessOutbound {
 
         Ok(())
     }
+
+    /// Connect using REALITY transport.
+    ///
+    /// Unlike the other transports, REALITY is handled here directly rather than
+    /// via the generic transport layer:
+    /// 1. Raw TCP connect to the VLESS server.
+    /// 2. Perform the REALITY/TLS 1.3 client handshake (camouflaged ClientHello).
+    /// 3. Send the VLESS request header over the encrypted REALITY channel.
+    /// 4. Wrap in `VlessStream` for deferred response-header handling and return.
+    async fn connect_reality(
+        &self,
+        addr: SocketAddr,
+        server_public_key: [u8; 32],
+        short_id: [u8; 8],
+        server_name: &str,
+    ) -> Result<OutboundConnection, VlessOutboundError> {
+        // 1. Raw TCP connect to the VLESS/REALITY server.
+        let tcp = tokio::net::TcpStream::connect(self.config.server_string())
+            .await
+            .map_err(|e| {
+                VlessOutboundError::TransportFailed(format!("TCP connect failed: {e}"))
+            })?;
+        // Disable Nagle to match the latency profile of the other transports.
+        let _ = tcp.set_nodelay(true);
+
+        // 2. Perform the REALITY handshake.
+        let reality_config =
+            RealityClientConfig::new(server_public_key, short_id, server_name.to_string());
+        let mut reality_stream = RealityClientStream::connect(tcp, reality_config)
+            .await
+            .map_err(|e| {
+                VlessOutboundError::HandshakeFailed(format!("REALITY handshake failed: {e}"))
+            })?;
+
+        // 3. Send the VLESS request header over the encrypted channel.
+        self.send_vless_request(&mut reality_stream, addr).await?;
+
+        // 4. Wrap for deferred VLESS response-header handling. Box the REALITY
+        //    stream so it fits the unified `OutboundStream::Reality` variant.
+        let boxed: BoxedAsyncStream = Box::new(reality_stream);
+        let vless_stream = VlessStream::new(boxed);
+        Ok(OutboundConnection::from_reality(vless_stream, addr))
+    }
 }
 
 impl Outbound for VlessOutbound {
@@ -567,6 +634,52 @@ impl Outbound for VlessOutbound {
             }
 
             self.stats.record_connection();
+
+            // REALITY transport is handled directly here (raw TCP + REALITY
+            // handshake), not via the generic transport layer.
+            if let VlessTransportConfig::Reality {
+                server_public_key,
+                short_id,
+                server_name,
+            } = &self.config.transport
+            {
+                debug!(
+                    "VLESS connecting to {} via {} over REALITY (dest: {})",
+                    self.config.server_string(),
+                    self.config.tag,
+                    addr
+                );
+
+                let reality_result = timeout(
+                    connect_timeout,
+                    self.connect_reality(addr, *server_public_key, *short_id, server_name),
+                )
+                .await;
+
+                return match reality_result {
+                    Ok(Ok(conn)) => {
+                        self.update_health(true);
+                        debug!(
+                            "VLESS/REALITY connection to {} via {} ready (deferred response)",
+                            addr, self.config.tag
+                        );
+                        Ok(conn)
+                    }
+                    Ok(Err(e)) => {
+                        self.update_health(false);
+                        self.stats.record_error();
+                        Err(OutboundError::connection_failed(addr, e.to_string()))
+                    }
+                    Err(_) => {
+                        self.update_health(false);
+                        self.stats.record_error();
+                        Err(OutboundError::Timeout {
+                            addr,
+                            timeout_secs: connect_timeout.as_secs(),
+                        })
+                    }
+                };
+            }
 
             // Build transport configuration
             let transport_config = self.build_transport_config();
@@ -676,6 +789,7 @@ impl Outbound for VlessOutbound {
             VlessTransportConfig::Tls { .. } => "tls",
             VlessTransportConfig::WebSocket { tls: Some(_), .. } => "websocket_tls",
             VlessTransportConfig::WebSocket { tls: None, .. } => "websocket",
+            VlessTransportConfig::Reality { .. } => "reality",
         })
     }
 

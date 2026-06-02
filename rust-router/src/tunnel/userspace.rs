@@ -2925,6 +2925,7 @@ mod tests {
             listen_port: Some(0), // Use ephemeral port
             persistent_keepalive: Some(25),
             mtu: Some(1420),
+            reserved: None,
         }
     }
 

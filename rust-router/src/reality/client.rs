@@ -6,7 +6,12 @@
 //! The connection follows the rustls API pattern with separate read/write
 //! phases and explicit state management.
 
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use sha2::{Digest, Sha256, Sha384};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::reality::auth::{derive_auth_key, encrypt_session_id, SessionId};
 use crate::reality::common::{
@@ -594,6 +599,250 @@ impl RealityClientConnection {
         }
 
         Ok(true)
+    }
+}
+
+// =============================================================================
+// RealityClientStream - async I/O wrapper over RealityClientConnection
+// =============================================================================
+
+/// Async stream wrapper for client-side REALITY connections.
+///
+/// Wraps an inner transport (e.g. a `TcpStream`) and a sans-I/O
+/// [`RealityClientConnection`], performing the full TLS 1.3 / REALITY handshake
+/// in [`RealityClientStream::connect`] and then exposing an encrypted
+/// `AsyncRead`/`AsyncWrite` channel for application data (the VLESS protocol).
+///
+/// The read path mirrors the server-side `RealityServerStream::poll_read`
+/// correctness fixes:
+/// - all already-buffered complete records are decrypted/drained before the
+///   socket is awaited (TCP often batches multiple records into one read), and
+/// - `Poll::Ready(Ok(()))` is never returned with zero bytes filled unless the
+///   transport reached true EOF (a 0-byte read is treated as EOF by
+///   `copy_bidirectional`).
+pub struct RealityClientStream<T> {
+    inner: T,
+    conn: RealityClientConnection,
+    /// Decrypted application data not yet handed to the caller.
+    read_buffer: Vec<u8>,
+    read_offset: usize,
+    /// True once the inner transport has reached EOF.
+    eof: bool,
+}
+
+impl<T> RealityClientStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Perform the REALITY/TLS 1.3 client handshake over `inner` and return a
+    /// ready-to-use encrypted stream.
+    ///
+    /// This sends the ClientHello, then loops reading from the transport and
+    /// feeding bytes into the sans-I/O connection (writing back any output it
+    /// produces, e.g. the client Finished) until the handshake is established.
+    /// Any application data delivered early (interleaved with the final
+    /// handshake flight) is buffered for the first `poll_read`.
+    pub async fn connect(mut inner: T, config: RealityClientConfig) -> RealityResult<Self> {
+        let mut conn = RealityClientConnection::new(config);
+
+        // 1. Send ClientHello.
+        let client_hello = conn.start()?;
+        inner
+            .write_all(&client_hello)
+            .await
+            .map_err(RealityError::Io)?;
+        inner.flush().await.map_err(RealityError::Io)?;
+
+        // 2. Drive the handshake: read -> feed -> write produced bytes.
+        let mut read_buffer = Vec::new();
+        let mut buf = [0u8; 16384];
+        while conn.is_handshaking() {
+            let n = inner.read(&mut buf).await.map_err(RealityError::Io)?;
+            if n == 0 {
+                return Err(RealityError::handshake(
+                    "transport closed during REALITY handshake",
+                ));
+            }
+
+            let result = conn.feed(&buf[..n])?;
+
+            if !result.to_send.is_empty() {
+                inner
+                    .write_all(&result.to_send)
+                    .await
+                    .map_err(RealityError::Io)?;
+                inner.flush().await.map_err(RealityError::Io)?;
+            }
+
+            // Stash any early application data (e.g. a server response that was
+            // pipelined right after the handshake) for the first read.
+            if !result.app_data.is_empty() {
+                read_buffer.extend_from_slice(&result.app_data);
+            }
+        }
+
+        if conn.is_closed() {
+            return Err(RealityError::handshake(
+                "REALITY connection closed during handshake",
+            ));
+        }
+
+        Ok(Self {
+            inner,
+            conn,
+            read_buffer,
+            read_offset: 0,
+            eof: false,
+        })
+    }
+
+    /// Get a reference to the underlying transport.
+    pub fn get_ref(&self) -> &T {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the underlying transport.
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
+    /// Consume the stream and return the underlying transport.
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<T> AsyncRead for RealityClientStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Return any buffered decrypted data first.
+        if self.read_offset < self.read_buffer.len() {
+            let available = &self.read_buffer[self.read_offset..];
+            let to_copy = available.len().min(buf.remaining());
+            buf.put_slice(&available[..to_copy]);
+            self.read_offset += to_copy;
+            if self.read_offset >= self.read_buffer.len() {
+                self.read_buffer.clear();
+                self.read_offset = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        if self.eof {
+            // True EOF: hand back a 0-byte read.
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            // Read ciphertext from the transport and feed it into the
+            // sans-I/O connection, which buffers partial records internally and
+            // drains all complete records per call. We only return once we have
+            // decrypted application data (or hit true EOF), never an empty read.
+            let mut tmp = [0u8; 16384];
+            let mut read_buf = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        // Transport EOF.
+                        self.eof = true;
+                        return Poll::Ready(Ok(()));
+                    }
+
+                    let result = match self.conn.feed(&tmp[..n]) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("REALITY decrypt failed: {e}"),
+                            )));
+                        }
+                    };
+
+                    if self.conn.is_closed() {
+                        // close_notify received: surface EOF after draining.
+                        self.eof = true;
+                    }
+
+                    if !result.app_data.is_empty() {
+                        let to_copy = result.app_data.len().min(buf.remaining());
+                        buf.put_slice(&result.app_data[..to_copy]);
+                        if to_copy < result.app_data.len() {
+                            self.read_buffer.extend_from_slice(&result.app_data[to_copy..]);
+                            self.read_offset = 0;
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+
+                    if self.eof {
+                        return Poll::Ready(Ok(()));
+                    }
+                    // No application data yet (e.g. only a TLS alert/handshake
+                    // record). Loop and read more rather than returning empty.
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl<T> AsyncWrite for RealityClientStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // Encrypt application data, then write the ciphertext to the transport.
+        let ciphertext = match self.conn.encrypt(buf) {
+            Ok(c) => c,
+            Err(e) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("REALITY encrypt failed: {e}"),
+                )));
+            }
+        };
+
+        match Pin::new(&mut self.inner).poll_write(cx, &ciphertext) {
+            Poll::Ready(Ok(n)) => {
+                // Report the plaintext length as written once any ciphertext
+                // bytes were accepted (matches server-side semantics).
+                if n > 0 {
+                    Poll::Ready(Ok(buf.len()))
+                } else {
+                    Poll::Ready(Ok(0))
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Best-effort: emit an encrypted close_notify before shutting the
+        // transport down, mirroring TLS shutdown semantics. Failures here are
+        // non-fatal and we proceed to shut down the inner transport regardless.
+        if let Ok(close_notify) = self.conn.close_notify() {
+            if !close_notify.is_empty() {
+                // Ignore write pending/errors: shutdown is best-effort.
+                let _ = Pin::new(&mut self.inner).poll_write(cx, &close_notify);
+            }
+        }
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 

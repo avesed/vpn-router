@@ -28,6 +28,21 @@ use crate::error::{OutboundError, UdpError};
 use crate::transport::TransportStream;
 use crate::vless::VlessStream;
 
+/// Combined async read/write marker trait.
+///
+/// A `dyn` object can only carry one non-auto trait, so we cannot write
+/// `dyn AsyncRead + AsyncWrite`. This blanket trait unifies both (plus `Unpin`
+/// and `Send`) so it can be used as a single trait object behind a `Box`.
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+/// Type-erased async stream used for the VLESS-over-REALITY outbound.
+///
+/// REALITY is not part of the generic `TransportStream` enum (it is handled
+/// directly by the VLESS outbound), so its inner stream is boxed behind a
+/// trait object to fit into the unified `OutboundStream`.
+pub type BoxedAsyncStream = Box<dyn AsyncReadWrite>;
+
 /// Connection pool statistics (for pooled outbound types like SOCKS5)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PoolStatsInfo {
@@ -110,6 +125,11 @@ pub enum OutboundStream {
     Shadowsocks(super::shadowsocks::ShadowsocksStream),
     /// VLESS stream with deferred response header handling
     Vless(VlessStream),
+    /// VLESS-over-REALITY stream with deferred response header handling.
+    ///
+    /// The inner stream is a `RealityClientStream` wrapped in `VlessStream`,
+    /// type-erased behind `BoxedAsyncStream`.
+    Reality(VlessStream<BoxedAsyncStream>),
 }
 
 impl OutboundStream {
@@ -129,6 +149,12 @@ impl OutboundStream {
     #[must_use]
     pub fn vless(stream: VlessStream) -> Self {
         Self::Vless(stream)
+    }
+
+    /// Create from a VLESS-over-REALITY stream
+    #[must_use]
+    pub fn reality(stream: VlessStream<BoxedAsyncStream>) -> Self {
+        Self::Reality(stream)
     }
 
     /// Check if this is a TCP stream
@@ -207,6 +233,7 @@ impl OutboundStream {
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(_) => None,
             Self::Vless(_) => None,
+            Self::Reality(_) => None,
         }
     }
 
@@ -220,6 +247,7 @@ impl OutboundStream {
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(_) => None,
             Self::Vless(_) => None,
+            Self::Reality(_) => None,
         }
     }
 
@@ -252,6 +280,7 @@ impl OutboundStream {
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(_) => None, // Shadowsocks doesn't expose local addr directly
             Self::Vless(_) => None, // VLESS wraps transport, doesn't expose local addr directly
+            Self::Reality(_) => None, // REALITY wraps a boxed stream, doesn't expose local addr
         }
     }
 }
@@ -277,6 +306,10 @@ impl std::fmt::Debug for OutboundStream {
                 .debug_struct("OutboundStream::Vless")
                 .field("header_consumed", &s.is_header_consumed())
                 .finish(),
+            Self::Reality(s) => f
+                .debug_struct("OutboundStream::Reality")
+                .field("header_consumed", &s.is_header_consumed())
+                .finish(),
         }
     }
 }
@@ -293,6 +326,7 @@ impl AsyncRead for OutboundStream {
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(s) => Pin::new(s).poll_read(cx, buf),
             Self::Vless(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Reality(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -309,6 +343,7 @@ impl AsyncWrite for OutboundStream {
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(s) => Pin::new(s).poll_write(cx, buf),
             Self::Vless(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Reality(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -319,6 +354,7 @@ impl AsyncWrite for OutboundStream {
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(s) => Pin::new(s).poll_flush(cx),
             Self::Vless(s) => Pin::new(s).poll_flush(cx),
+            Self::Reality(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -329,6 +365,7 @@ impl AsyncWrite for OutboundStream {
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(s) => Pin::new(s).poll_shutdown(cx),
             Self::Vless(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Reality(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -690,6 +727,21 @@ impl OutboundConnection {
         }
     }
 
+    /// Create a new outbound connection from a VLESS-over-REALITY stream
+    ///
+    /// Use this constructor for VLESS connections tunneled through REALITY
+    /// (deferred response header handling, type-erased inner stream).
+    pub fn from_reality(
+        stream: VlessStream<BoxedAsyncStream>,
+        remote_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            stream: OutboundStream::Reality(stream),
+            local_addr: None, // REALITY stream doesn't expose local address
+            remote_addr,
+        }
+    }
+
     /// Get the underlying stream reference (generic)
     ///
     /// This returns the `OutboundStream` enum which can be matched to get
@@ -759,6 +811,11 @@ impl OutboundConnection {
             OutboundStream::Vless(_) => {
                 panic!(
                     "Cannot convert VLESS stream to TcpStream; use into_outbound_stream() instead"
+                )
+            }
+            OutboundStream::Reality(_) => {
+                panic!(
+                    "Cannot convert REALITY stream to TcpStream; use into_outbound_stream() instead"
                 )
             }
         }

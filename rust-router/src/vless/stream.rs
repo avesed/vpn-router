@@ -52,9 +52,14 @@ const MAX_RESPONSE_HEADER_SIZE: usize = 258; // 1 + 1 + 256
 ///
 /// This stream transparently consumes the VLESS response header on the first read,
 /// then forwards all subsequent I/O directly to the underlying stream.
-pub struct VlessStream {
+///
+/// `VlessStream` is generic over the inner stream type `T`, defaulting to
+/// [`TransportStream`] for the standard TCP/TLS/WebSocket transports. The
+/// REALITY transport uses a different inner type (a boxed REALITY stream), so
+/// the deferred-response logic is shared by parameterizing over `T`.
+pub struct VlessStream<T = TransportStream> {
     /// The underlying transport stream
-    inner: TransportStream,
+    inner: T,
 
     /// Whether the response header has been consumed
     header_consumed: AtomicBool,
@@ -67,13 +72,13 @@ pub struct VlessStream {
     buffer_consumed: usize,
 }
 
-impl VlessStream {
+impl<T> VlessStream<T> {
     /// Create a new VlessStream wrapping the given transport stream
     ///
     /// The request header should already have been sent on this stream.
     /// The response header will be consumed on the first read.
     #[must_use]
-    pub fn new(inner: TransportStream) -> Self {
+    pub fn new(inner: T) -> Self {
         Self {
             inner,
             header_consumed: AtomicBool::new(false),
@@ -132,7 +137,10 @@ impl VlessStream {
     }
 }
 
-impl AsyncRead for VlessStream {
+impl<T> AsyncRead for VlessStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -237,7 +245,10 @@ impl AsyncRead for VlessStream {
     }
 }
 
-impl AsyncWrite for VlessStream {
+impl<T> AsyncWrite for VlessStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
