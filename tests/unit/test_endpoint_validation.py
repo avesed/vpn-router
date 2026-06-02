@@ -63,7 +63,8 @@ class TestEndpointValidation:
         # We'll create a local validation function that mirrors the implementation
         import re
 
-        ENDPOINT_PATTERN = re.compile(r'^[\w\.\-]+:\d+$')
+        # \Z (not $) so a trailing newline is rejected ($ matches before a final \n)
+        ENDPOINT_PATTERN = re.compile(r'^[\w\.\-]+:\d+\Z')
 
         def _validate_hostname(hostname: str) -> bool:
             """Validate hostname format."""
@@ -77,7 +78,7 @@ class TestEndpointValidation:
                 return False
             # Basic DNS label rules
             import re
-            if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$', hostname):
+            if not re.match(r'^[a-zA-Z0-9_]([a-zA-Z0-9_\-]*[a-zA-Z0-9_])?(\.[a-zA-Z0-9_]([a-zA-Z0-9_\-]*[a-zA-Z0-9_])?)*$', hostname):
                 if hostname != 'localhost':
                     return False
             return True

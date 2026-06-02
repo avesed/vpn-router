@@ -153,5 +153,5 @@ def sample_pia_profile() -> dict:
         "name": "us-east",
         "description": "US East Coast",
         "region_id": "us_east",
-        "dns_strategy": "prefer_ipv4"
+        "custom_dns": "1.1.1.1"
     }

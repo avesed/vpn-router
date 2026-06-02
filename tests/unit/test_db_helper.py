@@ -108,8 +108,8 @@ class TestUserDatabase:
         db = get_db(str(mock_geodata_db), str(initialized_user_db))
 
         # Add regular and adblock rules
-        db.add_routing_rule("domain_suffix", "example.com", "direct", "normal-rule", 100)
-        db.add_routing_rule("domain_suffix", "ads.com", "block", "__adblock__test123", 101)
+        db.add_routing_rule("domain_suffix", "example.com", "direct", priority=100, tag="normal-rule")
+        db.add_routing_rule("domain_suffix", "ads.com", "block", priority=101, tag="__adblock__test123")
 
         # Delete all but preserve adblock
         deleted = db.delete_all_routing_rules(preserve_adblock=True)
@@ -265,15 +265,14 @@ class TestPIAProfiles:
         db = get_db(str(mock_geodata_db), str(initialized_user_db))
         profile_id = db.add_pia_profile(**sample_pia_profile)
 
-        # Update with credentials
-        result = db.update_pia_profile(
-            profile_id,
-            server_ip="10.0.0.1",
-            server_port=1337,
-            private_key="dGVzdHByaXZhdGVrZXk=",
-            public_key="dGVzdHB1YmxpY2tleQ==",
-            address="10.1.0.2/32"
-        )
+        # Update with WireGuard credentials (keyed by profile name)
+        result = db.update_pia_credentials(sample_pia_profile["name"], {
+            "server_ip": "10.0.0.1",
+            "server_port": 1337,
+            "private_key": "dGVzdHByaXZhdGVrZXk=",
+            "public_key": "dGVzdHB1YmxpY2tleQ==",
+            "peer_ip": "10.1.0.2/32",
+        })
         assert result is True
 
         profiles = db.get_pia_profiles()
