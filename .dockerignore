@@ -95,6 +95,11 @@ test-client/
 test-egress/
 test-wg-client/
 xray-client-debug/
+test-e2e/
+test-configs/
+test-multi-hop/
+test-server/
+config/*.db.backup*
 
 # Temporary test scripts
 test_*.sh
